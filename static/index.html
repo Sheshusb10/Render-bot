@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
+<title>ΔLPHA PRO</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet"/>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:#f0f2f5;font-family:'Inter',sans-serif;font-size:14px}
+#root{height:100%}
+::-webkit-scrollbar{width:3px}
+::-webkit-scrollbar-thumb{background:#d1d5db;border-radius:4px}
+button,input{font-family:'Inter',sans-serif;cursor:pointer}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useEffect,useRef,useCallback}=React;
+const API="/api";
+const fmt=(n,d=2)=>n!=null?parseFloat(n).toFixed(d):"—";
+
+const REGIME_COLOR={
+  STRONG_BULL:"#16a34a",BULL:"#22c55e",
+  NEUTRAL:"#f59e0b",
+  BEAR:"#ef4444",STRONG_BEAR:"#dc2626",
+};
+
+const Card=({children,style={}})=>(
+  <div style={{background:"#fff",borderRadius:16,padding:16,
+    boxShadow:"0 1px 4px rgba(0,0,0,0.08)",...style}}>
+    {children}
+  </div>
+);
+
+const Badge=({color,children})=>{
+  const m={
+    green:{bg:"#dcfce7",fg:"#16a34a"},red:{bg:"#fee2e2",fg:"#dc2626"},
+    amber:{bg:"#fef3c7",fg:"#d97706"},blue:{bg:"#dbeafe",fg:"#2563eb"},
+    purple:{bg:"#ede9fe",fg:"#7c3aed"},gray:{bg:"#f3f4f6",fg:"#6b7280"},
+  };
+  const s=m[color]||m.gray;
+  return(
+    <span style={{background:s.bg,color:s.fg,fontSize:10,fontWeight:700,
+      padding:"2px 8px",borderRadius:20,whiteSpace:"nowrap"}}>
+      {children}
+    </span>
+  );
+};
+
+export default function App(){
+  const[creds,setCreds]=useState({key:"",secret:"",region:"india"});
+  const[conn,setConn]=useState(false);
+  const[connecting,setConnecting]=useState(false);
+  const[connErr,setConnErr]=useState("");
+  const[tab,setTab]=useState("home");
+  const[positions,setPositions]=useState([]);
+  const[orders,setOrders]=useState([]);
+  const[wallet,setWallet]=useState([]);
+  const[analysis,setAnalysis]=useState([]);
+  const[botStatus,setBotStatus]=useState({running:false,log:[],stats:{}});
+  const[interval2,setInterval2]=useState(300);
+  const logRef=useRef(null);
+
+  const connect=async()=>{
+    setConnecting(true);setConnErr("");
+    try{
+      const r=await fetch(`${API}/connect`,{method:"POST",
+        headers:{"Content-Type":"application/json"},body:JSON.stringify(creds)});
+      const d=await r.json();
+      if(!d.ok){setConnErr(d.error||"Failed");setConnecting(false);return;}
+      setWallet(d.wallet||[]);setConn(true);loadAll();
+    }catch(e){setConnErr("Cannot reach server");}
+    setConnecting(false);
+  };
+
+  const loadAll=useCallback(async()=>{
+    try{
+      const[po,or,wa,an]=await Promise.all([
+        fetch(`${API}/positions`).then(r=>r.json()),
+        fetch(`${API}/orders`).then(r=>r.json()),
+        fetch(`${API}/wallet`).then(r=>r.json()),
+        fetch(`${API}/analysis`).then(r=>r.json()),
+      ]);
+      setPositions((po.result||[]).filter(p=>p.size!==0));
+      setOrders(or.result||[]);
+      setWallet(wa.result||[]);
+      setAnalysis(an.result||[]);
+    }catch{}
+  },[]);
+
+  useEffect(()=>{
+    if(!conn)return;
+    const iv=setInterval(async()=>{
+      try{
+        const[bs,po,or]=await Promise.all([
+          fetch(`${API}/bot/status`).then(r=>r.json()),
+          fetch(`${API}/positions`).then(r=>r.json()),
+          fetch(`${API}/orders`).then(r=>r.json()),
+        ]);
+        setBotStatus(bs);
+        setPositions((po.result||[]).filter(p=>p.size!==0));
+        setOrders(or.result||[]);
+      }catch{}
+    },5000);
+    return()=>clearInterval(iv);
+  },[conn]);
+
+  useEffect(()=>{
+    if(!conn)return;
+    const iv=setInterval(()=>{
+      fetch(`${API}/analysis`).then(r=>r.json())
+        .then(d=>setAnalysis(d.result||[])).catch(()=>{});
+    },30000);
+    return()=>clearInterval(iv);
+  },[conn]);
+
+  useEffect(()=>{
+    if(logRef.current)logRef.current.scrollTop=logRef.current.scrollHeight;
+  },[botStatus.log]);
+
+  const startBot=()=>fetch(`${API}/bot/start`,{method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({interval:interval2})});
+  const stopBot=()=>fetch(`${API}/bot/stop`,{method:"POST"});
+  const runNow=()=>fetch(`${API}/bot/run_now`,{method:"POST"});
+  const reset=async()=>{await fetch(`${API}/bot/reset`,{method:"POST"});loadAll();};
+
+  const cancelOrder=async(id,pid)=>{
+    await fetch(`${API}/orders/${id}?product_id=${pid}`,{method:"DELETE"});
+    loadAll();
+  };
+
+  const s=botStatus.stats||{};
+  const usdt=wallet.find(w=>w.asset_symbol==="USDT")||
+             wallet.find(w=>["INR","USD"].includes(w.asset_symbol));
+  const bal=usdt?parseFloat(usdt.available_balance)/(usdt.asset_symbol==="INR"?85:1):0;
+  const startBal=s.starting_balance||bal;
+  const pnl=bal-startBal;
+  const pnlPct=startBal>0&&Math.abs(pnl)>0.001?(pnl/startBal*100):0;
+
+  // ── Login ──────────────────────────────────────────────────────
+  if(!conn)return(
+    <div style={{minHeight:"100vh",background:"linear-gradient(135deg,#1e3a8a,#7c3aed)",
+      display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+      <div style={{width:"100%",maxWidth:400}}>
+        <div style={{textAlign:"center",marginBottom:24}}>
+          <div style={{fontSize:52,fontWeight:800,color:"#fff",
+            letterSpacing:-2,lineHeight:1}}>ΔLPHA</div>
+          <div style={{color:"rgba(255,255,255,.7)",fontSize:12,marginTop:6,
+            letterSpacing:".1em",textTransform:"uppercase"}}>
+            PRO · Institutional Options Bot
+          </div>
+        </div>
+        <Card>
+          <div style={{marginBottom:12}}>
+            <div style={{fontSize:11,fontWeight:600,color:"#6b7280",
+              textTransform:"uppercase",letterSpacing:".05em",marginBottom:6}}>Region</div>
+            <div style={{display:"flex",gap:8}}>
+              {["india","global"].map(r=>(
+                <button key={r} onClick={()=>setCreds(c=>({...c,region:r}))}
+                  style={{flex:1,padding:"10px 0",borderRadius:10,fontSize:13,
+                    fontWeight:700,border:"2px solid",
+                    borderColor:creds.region===r?"#7c3aed":"#e5e7eb",
+                    background:creds.region===r?"#ede9fe":"#f9fafb",
+                    color:creds.region===r?"#7c3aed":"#6b7280"}}>
+                  {r==="india"?"🇮🇳 India":"🌐 Global"}
+                </button>
+              ))}
+            </div>
+          </div>
+          {["key","secret"].map(f=>(
+            <div key={f} style={{marginBottom:12}}>
+              <div style={{fontSize:11,fontWeight:600,color:"#6b7280",
+                textTransform:"uppercase",marginBottom:6}}>
+                API {f==="key"?"Key":"Secret"}
+              </div>
+              <input type={f==="secret"?"password":"text"}
+                value={creds[f]}
+                onChange={e=>setCreds(c=>({...c,[f]:e.target.value}))}
+                placeholder={`Enter API ${f}`}
+                style={{width:"100%",padding:"12px 14px",borderRadius:10,
+                  fontSize:13,border:"1.5px solid #e5e7eb",outline:"none",
+                  background:"#f9fafb"}}
+                onFocus={e=>e.target.style.borderColor="#7c3aed"}
+                onBlur={e=>e.target.style.borderColor="#e5e7eb"}/>
+            </div>
+          ))}
+          {connErr&&(
+            <div style={{background:"#fee2e2",border:"1px solid #fecaca",
+              color:"#dc2626",fontSize:12,padding:"10px 12px",
+              borderRadius:8,marginBottom:12}}>{connErr}</div>
+          )}
+          <button onClick={connect}
+            disabled={connecting||!creds.key||!creds.secret}
+            style={{width:"100%",padding:"14px 0",borderRadius:12,
+              fontSize:14,fontWeight:800,border:"none",
+              background:!creds.key||!creds.secret||connecting
+                ?"#e5e7eb":"linear-gradient(135deg,#1e3a8a,#7c3aed)",
+              color:!creds.key||!creds.secret||connecting?"#9ca3af":"#fff"}}>
+            {connecting?"Connecting...":"Connect →"}
+          </button>
+          <div style={{marginTop:12,fontSize:11,color:"#9ca3af",textAlign:"center"}}>
+            Keys sent only to your local server — never stored
+          </div>
+        </Card>
+      </div>
+    </div>
+  );
+
+  const tabs=[
+    {id:"home",icon:"🏠",label:"Home"},
+    {id:"signals",icon:"📊",label:"Signals"},
+    {id:"trades",icon:"💼",label:"Trades"},
+    {id:"log",icon:"📋",label:"Log"},
+  ];
+
+  return(
+    <div style={{display:"flex",flexDirection:"column",height:"100vh",
+      background:"#f0f2f5",maxWidth:480,margin:"0 auto"}}>
+
+      {/* Header */}
+      <div style={{background:"linear-gradient(135deg,#1e3a8a,#7c3aed)",
+        padding:"14px 16px 12px",flexShrink:0}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div>
+            <div style={{fontSize:24,fontWeight:800,color:"#fff",letterSpacing:-1}}>
+              ΔLPHA PRO
+            </div>
+            <div style={{fontSize:11,color:"rgba(255,255,255,.7)",marginTop:1}}>
+              {creds.region==="india"?"India":"Global"} · {botStatus.ip||""}
+            </div>
+          </div>
+          <div style={{textAlign:"right"}}>
+            <div style={{fontSize:24,fontWeight:800,color:"#fff"}}>
+              ₹{(bal*85).toFixed(0)}
+            </div>
+            <div style={{fontSize:11,fontWeight:600,
+              color:pnl>=0?"#86efac":"#fca5a5"}}>
+              {pnl>=0?"+":""}{fmt(pnl,2)} USDT
+              {Math.abs(pnlPct)>0.01?` (${pnlPct>=0?"+":""}${fmt(pnlPct,1)}%)`:""}
+            </div>
+          </div>
+        </div>
+
+        {/* Bot toggle */}
+        <div style={{marginTop:12,background:"rgba(255,255,255,.15)",
+          borderRadius:12,padding:"10px 14px",
+          display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div>
+            <div style={{fontSize:12,color:"rgba(255,255,255,.9)",fontWeight:600}}>
+              Auto-Trading
+            </div>
+            <div style={{fontSize:11,color:"rgba(255,255,255,.6)",marginTop:1}}>
+              {botStatus.running
+                ?`Running · ${s.trades_today||0}/6 trades`
+                :"Tap to start · 6 trades/day"}
+            </div>
+          </div>
+          <div onClick={botStatus.running?stopBot:startBot}
+            style={{width:52,height:28,borderRadius:14,
+              background:botStatus.running?"#22c55e":"rgba(255,255,255,.3)",
+              position:"relative",cursor:"pointer",transition:"background .2s"}}>
+            <div style={{position:"absolute",top:3,
+              left:botStatus.running?26:3,width:22,height:22,
+              borderRadius:"50%",background:"#fff",transition:"left .2s",
+              boxShadow:"0 1px 3px rgba(0,0,0,.2)"}}/>
+          </div>
+        </div>
+      </div>
+
+      {/* Content */}
+      <div style={{flex:1,overflowY:"auto",padding:12}}>
+
+        {/* HOME */}
+        {tab==="home"&&(
+          <div style={{display:"flex",flexDirection:"column",gap:12}}>
+
+            {/* Stats */}
+            <Card>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:4}}>
+                {[
+                  ["Trades",s.trades_today||0,"#7c3aed"],
+                  ["W/L",`${s.wins||0}/${s.losses||0}`,
+                    (s.wins||0)>(s.losses||0)?"#16a34a":"#dc2626"],
+                  ["Win%",`${s.win_rate||0}%`,
+                    (s.win_rate||0)>=50?"#16a34a":"#dc2626"],
+                  ["Exp",`${fmt(s.total_exposure_pct||0,0)}%`,
+                    (s.total_exposure_pct||0)>=8?"#dc2626":"#374151"],
+                ].map(([l,v,c])=>(
+                  <div key={l} style={{textAlign:"center",padding:"8px 4px"}}>
+                    <div style={{fontSize:10,color:"#6b7280",fontWeight:500,
+                      textTransform:"uppercase",letterSpacing:".05em",marginBottom:3}}>{l}</div>
+                    <div style={{fontSize:20,fontWeight:800,color:c,lineHeight:1}}>{v}</div>
+                  </div>
+                ))}
+              </div>
+            </Card>
+
+            {/* Profit Buffer */}
+            <Card>
+              <div style={{display:"flex",justifyContent:"space-between",
+                alignItems:"center",marginBottom:10}}>
+                <div style={{fontSize:13,fontWeight:700}}>Profit Buffer</div>
+                <Badge color={(s.profit_buffer||0)>0?"green":"gray"}>
+                  {(s.profit_buffer||0)>0?"ACTIVE":"EMPTY"}
+                </Badge>
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}}>
+                {[
+                  ["Buffer"  ,`$${fmt(s.profit_buffer||0,3)}`,"#16a34a"],
+                  ["High"    ,`$${fmt(s.buffer_high||0,3)}`,"#7c3aed"],
+                  ["Absorbed",`$${fmt(s.losses_absorbed||0,3)}`,"#f59e0b"],
+                ].map(([l,v,c])=>(
+                  <div key={l} style={{background:"#f9fafb",borderRadius:10,
+                    padding:"8px 10px"}}>
+                    <div style={{fontSize:10,color:"#6b7280",fontWeight:600,
+                      textTransform:"uppercase"}}>{l}</div>
+                    <div style={{fontSize:13,fontWeight:800,color:c,marginTop:2}}>{v}</div>
+                  </div>
+                ))}
+              </div>
+            </Card>
+
+            {/* Profit Floor */}
+            <Card>
+              <div style={{display:"flex",justifyContent:"space-between",
+                alignItems:"center",marginBottom:8}}>
+                <div style={{fontSize:13,fontWeight:700}}>Profit Floor</div>
+                <Badge color={s.daily_loss_limit_hit?"red":"green"}>
+                  {s.daily_loss_limit_hit?"HALTED":"ACTIVE"}
+                </Badge>
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}}>
+                {[
+                  ["Start",`${fmt(s.starting_balance||0)} USDT`,"#374151"],
+                  ["Peak", `${fmt(s.peak_balance||0)} USDT`,"#7c3aed"],
+                  ["Floor",`${fmt(s.profit_floor||0)} USDT`,"#16a34a"],
+                ].map(([l,v,c])=>(
+                  <div key={l} style={{background:"#f9fafb",borderRadius:10,padding:"8px 10px"}}>
+                    <div style={{fontSize:10,color:"#6b7280",fontWeight:600,
+                      textTransform:"uppercase"}}>{l}</div>
+                    <div style={{fontSize:12,fontWeight:800,color:c,marginTop:2}}>{v}</div>
+                  </div>
+                ))}
+              </div>
+              {s.starting_balance>0&&(
+                <div style={{marginTop:10}}>
+                  <div style={{height:6,background:"#e5e7eb",borderRadius:3}}>
+                    <div style={{height:"100%",borderRadius:3,
+                      background:pnl>=0
+                        ?"linear-gradient(90deg,#1e3a8a,#22c55e)"
+                        :"linear-gradient(90deg,#ef4444,#dc2626)",
+                      width:`${Math.min(100,Math.abs(pnlPct)*5)}%`,
+                      transition:"width .5s"}}/>
+                  </div>
+                  <div style={{display:"flex",justifyContent:"space-between",
+                    fontSize:10,color:"#6b7280",marginTop:3}}>
+                    <span>Balance progress</span>
+                    <span>{pnlPct>=0?"+":""}{fmt(pnlPct,2)}%</span>
+                  </div>
+                </div>
+              )}
+            </Card>
+
+            {/* Bot Controls */}
+            <Card>
+              <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Bot Controls</div>
+              <div style={{marginBottom:10}}>
+                <div style={{fontSize:11,color:"#6b7280",marginBottom:5,fontWeight:600}}>
+                  Cycle interval (seconds)
+                </div>
+                <input type="number" min="180" value={interval2}
+                  onChange={e=>setInterval2(Number(e.target.value))}
+                  style={{width:"100%",padding:"10px 12px",borderRadius:10,
+                    fontSize:13,border:"1.5px solid #e5e7eb",outline:"none",
+                    background:"#f9fafb"}}/>
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+                <button onClick={runNow}
+                  style={{padding:"12px 0",borderRadius:10,fontSize:13,
+                    fontWeight:700,border:"none",background:"#ede9fe",color:"#7c3aed"}}>
+                  ↻ Run Now
+                </button>
+                <button onClick={reset}
+                  style={{padding:"12px 0",borderRadius:10,fontSize:13,
+                    fontWeight:700,border:"none",background:"#f3f4f6",color:"#374151"}}>
+                  Reset Stats
+                </button>
+              </div>
+              {s.daily_loss_limit_hit&&(
+                <div style={{marginTop:8,background:"#fee2e2",borderRadius:10,
+                  padding:"10px 12px",fontSize:12,color:"#dc2626",fontWeight:600}}>
+                  ⛔ Floor breached — trading halted. Reset to resume.
+                </div>
+              )}
+            </Card>
+
+            {/* Positions */}
+            {positions.length>0&&(
+              <Card>
+                <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>
+                  Open Positions ({positions.length})
+                </div>
+                {positions.map(p=>{
+                  const pnl2=parseFloat(p.unrealized_pnl||0);
+                  return(
+                    <div key={p.product_id}
+                      style={{display:"flex",justifyContent:"space-between",
+                        alignItems:"center",padding:"10px 0",
+                        borderBottom:"1px solid #f3f4f6"}}>
+                      <div>
+                        <div style={{fontWeight:700,fontSize:13}}>{p.product_symbol}</div>
+                        <div style={{fontSize:11,color:"#6b7280",marginTop:2}}>
+                          Entry ${fmt(p.entry_price,2)}
+                        </div>
+                      </div>
+                      <div style={{textAlign:"right"}}>
+                        <div style={{fontWeight:800,fontSize:14,
+                          color:pnl2>=0?"#16a34a":"#dc2626"}}>
+                          {pnl2>=0?"+":""}{fmt(pnl2,4)} USDT
+                        </div>
+                        <Badge color={p.size>0?"green":"red"}>
+                          {p.size>0?"LONG":"SHORT"} {Math.abs(p.size)}
+                        </Badge>
+                      </div>
+                    </div>
+                  );
+                })}
+              </Card>
+            )}
+
+            {/* Wallet */}
+            <Card>
+              <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>Wallet</div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+                {(wallet||[]).filter(w=>parseFloat(w.balance)>0).map(w=>(
+                  <div key={w.asset_id}
+                    style={{background:"#f9fafb",borderRadius:10,padding:"10px 12px"}}>
+                    <div style={{fontSize:11,color:"#6b7280",fontWeight:600}}>{w.asset_symbol}</div>
+                    <div style={{fontSize:18,fontWeight:800,marginTop:2}}>
+                      {fmt(w.available_balance,4)}
+                    </div>
+                    <div style={{fontSize:10,color:"#9ca3af",marginTop:1}}>
+                      Total: {fmt(w.balance,4)}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </Card>
+
+          </div>
+        )}
+
+        {/* SIGNALS */}
+        {tab==="signals"&&(
+          <div style={{display:"flex",flexDirection:"column",gap:10}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div style={{fontSize:16,fontWeight:800}}>Live Signals</div>
+              <button onClick={loadAll}
+                style={{padding:"6px 14px",borderRadius:20,fontSize:12,
+                  fontWeight:700,border:"none",background:"#ede9fe",color:"#7c3aed"}}>
+                Refresh
+              </button>
+            </div>
+            {analysis.length===0&&(
+              <Card>
+                <div style={{textAlign:"center",color:"#6b7280",padding:24}}>
+                  Loading signals...
+                </div>
+              </Card>
+            )}
+            {analysis.map(a=>{
+              const r=a.regime||"NEUTRAL";
+              const sig=a||{};
+              const conf=sig.confidence||0;
+              const rc=REGIME_COLOR[r]||"#6b7280";
+              const sigColor=sig.direction==="BUY_CALL"?"#16a34a":
+                             sig.direction==="BUY_PUT"?"#dc2626":
+                             sig.direction==="STRADDLE"?"#7c3aed":"#6b7280";
+              const ind=sig.indicators||{};
+              return(
+                <Card key={a.asset}>
+                  <div style={{display:"flex",justifyContent:"space-between",
+                    alignItems:"flex-start",marginBottom:10}}>
+                    <div>
+                      <div style={{fontSize:20,fontWeight:800}}>{a.asset}</div>
+                      <div style={{fontSize:12,color:rc,fontWeight:700,marginTop:2}}>
+                        {r}
+                      </div>
+                      <div style={{fontSize:11,color:"#6b7280",marginTop:1}}>
+                        ${fmt(a.price,2)}
+                      </div>
+                    </div>
+                    <div style={{textAlign:"right"}}>
+                      <div style={{fontSize:20,fontWeight:800,color:sigColor}}>
+                        {sig.direction==="BUY_CALL"?"📈 CALL":
+                         sig.direction==="BUY_PUT"?"📉 PUT":
+                         sig.direction==="STRADDLE"?"⚖️ STRADDLE":"—"}
+                      </div>
+                      <div style={{fontSize:11,color:"#6b7280"}}>
+                        {sig.aggression||"—"} · {sig.size_multiplier
+                          ?`${sig.size_multiplier.toFixed(2)}x`:"1x"}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Confidence bar */}
+                  <div style={{marginBottom:10}}>
+                    <div style={{display:"flex",justifyContent:"space-between",
+                      fontSize:11,color:"#6b7280",marginBottom:3}}>
+                      <span>Confluence</span><span>{conf}%</span>
+                    </div>
+                    <div style={{height:6,background:"#f3f4f6",borderRadius:3}}>
+                      <div style={{height:"100%",borderRadius:3,
+                        background:conf>=75?"#16a34a":conf>=60?"#f59e0b":"#ef4444",
+                        width:`${conf}%`,transition:"width .5s"}}/>
+                    </div>
+                  </div>
+
+                  {/* Indicators grid */}
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",
+                    gap:6,marginBottom:10}}>
+                    {[
+                      ["RSI 1h",ind.rsi_1h,
+                        ind.rsi_1h>75?"#dc2626":ind.rsi_1h<35?"#16a34a":"#374151"],
+                      ["RSI 4h",ind.rsi_4h,
+                        ind.rsi_4h>75?"#dc2626":ind.rsi_4h<35?"#16a34a":"#374151"],
+                      ["MACD",ind.macd_1h,
+                        ind.macd_1h==="BULLISH"?"#16a34a":"#dc2626"],
+                      ["F&G",ind.fear_greed,
+                        ind.fear_greed<25?"#16a34a":ind.fear_greed>75?"#dc2626":"#f59e0b"],
+                    ].map(([l,v,c])=>(
+                      <div key={l} style={{background:"#f9fafb",borderRadius:8,
+                        padding:"6px 4px",textAlign:"center"}}>
+                        <div style={{fontSize:9,color:"#6b7280",fontWeight:600,
+                          textTransform:"uppercase"}}>{l}</div>
+                        <div style={{fontSize:11,fontWeight:700,color:c,marginTop:2}}>
+                          {v||"—"}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Reasons */}
+                  {(sig.reasons||[]).slice(0,3).map((r2,i)=>(
+                    <div key={i} style={{fontSize:11,color:"#6b7280",
+                      padding:"2px 0",borderBottom:"1px solid #f9fafb"}}>
+                      • {r2}
+                    </div>
+                  ))}
+                </Card>
+              );
+            })}
+          </div>
+        )}
+
+        {/* TRADES */}
+        {tab==="trades"&&(
+          <div style={{display:"flex",flexDirection:"column",gap:10}}>
+            <div style={{fontSize:16,fontWeight:800}}>
+              Open Orders ({orders.length})
+            </div>
+            {orders.length===0&&(
+              <Card>
+                <div style={{textAlign:"center",color:"#6b7280",padding:24}}>
+                  No open orders
+                </div>
+              </Card>
+            )}
+            {orders.map(o=>(
+              <Card key={o.id}>
+                <div style={{display:"flex",justifyContent:"space-between",
+                  alignItems:"center"}}>
+                  <div>
+                    <div style={{fontWeight:700,fontSize:13}}>{o.product_symbol}</div>
+                    <div style={{display:"flex",gap:6,marginTop:5,flexWrap:"wrap"}}>
+                      <Badge color={o.side==="buy"?"green":"red"}>
+                        {o.side?.toUpperCase()}
+                      </Badge>
+                      <Badge color="gray">{o.order_type?.replace(/_/g," ")}</Badge>
+                      <span style={{fontSize:11,color:"#6b7280"}}>
+                        {o.size}x {o.limit_price?`@ $${fmt(o.limit_price,2)}`:"mkt"}
+                      </span>
+                    </div>
+                  </div>
+                  <button
+                    onClick={()=>cancelOrder(o.id,o.product_id)}
+                    style={{padding:"8px 14px",borderRadius:10,fontSize:12,
+                      fontWeight:700,border:"none",background:"#fee2e2",
+                      color:"#dc2626"}}>
+                    Cancel
+                  </button>
+                </div>
+              </Card>
+            ))}
+          </div>
+        )}
+
+        {/* LOG */}
+        {tab==="log"&&(
+          <div style={{display:"flex",flexDirection:"column",gap:10}}>
+            <div style={{fontSize:16,fontWeight:800}}>Activity Log</div>
+            <Card style={{padding:12}}>
+              <div ref={logRef}
+                style={{height:500,overflowY:"auto",
+                  display:"flex",flexDirection:"column",gap:2}}>
+                {botStatus.log.length===0&&(
+                  <div style={{color:"#9ca3af",textAlign:"center",padding:24}}>
+                    No activity yet
+                  </div>
+                )}
+                {botStatus.log.map((e,i)=>(
+                  <div key={i} style={{fontSize:11,lineHeight:1.6,
+                    padding:"3px 6px",borderRadius:6,
+                    background:e.type==="error"?"#fee2e2":
+                               e.type==="success"?"#dcfce7":
+                               e.type==="bot"?"#ede9fe":
+                               e.type==="warning"?"#fef3c7":"transparent"}}>
+                    <span style={{color:"#9ca3af",marginRight:6}}>{e.ts}</span>
+                    <span style={{color:
+                      e.type==="success"?"#16a34a":
+                      e.type==="error"  ?"#dc2626":
+                      e.type==="bot"    ?"#7c3aed":
+                      e.type==="warning"?"#d97706":"#374151",
+                      fontWeight:e.type==="bot"||e.type==="success"?600:400}}>
+                      {e.msg}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </Card>
+          </div>
+        )}
+
+      </div>
+
+      {/* Bottom Nav */}
+      <div style={{background:"#fff",borderTop:"1px solid #e5e7eb",
+        display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",
+        flexShrink:0,paddingBottom:"env(safe-area-inset-bottom)"}}>
+        {tabs.map(t=>(
+          <button key={t.id} onClick={()=>setTab(t.id)}
+            style={{padding:"10px 0",border:"none",background:"none",
+              display:"flex",flexDirection:"column",alignItems:"center",gap:2,
+              color:tab===t.id?"#7c3aed":"#9ca3af"}}>
+            <span style={{fontSize:20}}>{t.icon}</span>
+            <span style={{fontSize:10,fontWeight:tab===t.id?700:500}}>{t.label}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
