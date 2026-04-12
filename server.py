@@ -337,6 +337,47 @@ def get_fear_greed():
     except:
         return {"value": 50, "label": "Neutral", "sentiment": "NEUTRAL"}
 
+def get_crypto_sentiment():
+    """
+    Read crypto news sentiment from CryptoCompare free API.
+    Returns: BULLISH / BEARISH / NEUTRAL + key headlines
+    """
+    try:
+        r = requests.get(
+            "https://min-api.cryptocompare.com/data/v2/news/?lang=EN&sortOrder=latest",
+            timeout=8)
+        articles = r.json().get("Data", [])[:10]
+        bull_words = ["rally","surge","rise","pump","bull","gains","up","high","record","buy"]
+        bear_words = ["crash","dump","fall","bear","loss","down","low","sell","fear","drop"]
+        bull_count = 0; bear_count = 0; headlines = []
+        for a in articles:
+            title = a.get("title","").lower()
+            headlines.append(a.get("title","")[:60])
+            bull_count += sum(1 for w in bull_words if w in title)
+            bear_count += sum(1 for w in bear_words if w in title)
+        total = bull_count + bear_count or 1
+        bull_pct = bull_count / total * 100
+        sentiment = "BULLISH" if bull_pct > 60 else "BEARISH" if bull_pct < 40 else "NEUTRAL"
+        return {"sentiment": sentiment, "bull_pct": round(bull_pct),
+                "headlines": headlines[:3]}
+    except:
+        return {"sentiment": "NEUTRAL", "bull_pct": 50, "headlines": []}
+
+def check_delta_status():
+    """Check if Delta Exchange API is healthy."""
+    try:
+        r = requests.get(
+            "https://api.india.delta.exchange/v2/products?states=live&page_size=1",
+            headers={"Accept": "application/json"}, timeout=8)
+        if r.status_code == 200:
+            return True, "OK"
+        elif r.status_code == 503:
+            return False, "Maintenance"
+        else:
+            return False, f"Error {r.status_code}"
+    except Exception as e:
+        return False, f"Unreachable: {str(e)[:30]}"
+
 def get_funding_rate(asset):
     sym = BINANCE_SYM.get(asset.upper())
     if not sym: return 0.0
@@ -422,6 +463,9 @@ def full_analysis(asset):
     fg      = get_fear_greed()
     funding = get_funding_rate(asset)
     oi      = get_oi_trend(asset)
+    news    = get_crypto_sentiment()
+    blog(f"[{asset}] News:{news['sentiment']} ({news['bull_pct']}% bull) | "
+         f"Headline: {news['headlines'][0] if news['headlines'] else 'none'}", "info")
 
     chg_1h = ((c1h[-1]["close"]-c1h[-2]["close"])/c1h[-2]["close"]*100) if len(c1h)>=2 else 0
     chg_4h = ((c4h[-1]["close"]-c4h[-2]["close"])/c4h[-2]["close"]*100) if len(c4h)>=2 else 0
@@ -553,6 +597,12 @@ def full_analysis(asset):
     elif fg["sentiment"] == "GREED" and chg_4h < 0:
         bear += 10; reasons.append("Greed+falling = sell")
 
+    # ── News Sentiment ────────────────────────────────────────────
+    if news["sentiment"] == "BULLISH":
+        bull += 8; reasons.append(f"News bullish ({news['bull_pct']}%)")
+    elif news["sentiment"] == "BEARISH":
+        bear += 8; reasons.append(f"News bearish ({100-news['bull_pct']}%)")
+
     # ── Funding — ignored in strong bull regime ───────────────────
     if regime not in ("STRONG_BULL", "BULL"):
         if funding > 0.05:
@@ -616,6 +666,23 @@ def full_analysis(asset):
         if not is_with_trend:
             direction = "NO TRADE"
             reasons.append(f"High vol ({bb_width:.1f}%) — counter-trend blocked")
+
+    # ── Trade Memory Adjustment ──────────────────────────────────
+    # If this setup historically loses, reduce confidence
+    setup_key = f"{regime}_{direction.replace('BUY_','')}" if direction != "NO TRADE" else None
+    if setup_key:
+        memory = bot_state.get("setup_memory", {}).get(setup_key, {})
+        mem_wins   = memory.get("wins", 0)
+        mem_losses = memory.get("losses", 0)
+        mem_total  = mem_wins + mem_losses
+        if mem_total >= 3:  # need at least 3 trades to learn
+            mem_winrate = mem_wins / mem_total * 100
+            if mem_winrate < 35:
+                conf = max(0, conf - 10)
+                reasons.append(f"Setup {setup_key} hist {mem_winrate:.0f}% WR — reduced conf")
+            elif mem_winrate > 65:
+                conf = min(100, conf + 5)
+                reasons.append(f"Setup {setup_key} hist {mem_winrate:.0f}% WR — boosted conf")
 
     # ── Regime Hard Veto ─────────────────────────────────────────
     # Dynamic regime veto — tighter in high volatility
@@ -963,6 +1030,29 @@ def manage_positions():
                             s["total_exposure_pct"]  = max(0,s["total_exposure_pct"]-3.0)
                             # Clear trail
                             bot_state["trail_state"].pop(sym, None)
+
+                            # Update trade memory
+                            try:
+                                # Determine setup key from symbol
+                                is_call = sym.startswith("C-")
+                                direction_str = "CALL" if is_call else "PUT"
+                                # Get regime from last signal
+                                last_sig = s.get("last_signal", {})
+                                mem_regime = last_sig.get("regime", "NEUTRAL")
+                                setup_key = f"{mem_regime}_{direction_str}"
+                                if setup_key not in bot_state["setup_memory"]:
+                                    bot_state["setup_memory"][setup_key] = {"wins": 0, "losses": 0}
+                                if upnl > 0:
+                                    bot_state["setup_memory"][setup_key]["wins"] += 1
+                                else:
+                                    bot_state["setup_memory"][setup_key]["losses"] += 1
+                                mem = bot_state["setup_memory"][setup_key]
+                                total = mem["wins"] + mem["losses"]
+                                wr = mem["wins"]/total*100 if total else 0
+                                blog(f"Setup memory: {setup_key} → {wr:.0f}% WR "
+                                     f"({mem['wins']}W/{mem['losses']}L)", "info")
+                            except Exception as me:
+                                pass
                             # Save state
                             save_state({
                                 "last_ip":         _ip_state["current"],
@@ -1263,6 +1353,12 @@ def run_cycle():
         blog(f"━━ PRO CYCLE | Trades:{s['trades_today']}/6 | "
              f"Bal:{s['current_balance']:.2f} | "
              f"Buffer:${s['profit_buffer']:.3f} ━━", "bot")
+
+        # Check Delta Exchange status first
+        delta_ok, delta_status = check_delta_status()
+        if not delta_ok:
+            blog(f"⚠️ Delta Exchange: {delta_status} — pausing trading", "error")
+            return
 
         check_ip()
         balance = refresh_balance()
