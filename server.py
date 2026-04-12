@@ -1,181 +1,88 @@
 # ============================================
-# ΔLPHA PRO — CONTINUOUS EXECUTION BOT (FINAL)
+# ΔLPHA PRO — FINAL SERVER + EXECUTION ENGINE
 # ============================================
 
-import time, requests
+import time, threading, requests
+from flask import Flask, jsonify
+
+app = Flask(__name__)
 
 BASE_URL = "https://api.india.delta.exchange"
 
+bot_running = False
+
 bot_state = {
-    "trail_state": {},
-    "stats": {
-        "current_balance": 70,
-        "trades_today": 0
-    }
+    "trail": {},
+    "balance": 70,
+    "positions": []
 }
+
+# ============================================
+# API HELPERS
+# ============================================
+def pub_get(path):
+    try:
+        return requests.get(BASE_URL + path).json()
+    except:
+        return {}
+
+def dx_post(path, body):
+    try:
+        return requests.post(BASE_URL + path, json=body).json()
+    except:
+        return {}
 
 # ============================================
 # LOGGER
 # ============================================
-def blog(msg, level="info"):
-    print(f"[{level.upper()}] {msg}")
-
-# ============================================
-# API
-# ============================================
-def pub_get(path):
-    return requests.get(BASE_URL + path).json()
-
-def dx_post(path, body):
-    return requests.post(BASE_URL + path, json=body).json()
+def log(msg):
+    print(f"[BOT] {msg}")
 
 # ============================================
 # LIQUIDITY FILTER
 # ============================================
-def filter_liquid_options(options):
-    liquid = []
-    for p in options:
-        vol = float(p.get("volume", 0) or 0)
-        oi  = float(p.get("open_interest", 0) or 0)
-
-        if vol > 1000 or oi > 500:
-            liquid.append(p)
-
-    return liquid
+def filter_liquid(options):
+    return [
+        p for p in options
+        if float(p.get("volume", 0) or 0) > 1000
+        or float(p.get("open_interest", 0) or 0) > 500
+    ]
 
 # ============================================
-# SMART STRIKE SELECTION
+# STRIKE SELECTION
 # ============================================
-def select_best_option(options, price, direction):
-
+def select_option(options, price, direction):
     def score(p):
         try:
             strike = float(p["symbol"].split("-")[2])
-
-            if direction == "BUY_CALL":
-                diff = strike - price
-            else:
-                diff = price - strike
-
-            if 0 < diff <= price * 0.02:
-                return (0, diff)
-            elif diff > 0:
-                return (1, diff)
-            else:
-                return (2, abs(diff))
+            diff = abs(strike - price)
+            return diff
         except:
-            return (3, 999999)
+            return 999999
 
     options.sort(key=score)
-    return options[0]
+    return options[0] if options else None
 
 # ============================================
 # POSITION SIZE
 # ============================================
-def get_position_size(balance, confidence):
-    base = 0.02
-
+def get_size(balance, confidence):
     if confidence >= 90:
         mult = 2
     elif confidence >= 80:
         mult = 1.5
-    elif confidence >= 70:
-        mult = 1.2
     else:
-        mult = 0.7
+        mult = 1
 
-    return balance * base * mult
-
-# ============================================
-# MICRO TRAILING + STOP LOSS
-# ============================================
-def micro_manage(sym, entry, mark):
-
-    pnl = ((mark - entry) / entry * 100)
-
-    trail = bot_state["trail_state"].get(sym, {"peak": 0, "floor": None})
-
-    if pnl > trail["peak"]:
-        trail["peak"] = pnl
-
-    # PROFIT FLOORING
-    if pnl > 1: trail["floor"] = 0.5
-    if pnl > 2: trail["floor"] = 1
-    if pnl > 3: trail["floor"] = 2
-    if pnl > 5: trail["floor"] = 3
-    if pnl > 8: trail["floor"] = 5
-
-    bot_state["trail_state"][sym] = trail
-
-    # FAST LOSS EXIT
-    if pnl <= -4:
-        return True, f"Stop loss {pnl:.1f}%"
-
-    # PROFIT LOCK EXIT
-    if trail["floor"] and pnl < trail["floor"]:
-        return True, f"Locked profit {trail['floor']}%"
-
-    return False, ""
+    return max(1, int(balance * 0.02 * mult / (70000 * 0.015)))
 
 # ============================================
-# QUICK FLOOR/CEILING TRADES
-# ============================================
-def quick_trade(price, support, resistance):
-
-    if (price - support)/price*100 < 0.6:
-        return "BUY_CALL", 68
-
-    if (resistance - price)/price*100 < 0.6:
-        return "BUY_PUT", 68
-
-    return None, 0
-
-# ============================================
-# EXECUTE TRADE
-# ============================================
-def execute_trade(asset, direction, price, confidence):
-
-    if confidence < 65:
-        return
-
-    products = pub_get("/v2/products?states=live&page_size=500")["result"]
-
-    opt_type = "call_options" if direction == "BUY_CALL" else "put_options"
-
-    options = [p for p in products
-               if p["contract_type"] == opt_type
-               and asset in p["symbol"]]
-
-    options = filter_liquid_options(options)
-
-    if not options:
-        blog(f"{asset} no liquidity", "warning")
-        return
-
-    product = select_best_option(options, price, direction)
-
-    balance = bot_state["stats"]["current_balance"]
-    risk = get_position_size(balance, confidence)
-
-    size = max(1, min(3, int(risk / (price * 0.015))))
-
-    blog(f"{asset} {direction} size {size} conf {confidence}")
-
-    dx_post("/v2/orders", {
-        "product_id": product["id"],
-        "size": size,
-        "side": "buy",
-        "order_type": "market_order"
-    })
-
-# ============================================
-# POSITION MANAGER
+# MICRO TRAILING
 # ============================================
 def manage_positions():
+    data = pub_get("/v2/positions/margined").get("result", [])
 
-    positions = pub_get("/v2/positions/margined").get("result", [])
-
-    for p in positions:
+    for p in data:
         size = float(p.get("size", 0))
         if abs(size) == 0:
             continue
@@ -184,10 +91,24 @@ def manage_positions():
         entry = float(p["entry_price"])
         mark = float(p["mark_price"])
 
-        should_close, reason = micro_manage(sym, entry, mark)
+        pnl = (mark - entry) / entry * 100
 
-        if should_close:
-            blog(f"{sym} closing {reason}")
+        trail = bot_state["trail"].get(sym, {"peak": 0, "floor": None})
+
+        if pnl > trail["peak"]:
+            trail["peak"] = pnl
+
+        # PROFIT FLOOR
+        if pnl > 1: trail["floor"] = 0.5
+        if pnl > 2: trail["floor"] = 1
+        if pnl > 3: trail["floor"] = 2
+        if pnl > 5: trail["floor"] = 3
+
+        bot_state["trail"][sym] = trail
+
+        # EXIT CONDITIONS
+        if pnl <= -4 or (trail["floor"] and pnl < trail["floor"]):
+            log(f"Closing {sym} pnl {pnl:.1f}%")
 
             dx_post("/v2/orders", {
                 "product_symbol": sym,
@@ -198,53 +119,114 @@ def manage_positions():
             })
 
 # ============================================
-# MOCK ANALYSIS (REPLACE WITH YOUR ENGINE)
+# QUICK TRADE LOGIC
 # ============================================
-def fake_analysis():
+def quick_trade(price, support, resistance):
+
+    if (price - support)/price*100 < 0.6:
+        return "BUY_CALL", 70
+
+    if (resistance - price)/price*100 < 0.6:
+        return "BUY_PUT", 70
+
+    return None, 0
+
+# ============================================
+# EXECUTE TRADE
+# ============================================
+def execute(asset, direction, price, confidence):
+
+    if confidence < 65:
+        return
+
+    products = pub_get("/v2/products?states=live&page_size=500").get("result", [])
+
+    opt_type = "call_options" if direction == "BUY_CALL" else "put_options"
+
+    options = [
+        p for p in products
+        if p["contract_type"] == opt_type
+        and asset in p["symbol"]
+    ]
+
+    options = filter_liquid(options)
+    if not options:
+        return
+
+    product = select_option(options, price, direction)
+    size = get_size(bot_state["balance"], confidence)
+
+    log(f"{asset} {direction} size {size}")
+
+    dx_post("/v2/orders", {
+        "product_id": product["id"],
+        "size": size,
+        "side": "buy",
+        "order_type": "market_order"
+    })
+
+# ============================================
+# MOCK ANALYSIS (REPLACE WITH YOUR REAL ONE)
+# ============================================
+def analysis():
     return {
         "asset": "BTC",
         "price": 70000,
         "support": 69500,
         "resistance": 70500,
         "direction": "BUY_PUT",
-        "confidence": 82
+        "confidence": 80
     }
 
 # ============================================
-# MAIN LOOP
+# MAIN BOT LOOP (KEY FIX)
 # ============================================
-def run():
+def bot_loop():
+    global bot_running
 
-    while True:
+    while bot_running:
         try:
-            a = fake_analysis()
+            a = analysis()
 
             # QUICK TRADE
-            qt_dir, qt_conf = quick_trade(
-                a["price"], a["support"], a["resistance"]
-            )
+            d, c = quick_trade(a["price"], a["support"], a["resistance"])
+            if d:
+                execute(a["asset"], d, a["price"], c)
 
-            if qt_dir:
-                execute_trade(a["asset"], qt_dir, a["price"], qt_conf)
-
-            # SWING TRADE
-            execute_trade(
-                a["asset"],
-                a["direction"],
-                a["price"],
-                a["confidence"]
-            )
+            # MAIN TRADE
+            execute(a["asset"], a["direction"], a["price"], a["confidence"])
 
             # MANAGE POSITIONS
             manage_positions()
 
         except Exception as e:
-            blog(str(e), "error")
+            log(str(e))
 
-        time.sleep(30)  # FAST LOOP
+        time.sleep(20)  # FAST LOOP
 
 # ============================================
-# START
+# API ROUTES
+# ============================================
+@app.route("/api/start")
+def start():
+    global bot_running
+    if not bot_running:
+        bot_running = True
+        threading.Thread(target=bot_loop).start()
+    return jsonify({"status": "started"})
+
+@app.route("/api/stop")
+def stop():
+    global bot_running
+    bot_running = False
+    return jsonify({"status": "stopped"})
+
+@app.route("/api/status")
+def status():
+    return jsonify({"running": bot_running})
+
+# ============================================
+# RUN SERVER
 # ============================================
 if __name__ == "__main__":
-    run()
+    app.run(host="0.0.0.0", port=5000)
