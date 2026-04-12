@@ -533,8 +533,8 @@ def full_analysis(asset):
         "STRONG_BULL": {"PUT": 75, "CALL": 0},
         "BULL":        {"PUT": 68, "CALL": 0},
         "NEUTRAL":     {"PUT": 0,  "CALL": 0},
-       "BEAR":        {"PUT": 0,  "CALL": 58},
-        "STRONG_BEAR": {"PUT": 0,  "CALL": 60},
+        "BEAR":        {"PUT": 0,  "CALL": 68},
+        "STRONG_BEAR": {"PUT": 0,  "CALL": 75},
     }
     thresholds = veto_thresholds.get(regime, {"PUT": 0, "CALL": 0})
 
@@ -891,10 +891,6 @@ def execute_trade(analysis):
     if direction not in ("BUY_CALL","BUY_PUT","STRADDLE"):
         return False
 
-    # Startup delay — 2 minutes after restart
-    if time.time() - bot_state["startup_time"] < 120:
-        blog(f"[{asset}] Startup delay — waiting 2 mins", "info")
-        return False
 
     ok, reason = risk_ok()
     if not ok:
