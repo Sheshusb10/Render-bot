@@ -989,7 +989,7 @@ def manage_positions():
             if pnl_pct > trail["peak"]:
                 trail["peak"] = pnl_pct
                 # Progressive floors
-                floors = [(50,45),(30,25),(25,22),(20,17),(15,12),(12,10),(10,8),(8,6)]
+                floors = [(50,45),(30,25),(25,22),(20,17),(15,12),(12,10),(10,8),(8,6),(5,3),(3,1)]
                 for threshold, floor in floors:
                     if pnl_pct >= threshold:
                         trail["floor"] = floor
@@ -1177,12 +1177,39 @@ def execute_trade(analysis):
         blog(f"[{asset}] No liquid options — using best available", "warning")
         liquid_options = valid  # fallback to any option
 
-    product = liquid_options[0]  # ATM with liquidity
+    # Smart strike selection:
+    # PUT: pick strike 0.5-2% BELOW current price (OTM put)
+    # CALL: pick strike 0.5-2% ABOVE current price (OTM call)
+    def otm_score(p):
+        try:
+            strike = float(p["symbol"].split("-")[2])
+            if direction == "BUY_PUT":
+                # Prefer strike slightly below price
+                diff = price - strike
+                if 0 < diff <= price * 0.03:  # 0-3% OTM
+                    return (0, diff)  # best range
+                elif diff > price * 0.03:
+                    return (1, diff)  # too far OTM
+                else:
+                    return (2, abs(diff))  # ITM put (avoid)
+            else:  # BUY_CALL
+                diff = strike - price
+                if 0 < diff <= price * 0.03:  # 0-3% OTM
+                    return (0, diff)
+                elif diff > price * 0.03:
+                    return (1, diff)
+                else:
+                    return (2, abs(diff))
+        except:
+            return (3, 999999)
+
+    liquid_options.sort(key=otm_score)
+    product = liquid_options[0]  # Best OTM option with liquidity
     strike  = product["symbol"].split("-")[2] if "-" in product["symbol"] else "?"
     hrs     = get_hours(product)
     vol_24h = float(product.get("volume", 0) or 0)
     oi_val  = float(product.get("open_interest", 0) or 0)
-    blog(f"[{asset}] Liquidity: Vol={vol_24h:.0f} OI={oi_val:.0f}", "info")
+    blog(f"[{asset}] Selected: {product['symbol']} | Vol={vol_24h:.0f} OI={oi_val:.0f}", "info")
 
     # Risk-based position sizing
     # risk per trade = 2% of balance * confidence factor
@@ -1221,7 +1248,11 @@ def execute_trade(analysis):
             "order_type":     "market_order",
         })
         if resp.get("error"):
-            blog(f"[{asset}] Failed: {resp['error'].get('code','err')}", "error")
+            err = resp["error"]
+            blog(f"[{asset}] Failed: {err.get('code','err')} — {err.get('context','')}", "error")
+            return False
+        if not resp.get("result"):
+            blog(f"[{asset}] No result in response: {str(resp)[:100]}", "error")
             return False
 
         blog(f"[{asset}] ✓ {direction} {size}x filled: {product['symbol']}", "success")
@@ -1238,7 +1269,7 @@ def execute_trade(analysis):
         return True
     except Exception as e:
         blog(f"[{asset}] Exception: {e}", "error")
-        bot_state["stats"]["consecutive_losses"] += 1
+        # Don't count order errors as losses — only real closed positions count
         return False
 
 def execute_straddle(asset, price, products):
@@ -1400,7 +1431,7 @@ def run_scalper(analyses):
                     should_close = True; reason = f"✅ TP +{pnl_pct:.1f}%"
                 elif pnl_pct <= sc["stop_pct"]:
                     should_close = True; reason = f"❌ SL {pnl_pct:.1f}%"
-                elif peak >= sc["target_pct"] * 0.5 and pnl_pct < peak * 0.55:
+                elif peak >= sc["target_pct"] * 0.4 and pnl_pct < peak * 0.5:
                     should_close = True
                     reason = f"🔒 Trail: peak +{peak:.1f}% now +{pnl_pct:.1f}%"
 
