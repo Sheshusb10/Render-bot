@@ -67,7 +67,7 @@ bot_state = {
         "max_trades": 6,        # max scalper trades per day
         "target_pct": 8.0,      # take profit at +8%
         "stop_pct": -12.0,      # stop loss at -12%
-        "min_confidence": 60,   # min confidence to scalp
+        "min_confidence": 52,   # min confidence to scalp
     },
     "setup_memory": _saved.get("setup_memory", {
         "STRONG_BEAR_CALL": {"wins": 0, "losses": 0},
@@ -507,7 +507,7 @@ def full_analysis(asset):
 
     # ── Volatility spike kill switch ─────────────────────────────
     # If price moved >5% in last hour = abnormal, skip trading
-    if abs(chg_1h) > 5.0:
+    if abs(chg_1h) > 8.0:
         blog(f"[{asset}] ⚠️ Volatility spike {chg_1h:.1f}% — skipping", "warning")
         return {
             "asset": asset, "price": price, "direction": "NO TRADE",
@@ -645,9 +645,9 @@ def full_analysis(asset):
     bear_pct = round(bear / total * 100, 1)
 
     # ── Direction with minimum confidence 75% ────────────────────
-    if bull > bear and bull_pct >= 62:
+    if bull > bear and bull_pct >= 55:
         direction = "BUY_CALL"; conf = bull_pct
-    elif bear > bull and bear_pct >= 62:
+    elif bear > bull and bear_pct >= 55:
         direction = "BUY_PUT";  conf = bear_pct
     else:
         direction = "NO TRADE"; conf = max(bull_pct, bear_pct)
@@ -670,14 +670,14 @@ def full_analysis(asset):
 
     # High vol — only allow trend following trades
     if vol_regime == "HIGH" and direction != "NO TRADE":
-        # In high vol only trade WITH trend, not against
+        # In high vol only block weak counter-trend setups
         is_with_trend = (
             (direction == "BUY_CALL" and chg_4h > 0) or
             (direction == "BUY_PUT"  and chg_4h < 0)
         )
-        if not is_with_trend:
+        if not is_with_trend and conf < 70:
             direction = "NO TRADE"
-            reasons.append(f"High vol ({bb_width:.1f}%) — counter-trend blocked")
+            reasons.append(f"High vol ({bb_width:.1f}%) + weak conf — blocked")
 
     # ── Trade Memory Adjustment ──────────────────────────────────
     # If this setup historically loses, reduce confidence
@@ -708,11 +708,11 @@ def full_analysis(asset):
             vol_factor = -5  # loosen veto in low vol
 
     veto_thresholds = {
-        "STRONG_BULL": {"PUT": 72 + vol_factor, "CALL": 0},
-        "BULL":        {"PUT": 65 + vol_factor, "CALL": 0},
+        "STRONG_BULL": {"PUT": 60 + vol_factor, "CALL": 0},
+        "BULL":        {"PUT": 58 + vol_factor, "CALL": 0},
         "NEUTRAL":     {"PUT": 0,               "CALL": 0},
-        "BEAR":        {"PUT": 0,  "CALL": 58 + vol_factor},
-        "STRONG_BEAR": {"PUT": 0,  "CALL": 60 + vol_factor},
+        "BEAR":        {"PUT": 0,  "CALL": 52 + vol_factor},
+        "STRONG_BEAR": {"PUT": 0,  "CALL": 55 + vol_factor},
     }
     thresholds = veto_thresholds.get(regime, {"PUT": 0, "CALL": 0})
 
@@ -1627,6 +1627,17 @@ def run_cycle():
         # ── MODE 2: SCALPER STRATEGY ─────────────────────────────
         # Independent — quick trades, 8% target, doesn't wait for swing
         run_scalper(analyses)
+
+        # ── FORCE TRADE: Last resort if nothing triggered ─────────
+        # If swing found no setup and scalper has no active trade,
+        # force best available signal if confidence >= 50%
+        sc = bot_state["scalper"]
+        if not best and not sc["active_trade"] and analyses:
+            force_best = max(analyses.values(), key=lambda x: x["confidence"])
+            if force_best["confidence"] >= 50 and force_best["direction"] != "NO TRADE":
+                blog(f"⚡ Force trade: {force_best['asset']} "
+                     f"{force_best['direction']} {force_best['confidence']}%", "warning")
+                execute_trade(force_best)
 
         total = s["wins"] + s["losses"]
         if total > 0: s["win_rate"] = round(s["wins"]/total*100, 1)
