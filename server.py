@@ -1097,12 +1097,13 @@ def run_cycle():
 
                 # Run execution engine
                 a = execution_engine(a)
+                analyses[asset] = a  # update with post-engine version
 
                 if a["confidence"] > best_conf:
                     best_conf = a["confidence"]
                     best      = a
             except Exception as e:
-                blog(f"[{asset}] Error: {e}","error")
+                blog(f"[{asset}] Error: {traceback.format_exc()}","error")
 
         if not best:
             blog("No valid setup this cycle","info")
@@ -1111,21 +1112,11 @@ def run_cycle():
         blog(f"Best: {best['asset']} {best['direction']} "
              f"{best['confidence']}% ({best.get('aggression','NORMAL')})", "bot")
 
-        # High conviction — trade immediately
-        if best["confidence"] >= 70:
-            execute_trade(best)
-            return
-
-        # Check if multiple assets agree
-        directions = [a["direction"] for a in analyses.values()
-                      if a.get("direction") not in ("NO TRADE",)]
-        if len(set(directions)) == 1 and len(directions) >= 2:
-            blog(f"Confluence: all agree {directions[0]}", "bot")
-            execute_trade(best)
-        elif best["confidence"] >= 55:
+        # Trade if confidence meets threshold
+        if best["confidence"] >= 55:
             execute_trade(best)
         else:
-            blog(f"Insufficient confluence — waiting","info")
+            blog(f"Confidence too low: {best['confidence']}% — waiting","info")
 
         total = s["wins"] + s["losses"]
         if total > 0: s["win_rate"] = round(s["wins"]/total*100, 1)
