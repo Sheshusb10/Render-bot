@@ -1276,7 +1276,27 @@ def api_health():
         "base": BASE_URL,
         "ip":   _ip_state.get("current",""),
     })
-
+@app.route("/api/test")
+def api_test():
+    results = {}
+    # Test Binance
+    for url in [
+        "https://api.binance.us/api/v3/ping",
+        "https://api.binance.com/api/v3/ping",
+        "https://api1.binance.com/api/v3/ping",
+    ]:
+        try:
+            r = requests.get(url, timeout=5)
+            results[url] = f"OK {r.status_code}"
+        except Exception as e:
+            results[url] = f"FAIL: {str(e)[:50]}"
+    # Test CoinGecko
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/ping", timeout=5)
+        results["coingecko"] = f"OK {r.status_code}"
+    except Exception as e:
+        results["coingecko"] = f"FAIL: {str(e)[:50]}"
+    return jsonify(results)
 if __name__ == "__main__":
     os.makedirs("static", exist_ok=True)
     port = int(os.environ.get("PORT", 8080))
