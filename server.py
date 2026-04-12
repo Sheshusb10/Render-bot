@@ -56,6 +56,7 @@ bot_state = {
     "log":      [],
     "cycle_lock": False,
     "startup_time": time.time(),
+    "pending_signal": {},  # signal waiting for confirmation
     "stats": {
         "trades_today":       0,
         "wins":               0,
@@ -163,24 +164,39 @@ BINANCE_SYM = {
     "BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT"
 }
 
+# Price cache — avoid hammering Binance every cycle
+_price_cache = {}
+_price_cache_ttl = 30  # seconds
+
 def get_price(asset):
+    # Return cached price if fresh
+    cached = _price_cache.get(asset.upper())
+    if cached and time.time() - cached["ts"] < _price_cache_ttl:
+        return cached["price"]
+
     sym = BINANCE_SYM.get(asset.upper())
+    price = 0.0
     if sym:
         for base in ["https://api.binance.us", "https://api.binance.com"]:
             try:
                 r = requests.get(f"{base}/api/v3/ticker/price?symbol={sym}", timeout=5)
                 if r.status_code == 200:
-                    return float(r.json()["price"])
+                    price = float(r.json()["price"])
+                    break
             except: continue
-    try:
-        gecko = {"BTC":"bitcoin","ETH":"ethereum","SOL":"solana"}.get(asset.upper())
-        if gecko:
-            r = requests.get(
-                f"https://api.coingecko.com/api/v3/simple/price"
-                f"?ids={gecko}&vs_currencies=usd", timeout=5)
-            return float(list(r.json().values())[0]["usd"])
-    except: pass
-    return 0.0
+    if not price:
+        try:
+            gecko = {"BTC":"bitcoin","ETH":"ethereum","SOL":"solana"}.get(asset.upper())
+            if gecko:
+                r = requests.get(
+                    f"https://api.coingecko.com/api/v3/simple/price"
+                    f"?ids={gecko}&vs_currencies=usd", timeout=5)
+                price = float(list(r.json().values())[0]["usd"])
+        except: pass
+
+    if price:
+        _price_cache[asset.upper()] = {"price": price, "ts": time.time()}
+    return price
 
 def get_candles(asset, interval="1h", limit=50):
     sym = BINANCE_SYM.get(asset.upper())
@@ -543,12 +559,22 @@ def full_analysis(asset):
             reasons.append("Sideways + BB squeeze — straddle opportunity")
 
     # ── Regime Hard Veto ─────────────────────────────────────────
+    # Dynamic regime veto — tighter in high volatility
+    vol_factor = 0
+    if c1h:
+        recent_range = max(c["high"] for c in c1h[-5:]) - min(c["low"] for c in c1h[-5:])
+        avg_range = sum(c["high"]-c["low"] for c in c1h[-20:]) / 20 if len(c1h) >= 20 else recent_range
+        if recent_range > avg_range * 1.5:
+            vol_factor = 5  # tighten veto in high vol
+        elif recent_range < avg_range * 0.7:
+            vol_factor = -5  # loosen veto in low vol
+
     veto_thresholds = {
-        "STRONG_BULL": {"PUT": 72, "CALL": 0},
-        "BULL":        {"PUT": 65, "CALL": 0},
-        "NEUTRAL":     {"PUT": 0,  "CALL": 0},
-        "BEAR":        {"PUT": 0,  "CALL": 58},
-        "STRONG_BEAR": {"PUT": 0,  "CALL": 60},
+        "STRONG_BULL": {"PUT": 72 + vol_factor, "CALL": 0},
+        "BULL":        {"PUT": 65 + vol_factor, "CALL": 0},
+        "NEUTRAL":     {"PUT": 0,               "CALL": 0},
+        "BEAR":        {"PUT": 0,  "CALL": 58 + vol_factor},
+        "STRONG_BEAR": {"PUT": 0,  "CALL": 60 + vol_factor},
     }
     thresholds = veto_thresholds.get(regime, {"PUT": 0, "CALL": 0})
 
@@ -919,10 +945,21 @@ def execute_trade(analysis):
             blog(f"[{asset}] Already have open position — skip","info")
             return False
 
-        # 2nd position only at 85%+
-        if len(open_syms) >= 1 and conf < 85:
-            blog(f"[{asset}] 2nd position needs 85%+ (got {conf}%) — skip","info")
-            return False
+        # Correlation filter — BTC and ETH move together
+        # Don't open ETH call if BTC call already open (double risk)
+        if len(open_syms) >= 1:
+            # Check direction of existing positions
+            existing_calls = any("C-" in s for s in open_syms)
+            existing_puts  = any("P-" in s for s in open_syms)
+            is_call = "CALL" in direction
+            is_put  = "PUT"  in direction
+            if (is_call and existing_calls) or (is_put and existing_puts):
+                if conf < 85:
+                    blog(f"[{asset}] Correlation block — same direction already open "
+                         f"(need 85%+ got {conf}%) — skip","info")
+                    return False
+                else:
+                    blog(f"[{asset}] High conviction {conf}% — allowing despite correlation","info")
 
         # Max 3 simultaneous positions
         if len(open_syms) >= 3:
@@ -964,9 +1001,27 @@ def execute_trade(analysis):
         try: return abs(float(p["symbol"].split("-")[2]) - price)
         except: return 999999
 
-    product = min(valid, key=strike_dist)
+    # Sort by strike distance first
+    valid.sort(key=strike_dist)
+
+    # Liquidity check — skip options with no volume
+    liquid_options = []
+    for p in valid:
+        vol_24h = float(p.get("volume", 0) or p.get("turnover_24h", 0) or 0)
+        oi = float(p.get("open_interest", 0) or 0)
+        if vol_24h > 0 or oi > 0:
+            liquid_options.append(p)
+
+    if not liquid_options:
+        blog(f"[{asset}] No liquid options — using best available", "warning")
+        liquid_options = valid  # fallback to any option
+
+    product = liquid_options[0]  # ATM with liquidity
     strike  = product["symbol"].split("-")[2] if "-" in product["symbol"] else "?"
     hrs     = get_hours(product)
+    vol_24h = float(product.get("volume", 0) or 0)
+    oi_val  = float(product.get("open_interest", 0) or 0)
+    blog(f"[{asset}] Liquidity: Vol={vol_24h:.0f} OI={oi_val:.0f}", "info")
 
     # Size based on aggression
     base_size = 1
@@ -1181,11 +1236,36 @@ def run_cycle():
         blog(f"Best: {best['asset']} {best['direction']} "
              f"{best['confidence']}% ({best.get('aggression','NORMAL')})", "bot")
 
-        # Trade if confidence meets threshold
-        if best["confidence"] >= 55:
+        # Signal confirmation — require signal to persist 1 cycle
+        pending = bot_state.get("pending_signal", {})
+        same_asset = pending.get("asset") == best["asset"]
+        same_dir   = pending.get("direction") == best["direction"]
+        pending_age = time.time() - pending.get("ts", 0)
+
+        if best["confidence"] >= 75:
+            # High conviction — trade immediately, no confirmation needed
+            blog(f"High conviction {best['confidence']}% — trading immediately", "bot")
+            bot_state["pending_signal"] = {}
             execute_trade(best)
+        elif same_asset and same_dir and pending_age < 600:
+            # Signal confirmed — same signal in 2 consecutive cycles
+            blog(f"Signal confirmed: {best['asset']} {best['direction']} "
+                 f"({best['confidence']}%) — executing", "bot")
+            bot_state["pending_signal"] = {}
+            execute_trade(best)
+        elif best["confidence"] >= 55:
+            # Store as pending — wait for next cycle to confirm
+            bot_state["pending_signal"] = {
+                "asset":     best["asset"],
+                "direction": best["direction"],
+                "confidence": best["confidence"],
+                "ts":        time.time(),
+            }
+            blog(f"Signal pending confirmation: {best['asset']} "
+                 f"{best['direction']} {best['confidence']}% — waiting 1 cycle", "info")
         else:
-            blog(f"Confidence too low: {best['confidence']}% — waiting","info")
+            blog(f"Confidence too low: {best['confidence']}% — skipping","info")
+            bot_state["pending_signal"] = {}
 
         total = s["wins"] + s["losses"]
         if total > 0: s["win_rate"] = round(s["wins"]/total*100, 1)
