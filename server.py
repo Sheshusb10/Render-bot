@@ -1229,6 +1229,8 @@ def api_bot_start():
     d = request.json or {}
     if bot_state["running"]:
         return jsonify({"ok":False,"error":"Already running"})
+        if not API_KEY or not API_SECRET:
+        return jsonify({"ok":False,"error":"Connect API key first"})
     bot_state["interval"]     = max(180, int(d.get("interval",300)))
     bot_state["running"]      = True
     bot_state["startup_time"] = time.time()
