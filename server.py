@@ -398,6 +398,14 @@ def full_analysis(asset):
 
     bull = 0; bear = 0; reasons = []
 
+    # ── Extreme oversold bounce signal ────────────────────────────
+    if rsi_1h < 25 and bb_1h["position"] == "LOWER":
+        bull += 20
+        reasons.append(f"🚨 Extreme oversold RSI {rsi_1h} — bounce signal")
+    if rsi_1h < 20:
+        bull += 15
+        reasons.append(f"RSI {rsi_1h} — historic oversold level")
+
     # ── RSI — adjusted thresholds based on regime ─────────────────
     if regime in ("STRONG_BULL", "BULL"):
         # In bull market RSI 60-75 is healthy, not overbought
