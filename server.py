@@ -679,9 +679,7 @@ def execution_engine(analysis):
             body = abs(last["close"]-last["open"])
             pbody = abs(prev["close"]-prev["open"])
             if body > pbody * 1.5:
-                result["confidence"]      -= 10
-                result["size_multiplier"] *= 0.7
-                result["log"].append("Sharp opposite 15m candle — reduce size")
+                result["log"].append("Sharp opposite 15m candle — noted only")
 
     # Final confidence gate
     final_conf = max(0, min(100, result["confidence"]))
@@ -1081,7 +1079,7 @@ def run_cycle():
         best = None; best_conf = 0
         analyses = {}
 
-        for asset in ["BTC","ETH","SOL"]:
+        for asset in ["BTC","ETH"]:
             try:
                 a = full_analysis(asset)
                 if not a: continue
