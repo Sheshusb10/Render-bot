@@ -280,7 +280,18 @@ def analysis_route():
         "price": a[2],
         "confidence": a[3]
     })
+# ============================================
+# AUTO START BOT (FIX)
+# ============================================
+def auto_start():
+    global bot_running, bot_thread
+    if not bot_running:
+        bot_running = True
+        bot_thread = threading.Thread(target=bot_loop, daemon=True)
+        bot_thread.start()
+        log("🔥 Bot auto-started")
 
+auto_start()
 # ============================================
 # RUN
 # ============================================
