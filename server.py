@@ -1,5 +1,5 @@
 # ============================================
-# ΔLPHA PRO — STABLE COMPUNDING BOT (FINAL FIX)
+# ΔLPHA PRO — STABLE COMPUNDING BOT (404 FIX)
 # ============================================
 
 import time, threading, requests
@@ -226,7 +226,7 @@ def bot_loop():
         time.sleep(10)
 
 # ============================================
-# API ROUTES (STABLE)
+# API ROUTES
 # ============================================
 @app.route("/")
 def home():
@@ -252,6 +252,34 @@ def stop():
 @app.route("/api/status")
 def status():
     return jsonify({"running": bot_running})
+
+# ============================================
+# ✅ FIXED ROUTES (NO MORE 404)
+# ============================================
+@app.route("/api/bot/status")
+def bot_status():
+    return jsonify({"running": bot_running})
+
+@app.route("/api/orders")
+def orders():
+    return jsonify(pub_get("/v2/orders"))
+
+@app.route("/api/positions")
+def positions():
+    return jsonify(pub_get("/v2/positions/margined"))
+
+@app.route("/api/analysis")
+def analysis_route():
+    a = analysis()
+    if not a:
+        return jsonify({"status": "no data"})
+
+    return jsonify({
+        "asset": a[0],
+        "direction": a[1],
+        "price": a[2],
+        "confidence": a[3]
+    })
 
 # ============================================
 # RUN
