@@ -1068,8 +1068,16 @@ def execute_straddle(asset, price, products):
 
 # ── Main Bot Cycle ────────────────────────────────────────────────
 def run_cycle():
-    if bot_state["cycle_lock"]: return
+    # Auto-release lock if stuck for more than 60 seconds
+    lock_time = bot_state.get("cycle_lock_time", 0)
+    if bot_state["cycle_lock"]:
+        if time.time() - lock_time > 60:
+            blog("Cycle lock auto-released after timeout", "warning")
+            bot_state["cycle_lock"] = False
+        else:
+            return
     bot_state["cycle_lock"] = True
+    bot_state["cycle_lock_time"] = time.time()
 
     try:
         s = bot_state["stats"]
