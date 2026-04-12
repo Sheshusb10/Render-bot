@@ -797,7 +797,7 @@ def manage_positions():
             except: pass
 
             # Stop loss -40%
-            if not should_close and pnl_pct <= -40:
+            if not should_close and pnl_pct <= -15%:
                 should_close = True
                 close_reason = f"Stop loss -40%: {pnl_pct:.1f}%"
 
