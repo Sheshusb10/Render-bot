@@ -152,12 +152,12 @@ BINANCE_SYM = {
 def get_price(asset):
     sym = BINANCE_SYM.get(asset.upper())
     if sym:
-        try:
-            r = requests.get(
-                f"https://api.binance.com/api/v3/ticker/price?symbol={sym}",
-                timeout=5)
-            return float(r.json()["price"])
-        except: pass
+        for base in ["https://api.binance.us", "https://api.binance.com"]:
+            try:
+                r = requests.get(f"{base}/api/v3/ticker/price?symbol={sym}", timeout=5)
+                if r.status_code == 200:
+                    return float(r.json()["price"])
+            except: continue
     try:
         gecko = {"BTC":"bitcoin","ETH":"ethereum","SOL":"solana"}.get(asset.upper())
         if gecko:
@@ -171,22 +171,34 @@ def get_price(asset):
 def get_candles(asset, interval="1h", limit=50):
     sym = BINANCE_SYM.get(asset.upper())
     if not sym: return []
-    urls = [
-        f"https://api.binance.us/api/v3/klines?symbol={sym}&interval={interval}&limit={limit}",
-        f"https://api.binance.com/api/v3/klines?symbol={sym}&interval={interval}&limit={limit}",
-        f"https://api1.binance.com/api/v3/klines?symbol={sym}&interval={interval}&limit={limit}",
-    ]
-    for url in urls:
-        try:
-            r = requests.get(url, timeout=8)
-            if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, list) and len(data) > 0:
-                    return [{"open": float(k[1]), "high": float(k[2]),
-                             "low":  float(k[3]), "close": float(k[4]),
-                             "volume": float(k[5])} for k in data]
-        except: continue
-    blog(f"[{asset}] All candle sources failed for {interval}", "warning")
+    # Binance US works from Render servers
+    url = f"https://api.binance.us/api/v3/klines?symbol={sym}&interval={interval}&limit={limit}"
+    try:
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list) and len(data) > 0:
+                return [{"open": float(k[1]), "high": float(k[2]),
+                         "low":  float(k[3]), "close": float(k[4]),
+                         "volume": float(k[5])} for k in data]
+    except Exception as e:
+        blog(f"[{asset}] binance.us failed: {e}", "warning")
+
+    # Fallback to global Binance
+    try:
+        r = requests.get(
+            f"https://api.binance.com/api/v3/klines?symbol={sym}&interval={interval}&limit={limit}",
+            timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list) and len(data) > 0:
+                return [{"open": float(k[1]), "high": float(k[2]),
+                         "low":  float(k[3]), "close": float(k[4]),
+                         "volume": float(k[5])} for k in data]
+    except Exception as e:
+        blog(f"[{asset}] binance.com failed: {e}", "warning")
+
+    blog(f"[{asset}] All candle sources failed for {interval}", "error")
     return []
 
 # ── Technical Indicators ──────────────────────────────────────────
@@ -1276,27 +1288,7 @@ def api_health():
         "base": BASE_URL,
         "ip":   _ip_state.get("current",""),
     })
-@app.route("/api/test")
-def api_test():
-    results = {}
-    # Test Binance
-    for url in [
-        "https://api.binance.us/api/v3/ping",
-        "https://api.binance.com/api/v3/ping",
-        "https://api1.binance.com/api/v3/ping",
-    ]:
-        try:
-            r = requests.get(url, timeout=5)
-            results[url] = f"OK {r.status_code}"
-        except Exception as e:
-            results[url] = f"FAIL: {str(e)[:50]}"
-    # Test CoinGecko
-    try:
-        r = requests.get("https://api.coingecko.com/api/v3/ping", timeout=5)
-        results["coingecko"] = f"OK {r.status_code}"
-    except Exception as e:
-        results["coingecko"] = f"FAIL: {str(e)[:50]}"
-    return jsonify(results)
+
 if __name__ == "__main__":
     os.makedirs("static", exist_ok=True)
     port = int(os.environ.get("PORT", 8080))
