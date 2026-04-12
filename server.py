@@ -484,9 +484,9 @@ def full_analysis(asset):
     bear_pct = round(bear / total * 100, 1)
 
     # ── Direction with minimum confidence 75% ────────────────────
-    if bull > bear and bull_pct >= 75:
+    if bull > bear and bull_pct >= 62:
         direction = "BUY_CALL"; conf = bull_pct
-    elif bear > bull and bear_pct >= 75:
+    elif bear > bull and bear_pct >= 62:
         direction = "BUY_PUT";  conf = bear_pct
     else:
         direction = "NO TRADE"; conf = max(bull_pct, bear_pct)
@@ -502,11 +502,11 @@ def full_analysis(asset):
 
     # ── Regime Hard Veto ─────────────────────────────────────────
     veto_thresholds = {
-        "STRONG_BULL": {"PUT": 80, "CALL": 0},
-        "BULL":        {"PUT": 75, "CALL": 0},
+        "STRONG_BULL": {"PUT": 75, "CALL": 0},
+        "BULL":        {"PUT": 68, "CALL": 0},
         "NEUTRAL":     {"PUT": 0,  "CALL": 0},
-        "BEAR":        {"PUT": 0,  "CALL": 75},
-        "STRONG_BEAR": {"PUT": 0,  "CALL": 80},
+        "BEAR":        {"PUT": 0,  "CALL": 68},
+        "STRONG_BEAR": {"PUT": 0,  "CALL": 75},
     }
     thresholds = veto_thresholds.get(regime, {"PUT": 0, "CALL": 0})
 
@@ -709,7 +709,7 @@ def risk_ok():
             s["daily_loss_limit_hit"] = True
             return False, "Profit floor breached"
     if s["trades_today"] >= 8: return False, "Max 8 trades/day"
-    if s["consecutive_losses"] >= 3: return False, "3 consecutive losses — pause"
+    if s["consecutive_losses"] >= 4: return False, "4 consecutive losses — pause"
     return True, "OK"
 
 def get_products_cached():
@@ -934,10 +934,10 @@ def execute_trade(analysis):
 
     # Size based on aggression
     base_size = 4
-if aggression == "HIGH":    size = min(7, max(1, round(base_size * size_mult * 1.5)))
-elif aggression == "MEDIUM": size = min(5, max(1, round(base_size * size_mult)))
-elif aggression == "LOW":    size = 2
-else:                        size = min(4, max(1, round(base_size * size_mult)))
+    if aggression == "HIGH":    size = min(7, max(1, round(base_size * size_mult * 1.5)))
+    elif aggression == "MEDIUM": size = min(5, max(1, round(base_size * size_mult)))
+    elif aggression == "LOW":    size = 2
+    else:                        size = min(4, max(1, round(base_size * size_mult)))
 
     blog(f"[{asset}] {direction} | Strike ${strike} | "
          f"Price ${price:.2f} | Conf {conf}% | "
@@ -1088,7 +1088,7 @@ def run_cycle():
              f"{best['confidence']}% ({best.get('aggression','NORMAL')})", "bot")
 
         # High conviction — trade immediately
-        if best["confidence"] >= 85:
+        if best["confidence"] >= 78:
             execute_trade(best)
             return
 
@@ -1098,7 +1098,7 @@ def run_cycle():
         if len(set(directions)) == 1 and len(directions) >= 2:
             blog(f"Confluence: all agree {directions[0]}", "bot")
             execute_trade(best)
-        elif best["confidence"] >= 75:
+        elif best["confidence"] >= 65:
             execute_trade(best)
         else:
             blog(f"Insufficient confluence — waiting","info")
