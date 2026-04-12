@@ -530,8 +530,8 @@ def full_analysis(asset):
 
     # ── Regime Hard Veto ─────────────────────────────────────────
     veto_thresholds = {
-        "STRONG_BULL": {"PUT": 75, "CALL": 0},
-        "BULL":        {"PUT": 68, "CALL": 0},
+        "STRONG_BULL": {"PUT": 72, "CALL": 0},
+        "BULL":        {"PUT": 65, "CALL": 0},
         "NEUTRAL":     {"PUT": 0,  "CALL": 0},
         "BEAR":        {"PUT": 0,  "CALL": 58},
         "STRONG_BEAR": {"PUT": 0,  "CALL": 60},
@@ -1112,7 +1112,7 @@ def run_cycle():
              f"{best['confidence']}% ({best.get('aggression','NORMAL')})", "bot")
 
         # High conviction — trade immediately
-        if best["confidence"] >= 78:
+        if best["confidence"] >= 70:
             execute_trade(best)
             return
 
@@ -1122,7 +1122,7 @@ def run_cycle():
         if len(set(directions)) == 1 and len(directions) >= 2:
             blog(f"Confluence: all agree {directions[0]}", "bot")
             execute_trade(best)
-        elif best["confidence"] >= 52:
+        elif best["confidence"] >= 55:
             execute_trade(best)
         else:
             blog(f"Insufficient confluence — waiting","info")
