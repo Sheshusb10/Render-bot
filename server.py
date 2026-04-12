@@ -228,9 +228,11 @@ def bot_loop():
 # ============================================
 # API ROUTES
 # ============================================
+from flask import render_template
+
 @app.route("/")
 def home():
-    return "Bot running"
+    return render_template("index.html")
 
 @app.route("/api/start")
 def start():
