@@ -72,7 +72,13 @@ bot_state = {
         "profit_buffer":      _saved.get("profit_buffer", 0.0),
         "buffer_high":        _saved.get("buffer_high", 0.0),
         "losses_absorbed":    _saved.get("losses_absorbed", 0.0),
-        "last_signal":        {},
+        "starting_balance":   _saved.get("starting_balance", 0.0),
+        "peak_balance":       _saved.get("peak_balance", 0.0),
+        "profit_floor":       _saved.get("profit_floor", 0.0),
+        "wins":               _saved.get("wins", 0),
+        "losses":             _saved.get("losses", 0),
+        "win_rate":           _saved.get("win_rate", 0.0),
+        "last_signal":        _saved.get("last_signal", {}),
     },
     "trail_state": _saved.get("trail_state", {}),
 }
@@ -135,12 +141,20 @@ def check_ip():
             blog(f"🚨 IP CHANGED: {_ip_state['last']} → {ip} "
                  f"— UPDATE DELTA WHITELIST!", "error")
         _ip_state["last"] = _ip_state["current"] = ip
+        s = bot_state["stats"]
         save_state({
-            "last_ip":       ip,
-            "profit_buffer": bot_state["stats"]["profit_buffer"],
-            "buffer_high":   bot_state["stats"]["buffer_high"],
-            "losses_absorbed": bot_state["stats"]["losses_absorbed"],
-            "trail_state":   bot_state["trail_state"],
+            "last_ip":          ip,
+            "profit_buffer":    s["profit_buffer"],
+            "buffer_high":      s["buffer_high"],
+            "losses_absorbed":  s["losses_absorbed"],
+            "starting_balance": s["starting_balance"],
+            "peak_balance":     s["peak_balance"],
+            "profit_floor":     s["profit_floor"],
+            "wins":             s["wins"],
+            "losses":           s["losses"],
+            "win_rate":         s["win_rate"],
+            "last_signal":      s["last_signal"],
+            "trail_state":      bot_state["trail_state"],
         })
     except: pass
 
@@ -797,7 +811,7 @@ def manage_positions():
             except: pass
 
             # Stop loss -40%
-            if not should_close and pnl_pct <= -15%:
+            if not should_close and pnl_pct <= -40:
                 should_close = True
                 close_reason = f"Stop loss -40%: {pnl_pct:.1f}%"
 
@@ -906,8 +920,8 @@ def execute_trade(analysis):
             return False
 
         # 2nd position only at 85%+
-       if len(open_syms) >= 1 and conf < 65:
-            blog(f"[{asset}] 2nd position needs 65%+ (got {conf}%) — skip","info")
+        if len(open_syms) >= 1 and conf < 85:
+            blog(f"[{asset}] 2nd position needs 85%+ (got {conf}%) — skip","info")
             return False
 
         # Max 3 simultaneous positions
