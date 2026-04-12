@@ -533,8 +533,8 @@ def full_analysis(asset):
         "STRONG_BULL": {"PUT": 75, "CALL": 0},
         "BULL":        {"PUT": 68, "CALL": 0},
         "NEUTRAL":     {"PUT": 0,  "CALL": 0},
-        "BEAR":        {"PUT": 0,  "CALL": 68},
-        "STRONG_BEAR": {"PUT": 0,  "CALL": 75},
+        "BEAR":        {"PUT": 0,  "CALL": 58},
+        "STRONG_BEAR": {"PUT": 0,  "CALL": 60},
     }
     thresholds = veto_thresholds.get(regime, {"PUT": 0, "CALL": 0})
 
