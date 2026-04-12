@@ -810,10 +810,10 @@ def manage_positions():
                     close_reason = f"Expiry {hours_left:.1f}h + losing — closing"
             except: pass
 
-            # Stop loss -40%
-            if not should_close and pnl_pct <= -40:
+            # Stop loss -25%
+            if not should_close and pnl_pct <= -25:
                 should_close = True
-                close_reason = f"Stop loss -40%: {pnl_pct:.1f}%"
+                close_reason = f"Stop loss -25%: {pnl_pct:.1f}%"
 
             # Take profit +25%
             if not should_close and pnl_pct >= 25:
@@ -969,11 +969,11 @@ def execute_trade(analysis):
     hrs     = get_hours(product)
 
     # Size based on aggression
-    base_size = 4
-    if aggression == "HIGH":    size = min(7, max(1, round(base_size * size_mult * 1.5)))
-    elif aggression == "MEDIUM": size = min(5, max(1, round(base_size * size_mult)))
-    elif aggression == "LOW":    size = 2
-    else:                        size = min(4, max(1, round(base_size * size_mult)))
+    base_size = 1
+    if aggression == "HIGH":    size = min(3, max(1, round(base_size * size_mult * 1.5)))
+    elif aggression == "MEDIUM": size = min(2, max(1, round(base_size * size_mult)))
+    elif aggression == "LOW":    size = 1
+    else:                        size = 1
 
     blog(f"[{asset}] {direction} | Strike ${strike} | "
          f"Price ${price:.2f} | Conf {conf}% | "
@@ -1010,8 +1010,65 @@ def execute_trade(analysis):
         return False
 
 def execute_straddle(asset, price, products):
-    """Buy both ATM call and put simultaneously."""
-    blog(f"[{asset}] STRADDLE — buying call + put", "bot")
+    """
+    Execute straddle using Delta Exchange MV-BTC/MV-ETH products.
+    These are pre-packaged call+put bundles with daily expiry.
+    50% lower fees, single order execution.
+    """
+    blog(f"[{asset}] STRADDLE — using Delta MV products", "bot")
+
+    # Try Delta native straddle products first (MV-BTC, MV-ETH)
+    mv_products = [p for p in products
+                   if p.get("contract_type") in ("move_options", "straddle", "move")
+                   and asset.upper() in p.get("symbol","").upper()
+                   and p.get("state") == "live"]
+
+    # Also try symbol pattern MV-BTC or MOVE
+    if not mv_products:
+        mv_products = [p for p in products
+                       if ("MV-" + asset.upper() in p.get("symbol","")
+                           or "MOVE" in p.get("symbol","").upper())
+                       and p.get("state") == "live"]
+
+    if mv_products:
+        # Pick ATM move product
+        def strike_dist(p):
+            try:
+                parts = p["symbol"].split("-")
+                for part in parts:
+                    try:
+                        val = float(part)
+                        if val > 1000:  # likely a strike price
+                            return abs(val - price)
+                    except: pass
+                return 999999
+            except: return 999999
+
+        product = min(mv_products, key=strike_dist)
+        blog(f"[{asset}] Using MV product: {product['symbol']}", "bot")
+
+        try:
+            resp = dx_post("/v2/orders", {
+                "product_id":     product["id"],
+                "product_symbol": product["symbol"],
+                "size":           1,
+                "side":           "buy",
+                "order_type":     "market_order",
+            })
+            if not resp.get("error"):
+                blog(f"[{asset}] ✓ MV Straddle filled: {product['symbol']}","success")
+                s = bot_state["stats"]
+                s["trades_today"]       += 1
+                s["total_exposure_pct"] += 4.0
+                s["consecutive_losses"]  = 0
+                return True
+            else:
+                blog(f"[{asset}] MV order failed: {resp['error']}","error")
+        except Exception as e:
+            blog(f"[{asset}] MV error: {e}","error")
+
+    # Fallback — buy separate call and put
+    blog(f"[{asset}] No MV products — using separate call+put", "warning")
 
     def get_atm(opt_type):
         opts = [p for p in products
@@ -1026,7 +1083,7 @@ def execute_straddle(asset, price, products):
                 return (datetime(y,m,d,8,0,0,tzinfo=timezone.utc) -
                         datetime.now(timezone.utc)).total_seconds()/3600
             except: return 999
-        valid = [p for p in opts if 48 < get_hours(p) < 168]
+        valid = [p for p in opts if 24 < get_hours(p) < 168]
         if not valid: valid = opts
         def sd(p):
             try: return abs(float(p["symbol"].split("-")[2]) - price)
@@ -1068,16 +1125,8 @@ def execute_straddle(asset, price, products):
 
 # ── Main Bot Cycle ────────────────────────────────────────────────
 def run_cycle():
-    # Auto-release lock if stuck for more than 60 seconds
-    lock_time = bot_state.get("cycle_lock_time", 0)
-    if bot_state["cycle_lock"]:
-        if time.time() - lock_time > 60:
-            blog("Cycle lock auto-released after timeout", "warning")
-            bot_state["cycle_lock"] = False
-        else:
-            return
+    if bot_state["cycle_lock"]: return
     bot_state["cycle_lock"] = True
-    bot_state["cycle_lock_time"] = time.time()
 
     try:
         s = bot_state["stats"]
@@ -1289,6 +1338,24 @@ def api_bot_reset():
     s["consecutive_losses"]   = 0
     blog("Reset.","info")
     return jsonify({"ok":True})
+
+@app.route("/api/straddles")
+def api_straddles():
+    """Debug route to see available straddle/move products"""
+    try:
+        products = get_products_cached()
+        mv = [p["symbol"] for p in products
+              if any(x in p.get("symbol","").upper()
+                     for x in ["MV-","MOVE","STRADDLE"])
+              and p.get("state") == "live"]
+        types = list(set(p.get("contract_type","") for p in products))
+        btc_types = list(set(p.get("contract_type","")
+                             for p in products if "BTC" in p.get("symbol","")))
+        return jsonify({"mv_products": mv[:20],
+                        "all_types": types,
+                        "btc_types": btc_types})
+    except Exception as e:
+        return jsonify({"error": str(e)})
 
 @app.route("/api/ip")
 def api_ip():
