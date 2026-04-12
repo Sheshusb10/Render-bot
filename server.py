@@ -57,6 +57,15 @@ bot_state = {
     "cycle_lock": False,
     "startup_time": time.time(),
     "pending_signal": {},  # signal waiting for confirmation
+    "setup_memory": _saved.get("setup_memory", {
+        "STRONG_BEAR_CALL": {"wins": 0, "losses": 0},
+        "STRONG_BEAR_PUT":  {"wins": 0, "losses": 0},
+        "BEAR_CALL":        {"wins": 0, "losses": 0},
+        "BEAR_PUT":         {"wins": 0, "losses": 0},
+        "NEUTRAL_STRADDLE": {"wins": 0, "losses": 0},
+        "BULL_CALL":        {"wins": 0, "losses": 0},
+        "STRONG_BULL_CALL": {"wins": 0, "losses": 0},
+    }),
     "stats": {
         "trades_today":       0,
         "wins":               0,
@@ -421,12 +430,44 @@ def full_analysis(asset):
     # Market regime
     regime = detect_market_regime(chg_1h, chg_4h, chg_1d, rsi_4h)
 
+    # ── Volatility Regime ─────────────────────────────────────────
+    bb_width = ((bb_1h["upper"] - bb_1h["lower"]) / bb_1h["middle"] * 100
+                if bb_1h["middle"] > 0 else 3.0)
+    if bb_width < 2.0:
+        vol_regime = "LOW"    # straddle zone
+    elif bb_width > 5.0:
+        vol_regime = "HIGH"   # trend trade zone
+    else:
+        vol_regime = "MID"    # normal directional
+
+    blog(f"[{asset}] VolRegime:{vol_regime} BB_width:{bb_width:.2f}%", "info")
+
     highs = [c["high"] for c in c1h[-20:]]
     lows  = [c["low"]  for c in c1h[-20:]]
     support    = round(min(lows), 2)
     resistance = round(max(highs), 2)
 
     bull = 0; bear = 0; reasons = []
+
+    # ── Volatility spike kill switch ─────────────────────────────
+    # If price moved >5% in last hour = abnormal, skip trading
+    if abs(chg_1h) > 5.0:
+        blog(f"[{asset}] ⚠️ Volatility spike {chg_1h:.1f}% — skipping", "warning")
+        return {
+            "asset": asset, "price": price, "direction": "NO TRADE",
+            "confidence": 0, "bull_score": 0, "bear_score": 0,
+            "regime": regime, "candles_4h": c4h, "candles_15m": c15m,
+            "indicators": {"rsi_1h": rsi_1h, "rsi_4h": rsi_4h, "rsi_1d": rsi_1d,
+                          "macd_1h": macd_1h["trend"], "macd_4h": macd_4h["trend"],
+                          "bb_1h": bb_1h["position"], "pattern": "NONE",
+                          "volume": vol["volume_trend"], "whale": False,
+                          "fake_pump": False, "fake_dump": False,
+                          "fear_greed": 50, "funding": 0, "oi": "STABLE",
+                          "chg_1h": round(chg_1h,2), "chg_4h": round(chg_4h,2),
+                          "chg_1d": round(chg_1d,2)},
+            "support": 0, "resistance": 0,
+            "reasons": [f"Volatility spike {chg_1h:.1f}% — trading paused"],
+        }
 
     # ── Extreme oversold bounce signal ────────────────────────────
     if rsi_1h < 25 and bb_1h["position"] == "LOWER":
@@ -549,14 +590,32 @@ def full_analysis(asset):
     else:
         direction = "NO TRADE"; conf = max(bull_pct, bear_pct)
 
-    # ── Straddle for sideways market ──────────────────────────────
-    if direction == "NO TRADE" and regime == "NEUTRAL":
-        atr = ((max(c["high"] for c in c1h[-14:]) -
-                min(c["low"]  for c in c1h[-14:])) / price * 100) if c1h else 3
-        if bb_1h["squeeze"] or (45 < rsi_1h < 55 and atr < 1.5):
+    # ── Straddle for sideways/low vol market ─────────────────────
+    if direction == "NO TRADE" and vol_regime == "LOW":
+        # Low volatility = straddle opportunity regardless of regime
+        # Volume contraction check
+        vol_contracting = vol.get("volume_trend") == "FALLING"
+        oi_flat = oi == "STABLE"
+        if vol_contracting or oi_flat or bb_1h["squeeze"]:
             direction = "STRADDLE"
-            conf      = 70
-            reasons.append("Sideways + BB squeeze — straddle opportunity")
+            conf      = 72
+            reasons.append(f"Low vol ({bb_width:.1f}%) + contraction — straddle")
+    elif direction == "NO TRADE" and regime == "NEUTRAL" and vol_regime == "MID":
+        if bb_1h["squeeze"] or (45 < rsi_1h < 55):
+            direction = "STRADDLE"
+            conf      = 65
+            reasons.append("Neutral regime + mid vol — straddle")
+
+    # High vol — only allow trend following trades
+    if vol_regime == "HIGH" and direction != "NO TRADE":
+        # In high vol only trade WITH trend, not against
+        is_with_trend = (
+            (direction == "BUY_CALL" and chg_4h > 0) or
+            (direction == "BUY_PUT"  and chg_4h < 0)
+        )
+        if not is_with_trend:
+            direction = "NO TRADE"
+            reasons.append(f"High vol ({bb_width:.1f}%) — counter-trend blocked")
 
     # ── Regime Hard Veto ─────────────────────────────────────────
     # Dynamic regime veto — tighter in high volatility
@@ -1023,12 +1082,28 @@ def execute_trade(analysis):
     oi_val  = float(product.get("open_interest", 0) or 0)
     blog(f"[{asset}] Liquidity: Vol={vol_24h:.0f} OI={oi_val:.0f}", "info")
 
-    # Size based on aggression
-    base_size = 1
-    if aggression == "HIGH":    size = min(3, max(1, round(base_size * size_mult * 1.5)))
-    elif aggression == "MEDIUM": size = min(2, max(1, round(base_size * size_mult)))
-    elif aggression == "LOW":    size = 1
-    else:                        size = 1
+    # Risk-based position sizing
+    # risk per trade = 2% of balance * confidence factor
+    s = bot_state["stats"]
+    balance = s.get("current_balance", 70)
+    risk_pct = 0.02  # 2% max risk per trade
+    conf_factor = conf / 100.0
+    risk_amount = balance * risk_pct * conf_factor
+
+    # Estimate option premium (rough: 1-3% of underlying)
+    est_premium = price * 0.015  # 1.5% of spot as rough premium estimate
+    if est_premium > 0:
+        raw_size = risk_amount / est_premium
+        size = max(1, min(3, round(raw_size)))
+    else:
+        size = 1
+
+    # Override: LOW aggression = always 1
+    if aggression == "LOW":
+        size = 1
+
+    blog(f"[{asset}] Risk sizing: bal={balance:.2f} risk={risk_amount:.2f} "
+         f"est_prem={est_premium:.2f} size={size}", "info")
 
     blog(f"[{asset}] {direction} | Strike ${strike} | "
          f"Price ${price:.2f} | Conf {conf}% | "
