@@ -1122,7 +1122,7 @@ def run_cycle():
         if len(set(directions)) == 1 and len(directions) >= 2:
             blog(f"Confluence: all agree {directions[0]}", "bot")
             execute_trade(best)
-        elif best["confidence"] >= 65:
+        elif best["confidence"] >= 52:
             execute_trade(best)
         else:
             blog(f"Insufficient confluence — waiting","info")
