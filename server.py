@@ -906,8 +906,8 @@ def execute_trade(analysis):
             return False
 
         # 2nd position only at 85%+
-        if len(open_syms) >= 1 and conf < 85:
-            blog(f"[{asset}] 2nd position needs 85%+ (got {conf}%) — skip","info")
+       if len(open_syms) >= 1 and conf < 65:
+            blog(f"[{asset}] 2nd position needs 65%+ (got {conf}%) — skip","info")
             return False
 
         # Max 3 simultaneous positions
