@@ -3,7 +3,7 @@
 # ============================================
 
 import time, threading, requests
-from flask import Flask, jsonify
+from flask import Flask, jsonify,send_from_directory
 
 app = Flask(__name__)
 
@@ -230,9 +230,11 @@ def bot_loop():
 # ============================================
 from flask import render_template
 
+from flask import send_from_directory
+
 @app.route("/")
 def home():
-    return render_template("index.html")
+    return send_from_directory("static", "index.html")
 
 @app.route("/api/start")
 def start():
