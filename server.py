@@ -1212,7 +1212,7 @@ def api_products():
 def api_analysis():
     try:
         results = []
-        for asset in ["BTC","ETH","SOL"]:
+        for asset in ["BTC","ETH"]:
             a = full_analysis(asset)
             if a:
                 a = execution_engine(a)
@@ -1227,8 +1227,6 @@ def api_bot_start():
     d = request.json or {}
     if bot_state["running"]:
         return jsonify({"ok":False,"error":"Already running"})
-        if not API_KEY or not API_SECRET:
-        return jsonify({"ok":False,"error":"Connect API key first"})
     bot_state["interval"]     = max(180, int(d.get("interval",300)))
     bot_state["running"]      = True
     bot_state["startup_time"] = time.time()
