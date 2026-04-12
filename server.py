@@ -1,5 +1,5 @@
 # ============================================
-# ΔLPHA PRO — REAL SIGNAL + TRUE TRAILING BOT
+# ΔLPHA PRO — COMPOUNDING EXECUTION ENGINE
 # ============================================
 
 import time, threading, requests
@@ -13,7 +13,8 @@ bot_running = False
 
 bot_state = {
     "trail": {},
-    "balance": 70
+    "balance": 70,
+    "last_exit": None   # 🔥 for compounding
 }
 
 # ============================================
@@ -23,47 +24,37 @@ def log(msg):
     print(f"[BOT] {msg}")
 
 # ============================================
-# BINANCE DATA (REAL SIGNAL)
+# MARKET DATA (BINANCE)
 # ============================================
-def get_price():
-    r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT")
-    return float(r.json()["price"])
-
 def get_candles():
     r = requests.get(
         "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=50"
     )
     return r.json()
 
-# ============================================
-# RSI
-# ============================================
-def calc_rsi(candles, period=14):
-    closes = [float(c[4]) for c in candles]
+def calc_rsi(closes):
     gains, losses = [], []
-
     for i in range(1, len(closes)):
         diff = closes[i] - closes[i-1]
         gains.append(max(diff, 0))
         losses.append(max(-diff, 0))
-
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-
-    if avg_loss == 0:
-        return 100
-
+    avg_gain = sum(gains[-14:]) / 14
+    avg_loss = sum(losses[-14:]) / 14
+    if avg_loss == 0: return 100
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
 # ============================================
-# REAL ANALYSIS
+# ANALYSIS ENGINE
 # ============================================
 def analysis():
     candles = get_candles()
-    price = float(candles[-1][4])
+    closes = [float(c[4]) for c in candles]
 
-    rsi = calc_rsi(candles)
+    price = closes[-1]
+    rsi = calc_rsi(closes)
+
+    momentum = closes[-1] - closes[-5]
 
     highs = [float(c[2]) for c in candles[-20:]]
     lows  = [float(c[3]) for c in candles[-20:]]
@@ -74,13 +65,18 @@ def analysis():
     direction = "NO TRADE"
     confidence = 0
 
-    if rsi < 35:
+    if momentum > 50:
         direction = "BUY_CALL"
-        confidence = 75
-
+        confidence = 80
+    elif momentum < -50:
+        direction = "BUY_PUT"
+        confidence = 80
+    elif rsi < 35:
+        direction = "BUY_CALL"
+        confidence = 70
     elif rsi > 65:
         direction = "BUY_PUT"
-        confidence = 75
+        confidence = 70
 
     return {
         "asset": "BTC",
@@ -101,38 +97,39 @@ def dx_post(path, body):
     return requests.post(BASE_URL + path, json=body).json()
 
 # ============================================
-# LIQUIDITY FILTER
+# OPTION LOGIC
 # ============================================
 def filter_liquid(options):
-    return [
-        p for p in options
-        if float(p.get("volume", 0) or 0) > 1000
-        or float(p.get("open_interest", 0) or 0) > 500
-    ]
+    return [p for p in options if float(p.get("volume",0)) > 1000]
 
-# ============================================
-# OPTION SELECT
-# ============================================
 def select_option(options, price):
-    def score(p):
-        try:
-            strike = float(p["symbol"].split("-")[2])
-            return abs(strike - price)
-        except:
-            return 999999
+    return min(options, key=lambda p: abs(float(p["symbol"].split("-")[2]) - price))
 
-    options.sort(key=score)
-    return options[0]
+def get_size(balance):
+    return max(1, int(balance * 0.02 / (70000 * 0.015)))
 
 # ============================================
-# POSITION SIZE
+# CLOSE FUNCTION (WITH COMPOUND MEMORY)
 # ============================================
-def get_size(balance, confidence):
-    mult = 1.5 if confidence > 80 else 1
-    return max(1, int(balance * 0.02 * mult / (70000 * 0.015)))
+def close(sym, size, pnl, reason):
+    log(f"Closing {sym} {pnl:.1f}% ({reason})")
+
+    dx_post("/v2/orders", {
+        "product_symbol": sym,
+        "size": int(abs(size)),
+        "side": "sell" if size > 0 else "buy",
+        "order_type": "market_order",
+        "reduce_only": "true"
+    })
+
+    # 🔥 STORE LAST EXIT
+    bot_state["last_exit"] = {
+        "time": time.time(),
+        "pnl": pnl
+    }
 
 # ============================================
-# TRUE TRAILING (KEY UPGRADE)
+# TRAILING + EXIT
 # ============================================
 def manage_positions():
     positions = pub_get("/v2/positions/margined").get("result", [])
@@ -150,43 +147,37 @@ def manage_positions():
 
         trail = bot_state["trail"].get(sym, {"peak": 0})
 
-        # Track peak profit
         if pnl > trail["peak"]:
             trail["peak"] = pnl
 
         bot_state["trail"][sym] = trail
 
-        drawdown = trail["peak"] - pnl
+        peak = trail["peak"]
+        drawdown = peak - pnl
 
-        # 🔥 PROFIT LOCK ON REVERSAL
-        if trail["peak"] > 2 and drawdown > 1.5:
-            close(sym, size, pnl, "profit reversal")
+        # 🔥 DYNAMIC EXIT
+        if peak > 2 and drawdown > 0.8:
+            close(sym, size, pnl, "tight lock")
 
-        # ❌ FAST LOSS
-        elif pnl < -4:
+        elif peak > 5 and drawdown > 1.5:
+            close(sym, size, pnl, "profit lock")
+
+        elif peak > 8 and drawdown > 2.5:
+            close(sym, size, pnl, "trend exit")
+
+        elif pnl < -3:
             close(sym, size, pnl, "stop loss")
-
-def close(sym, size, pnl, reason):
-    log(f"Closing {sym} {pnl:.1f}% ({reason})")
-
-    dx_post("/v2/orders", {
-        "product_symbol": sym,
-        "size": int(abs(size)),
-        "side": "sell" if size > 0 else "buy",
-        "order_type": "market_order",
-        "reduce_only": "true"
-    })
 
 # ============================================
 # QUICK TRADE
 # ============================================
 def quick_trade(price, support, resistance):
 
-    if (price - support)/price*100 < 0.5:
-        return "BUY_CALL", 70
+    if (price - support)/price*100 < 0.4:
+        return "BUY_CALL", 72
 
-    if (resistance - price)/price*100 < 0.5:
-        return "BUY_PUT", 70
+    if (resistance - price)/price*100 < 0.4:
+        return "BUY_PUT", 72
 
     return None, 0
 
@@ -195,7 +186,7 @@ def quick_trade(price, support, resistance):
 # ============================================
 def execute(asset, direction, price, confidence):
 
-    if direction == "NO TRADE" or confidence < 65:
+    if direction == "NO TRADE":
         return
 
     products = pub_get("/v2/products?states=live&page_size=500")["result"]
@@ -213,8 +204,7 @@ def execute(asset, direction, price, confidence):
         return
 
     product = select_option(options, price)
-
-    size = get_size(bot_state["balance"], confidence)
+    size = get_size(bot_state["balance"])
 
     log(f"{asset} {direction} size {size}")
 
@@ -226,6 +216,29 @@ def execute(asset, direction, price, confidence):
     })
 
 # ============================================
+# 🔥 COMPOUNDING ENGINE
+# ============================================
+def compounding_reentry():
+
+    last = bot_state.get("last_exit")
+
+    if not last:
+        return
+
+    # only re-enter within 60 sec of exit
+    if time.time() - last["time"] > 60:
+        return
+
+    a = analysis()
+
+    if a["direction"] != "NO TRADE" and a["confidence"] > 65:
+        log("🔥 COMPOUND RE-ENTRY")
+        execute(a["asset"], a["direction"], a["price"], a["confidence"])
+
+        # reset so it doesn't spam
+        bot_state["last_exit"] = None
+
+# ============================================
 # BOT LOOP
 # ============================================
 def bot_loop():
@@ -235,20 +248,23 @@ def bot_loop():
         try:
             a = analysis()
 
-            # QUICK TRADE
+            # QUICK
             d, c = quick_trade(a["price"], a["support"], a["resistance"])
             if d:
                 execute(a["asset"], d, a["price"], c)
 
-            # MAIN SIGNAL
+            # MAIN
             execute(a["asset"], a["direction"], a["price"], a["confidence"])
 
             manage_positions()
 
+            # 🔥 COMPOUNDING
+            compounding_reentry()
+
         except Exception as e:
             log(str(e))
 
-        time.sleep(20)
+        time.sleep(15)
 
 # ============================================
 # API
