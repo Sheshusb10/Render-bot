@@ -57,6 +57,18 @@ bot_state = {
     "cycle_lock": False,
     "startup_time": time.time(),
     "pending_signal": {},  # signal waiting for confirmation
+    "scalper": {
+        "enabled": True,
+        "active_trade": None,   # current scalper position
+        "trades_today": 0,
+        "wins": 0,
+        "losses": 0,
+        "profit": 0.0,
+        "max_trades": 6,        # max scalper trades per day
+        "target_pct": 8.0,      # take profit at +8%
+        "stop_pct": -12.0,      # stop loss at -12%
+        "min_confidence": 60,   # min confidence to scalp
+    },
     "setup_memory": _saved.get("setup_memory", {
         "STRONG_BEAR_CALL": {"wins": 0, "losses": 0},
         "STRONG_BEAR_PUT":  {"wins": 0, "losses": 0},
@@ -1343,6 +1355,192 @@ def execute_straddle(asset, price, products):
         return True
     return False
 
+# ── Scalper Strategy ─────────────────────────────────────────────
+def run_scalper(analyses):
+    """
+    Independent scalper — runs alongside swing strategy.
+    Quick entries, 8% target, 12% stop.
+    Never waits for swing — places trades independently.
+    Max 6 scalp trades per day, always 1 lot.
+    """
+    sc = bot_state["scalper"]
+    if not sc["enabled"]: return
+
+    products = get_products_cached()
+
+    # ── Manage existing scalper position ──────────────────────────
+    if sc["active_trade"]:
+        sym = sc["active_trade"]["symbol"]
+        try:
+            positions = dx_get("/v2/positions/margined").get("result", [])
+            pos = next((p for p in positions
+                        if p.get("product_symbol") == sym
+                        and abs(float(p.get("size",0))) > 0), None)
+
+            if not pos:
+                blog(f"[SCALPER] {sym} gone — resetting", "warning")
+                sc["active_trade"] = None
+            else:
+                entry   = float(pos.get("entry_price", 0))
+                mark    = float(pos.get("mark_price", 0) or 0)
+                size    = abs(float(pos.get("size", 0)))
+                upnl    = float(pos.get("unrealized_pnl", 0))
+                side    = "buy" if float(pos.get("size", 0)) > 0 else "sell"
+                pnl_pct = ((mark - entry) / entry * 100) if entry else 0
+
+                if pnl_pct > sc["active_trade"].get("peak_pnl", 0):
+                    sc["active_trade"]["peak_pnl"] = pnl_pct
+
+                peak = sc["active_trade"].get("peak_pnl", 0)
+                blog(f"[SCALPER] {sym} PnL:{pnl_pct:.1f}% Peak:{peak:.1f}% "
+                     f"TP:+{sc['target_pct']}% SL:{sc['stop_pct']}%", "bot")
+
+                should_close = False; reason = ""
+                if pnl_pct >= sc["target_pct"]:
+                    should_close = True; reason = f"✅ TP +{pnl_pct:.1f}%"
+                elif pnl_pct <= sc["stop_pct"]:
+                    should_close = True; reason = f"❌ SL {pnl_pct:.1f}%"
+                elif peak >= sc["target_pct"] * 0.5 and pnl_pct < peak * 0.55:
+                    should_close = True
+                    reason = f"🔒 Trail: peak +{peak:.1f}% now +{pnl_pct:.1f}%"
+
+                if should_close:
+                    blog(f"[SCALPER] Closing: {reason}", "bot")
+                    product = next((p for p in products
+                                    if p.get("symbol") == sym), None)
+                    if product:
+                        close_side = "sell" if side == "buy" else "buy"
+                        resp = dx_post("/v2/orders", {
+                            "product_id":     product["id"],
+                            "product_symbol": sym,
+                            "size":           int(size),
+                            "side":           close_side,
+                            "order_type":     "market_order",
+                            "reduce_only":    "true",
+                        })
+                        if not resp.get("error"):
+                            sc["trades_today"] += 1
+                            sc["profit"]       += upnl
+                            if upnl > 0: sc["wins"]   += 1
+                            else:        sc["losses"] += 1
+                            sc["active_trade"] = None
+                            wr = (sc["wins"]/(sc["wins"]+sc["losses"])*100
+                                  if sc["wins"]+sc["losses"] > 0 else 0)
+                            blog(f"[SCALPER] ✓ Closed | P&L:${upnl:.3f} | "
+                                 f"WR:{wr:.0f}% ({sc['wins']}W/{sc['losses']}L)", "success")
+                return  # done managing existing position
+        except Exception as e:
+            blog(f"[SCALPER] Manage error: {e}", "error")
+            return
+
+    # ── Look for new scalper entry ────────────────────────────────
+    if sc["trades_today"] >= sc["max_trades"]:
+        blog(f"[SCALPER] Max {sc['max_trades']} trades reached today", "info")
+        return
+
+    best_scalp = None; best_score = 0
+
+    for asset, a in analyses.items():
+        direction = a.get("direction", "NO TRADE")
+        if direction in ("NO TRADE", "STRADDLE"): continue
+
+        conf = a.get("confidence", 0)
+        ind  = a.get("indicators", {})
+        c15m = a.get("candles_15m", [])
+        rsi  = ind.get("rsi_1h", 50)
+
+        score = 0
+
+        # RSI extreme = bounce opportunity
+        if direction == "BUY_CALL" and rsi < 25: score += 35
+        elif direction == "BUY_CALL" and rsi < 35: score += 20
+        elif direction == "BUY_PUT" and rsi > 75: score += 35
+        elif direction == "BUY_PUT" and rsi > 65: score += 20
+
+        # 15m candle momentum
+        if len(c15m) >= 3:
+            last3 = c15m[-3:]
+            if direction == "BUY_CALL":
+                score += sum(8 for c in last3 if c["close"] > c["open"])
+            else:
+                score += sum(8 for c in last3 if c["close"] < c["open"])
+
+        # Volume
+        if ind.get("volume") == "RISING": score += 15
+        if ind.get("whale"): score += 20
+
+        # Base confidence
+        score += conf * 0.25
+
+        if score > best_score and score >= sc["min_confidence"]:
+            best_score = score
+            best_scalp = a
+
+    if not best_scalp:
+        blog("[SCALPER] No entry signal", "info")
+        return
+
+    asset     = best_scalp["asset"]
+    direction = best_scalp["direction"]
+    price     = best_scalp["price"]
+
+    blog(f"[SCALPER] 🎯 Entry: {asset} {direction} Score:{best_score:.0f}", "bot")
+
+    opt_type = "call_options" if "CALL" in direction else "put_options"
+    options  = [p for p in products
+                if p.get("contract_type") == opt_type
+                and f"-{asset.upper()}-" in p.get("symbol","")
+                and p.get("state") == "live"]
+
+    def get_hrs(p):
+        try:
+            e = p["symbol"].split("-")[-1]
+            d=int(e[0:2]); m=int(e[2:4]); y=int("20"+e[4:6])
+            dt = datetime(y,m,d,8,0,0,tzinfo=timezone.utc)
+            return (dt - datetime.now(timezone.utc)).total_seconds()/3600
+        except: return 999
+
+    valid = [p for p in options if 12 < get_hrs(p) < 120]
+    if not valid: valid = options
+    if not valid:
+        blog(f"[SCALPER] No options available for {asset}", "warning")
+        return
+
+    def strike_dist(p):
+        try: return abs(float(p["symbol"].split("-")[2]) - price)
+        except: return 999999
+
+    valid.sort(key=strike_dist)
+    liquid = [p for p in valid
+              if float(p.get("volume",0) or 0) > 0
+              or float(p.get("open_interest",0) or 0) > 0]
+    product = liquid[0] if liquid else valid[0]
+
+    try:
+        resp = dx_post("/v2/orders", {
+            "product_id":     product["id"],
+            "product_symbol": product["symbol"],
+            "size":           1,
+            "side":           "buy",
+            "order_type":     "market_order",
+        })
+        if resp.get("error"):
+            blog(f"[SCALPER] Order failed: {resp['error']}", "error")
+            return
+
+        blog(f"[SCALPER] ✓ {product['symbol']} | "
+             f"TP:+{sc['target_pct']}% SL:{sc['stop_pct']}%", "success")
+        sc["active_trade"] = {
+            "symbol":    product["symbol"],
+            "asset":     asset,
+            "direction": direction,
+            "score":     best_score,
+            "peak_pnl":  0.0,
+            "ts":        time.time(),
+        }
+    except Exception as e:
+        blog(f"[SCALPER] Entry error: {e}", "error")
+
 # ── Main Bot Cycle ────────────────────────────────────────────────
 def run_cycle():
     if bot_state["cycle_lock"]: return
@@ -1369,74 +1567,66 @@ def run_cycle():
         if not ok:
             blog(f"Risk: {reason}","warning"); return
 
-        # Manage existing positions first
-        manage_positions()
-
-        # Analyze all assets
-        best = None; best_conf = 0
+        # ── DUAL MODE: Analyze all assets ───────────────────────
         analyses = {}
-
         for asset in ["BTC","ETH"]:
             try:
                 a = full_analysis(asset)
                 if not a: continue
-                analyses[asset] = a
-
                 ind = a["indicators"]
                 blog(f"[{asset}] RSI:{ind['rsi_1h']}/{ind['rsi_4h']} "
                      f"MACD:{ind['macd_1h']} BB:{ind['bb_1h']} "
                      f"Regime:{a['regime']} "
                      f"→ {a['direction']} ({a['confidence']}%)", "info")
-
-                if a["direction"] == "NO TRADE": continue
-
-                # Run execution engine
-                a = execution_engine(a)
-                analyses[asset] = a  # update with post-engine version
-
-                if a["confidence"] > best_conf:
-                    best_conf = a["confidence"]
-                    best      = a
+                if a["direction"] != "NO TRADE":
+                    a = execution_engine(a)
+                analyses[asset] = a
             except Exception as e:
                 blog(f"[{asset}] Error: {traceback.format_exc()}","error")
 
-        if not best:
-            blog("No valid setup this cycle","info")
-            return
+        # ── MODE 1: SWING STRATEGY ───────────────────────────────
+        # High confidence, holds hours/days, signal confirmation
+        manage_positions()
 
-        blog(f"Best: {best['asset']} {best['direction']} "
-             f"{best['confidence']}% ({best.get('aggression','NORMAL')})", "bot")
+        best = None; best_conf = 0
+        for asset, a in analyses.items():
+            if a["direction"] == "NO TRADE": continue
+            if a["confidence"] > best_conf:
+                best_conf = a["confidence"]
+                best = a
 
-        # Signal confirmation — require signal to persist 1 cycle
-        pending = bot_state.get("pending_signal", {})
-        same_asset = pending.get("asset") == best["asset"]
-        same_dir   = pending.get("direction") == best["direction"]
-        pending_age = time.time() - pending.get("ts", 0)
+        if best:
+            blog(f"[SWING] Best: {best['asset']} {best['direction']} "
+                 f"{best['confidence']}%", "bot")
+            pending = bot_state.get("pending_signal", {})
+            same_asset  = pending.get("asset") == best["asset"]
+            same_dir    = pending.get("direction") == best["direction"]
+            pending_age = time.time() - pending.get("ts", 0)
 
-        if best["confidence"] >= 75:
-            # High conviction — trade immediately, no confirmation needed
-            blog(f"High conviction {best['confidence']}% — trading immediately", "bot")
-            bot_state["pending_signal"] = {}
-            execute_trade(best)
-        elif same_asset and same_dir and pending_age < 600:
-            # Signal confirmed — same signal in 2 consecutive cycles
-            blog(f"Signal confirmed: {best['asset']} {best['direction']} "
-                 f"({best['confidence']}%) — executing", "bot")
-            bot_state["pending_signal"] = {}
-            execute_trade(best)
-        elif best["confidence"] >= 55:
-            # Store as pending — wait for next cycle to confirm
-            bot_state["pending_signal"] = {
-                "asset":     best["asset"],
-                "direction": best["direction"],
-                "confidence": best["confidence"],
-                "ts":        time.time(),
-            }
-            blog(f"Signal pending confirmation: {best['asset']} "
-                 f"{best['direction']} {best['confidence']}% — waiting 1 cycle", "info")
+            if best["confidence"] >= 75:
+                blog(f"[SWING] High conviction — trading immediately", "bot")
+                bot_state["pending_signal"] = {}
+                execute_trade(best)
+            elif same_asset and same_dir and pending_age < 600:
+                blog(f"[SWING] Signal confirmed — executing", "bot")
+                bot_state["pending_signal"] = {}
+                execute_trade(best)
+            elif best["confidence"] >= 55:
+                bot_state["pending_signal"] = {
+                    "asset": best["asset"], "direction": best["direction"],
+                    "confidence": best["confidence"], "ts": time.time(),
+                }
+                blog(f"[SWING] Pending confirmation: {best['asset']} "
+                     f"{best['direction']} {best['confidence']}%", "info")
+            else:
+                blog(f"[SWING] Confidence too low — skipping", "info")
+                bot_state["pending_signal"] = {}
         else:
-            blog(f"Confidence too low: {best['confidence']}% — skipping","info")
-            bot_state["pending_signal"] = {}
+            blog("[SWING] No valid setup this cycle", "info")
+
+        # ── MODE 2: SCALPER STRATEGY ─────────────────────────────
+        # Independent — quick trades, 8% target, doesn't wait for swing
+        run_scalper(analyses)
 
         total = s["wins"] + s["losses"]
         if total > 0: s["win_rate"] = round(s["wins"]/total*100, 1)
