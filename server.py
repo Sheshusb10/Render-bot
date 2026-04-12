@@ -1,5 +1,5 @@
 # ============================================
-# ΔLPHA PRO — COMPOUNDING EXECUTION ENGINE
+# ΔLPHA PRO — STABLE COMPUNDING BOT (FINAL FIX)
 # ============================================
 
 import time, threading, requests
@@ -10,11 +10,12 @@ app = Flask(__name__)
 BASE_URL = "https://api.india.delta.exchange"
 
 bot_running = False
+bot_thread = None
 
 bot_state = {
     "trail": {},
     "balance": 70,
-    "last_exit": None   # 🔥 for compounding
+    "last_exit": None
 }
 
 # ============================================
@@ -24,13 +25,17 @@ def log(msg):
     print(f"[BOT] {msg}")
 
 # ============================================
-# MARKET DATA (BINANCE)
+# MARKET DATA
 # ============================================
 def get_candles():
-    r = requests.get(
-        "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=50"
-    )
-    return r.json()
+    try:
+        r = requests.get(
+            "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=50",
+            timeout=5
+        )
+        return r.json()
+    except:
+        return []
 
 def calc_rsi(closes):
     gains, losses = [], []
@@ -38,22 +43,27 @@ def calc_rsi(closes):
         diff = closes[i] - closes[i-1]
         gains.append(max(diff, 0))
         losses.append(max(-diff, 0))
+    if len(gains) < 14:
+        return 50
     avg_gain = sum(gains[-14:]) / 14
     avg_loss = sum(losses[-14:]) / 14
-    if avg_loss == 0: return 100
+    if avg_loss == 0:
+        return 100
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
 # ============================================
-# ANALYSIS ENGINE
+# ANALYSIS
 # ============================================
 def analysis():
     candles = get_candles()
+    if not candles:
+        return None
+
     closes = [float(c[4]) for c in candles]
 
     price = closes[-1]
     rsi = calc_rsi(closes)
-
     momentum = closes[-1] - closes[-5]
 
     highs = [float(c[2]) for c in candles[-20:]]
@@ -62,57 +72,60 @@ def analysis():
     support = min(lows)
     resistance = max(highs)
 
-    direction = "NO TRADE"
-    confidence = 0
-
-    if momentum > 50:
-        direction = "BUY_CALL"
-        confidence = 80
-    elif momentum < -50:
-        direction = "BUY_PUT"
-        confidence = 80
+    if momentum > 40:
+        return ("BTC", "BUY_CALL", price, 80, support, resistance)
+    elif momentum < -40:
+        return ("BTC", "BUY_PUT", price, 80, support, resistance)
     elif rsi < 35:
-        direction = "BUY_CALL"
-        confidence = 70
+        return ("BTC", "BUY_CALL", price, 70, support, resistance)
     elif rsi > 65:
-        direction = "BUY_PUT"
-        confidence = 70
+        return ("BTC", "BUY_PUT", price, 70, support, resistance)
 
-    return {
-        "asset": "BTC",
-        "price": price,
-        "support": support,
-        "resistance": resistance,
-        "direction": direction,
-        "confidence": confidence
-    }
+    return ("BTC", "NO", price, 0, support, resistance)
 
 # ============================================
 # DELTA API
 # ============================================
 def pub_get(path):
-    return requests.get(BASE_URL + path).json()
+    try:
+        return requests.get(BASE_URL + path, timeout=5).json()
+    except:
+        return {}
 
 def dx_post(path, body):
-    return requests.post(BASE_URL + path, json=body).json()
+    try:
+        return requests.post(BASE_URL + path, json=body, timeout=5).json()
+    except:
+        return {}
 
 # ============================================
 # OPTION LOGIC
 # ============================================
-def filter_liquid(options):
-    return [p for p in options if float(p.get("volume",0)) > 1000]
+def get_option(asset, direction, price):
+    products = pub_get("/v2/products?states=live&page_size=500").get("result", [])
 
-def select_option(options, price):
+    opt_type = "call_options" if direction == "BUY_CALL" else "put_options"
+
+    options = [
+        p for p in products
+        if p.get("contract_type") == opt_type
+        and asset in p.get("symbol","")
+        and float(p.get("volume",0)) > 1000
+    ]
+
+    if not options:
+        return None
+
     return min(options, key=lambda p: abs(float(p["symbol"].split("-")[2]) - price))
 
-def get_size(balance):
-    return max(1, int(balance * 0.02 / (70000 * 0.015)))
+def get_size():
+    return 1
 
 # ============================================
-# CLOSE FUNCTION (WITH COMPOUND MEMORY)
+# CLOSE + COMPOUND MEMORY
 # ============================================
-def close(sym, size, pnl, reason):
-    log(f"Closing {sym} {pnl:.1f}% ({reason})")
+def close(sym, size, pnl):
+    log(f"Closing {sym} {pnl:.1f}%")
 
     dx_post("/v2/orders", {
         "product_symbol": sym,
@@ -122,19 +135,15 @@ def close(sym, size, pnl, reason):
         "reduce_only": "true"
     })
 
-    # 🔥 STORE LAST EXIT
-    bot_state["last_exit"] = {
-        "time": time.time(),
-        "pnl": pnl
-    }
+    bot_state["last_exit"] = time.time()
 
 # ============================================
-# TRAILING + EXIT
+# POSITION MANAGEMENT
 # ============================================
 def manage_positions():
-    positions = pub_get("/v2/positions/margined").get("result", [])
+    data = pub_get("/v2/positions/margined").get("result", [])
 
-    for p in positions:
+    for p in data:
         size = float(p.get("size", 0))
         if abs(size) == 0:
             continue
@@ -155,88 +164,46 @@ def manage_positions():
         peak = trail["peak"]
         drawdown = peak - pnl
 
-        # 🔥 DYNAMIC EXIT
-        if peak > 2 and drawdown > 0.8:
-            close(sym, size, pnl, "tight lock")
-
-        elif peak > 5 and drawdown > 1.5:
-            close(sym, size, pnl, "profit lock")
-
-        elif peak > 8 and drawdown > 2.5:
-            close(sym, size, pnl, "trend exit")
+        if peak > 2 and drawdown > 1:
+            close(sym, size, pnl)
 
         elif pnl < -3:
-            close(sym, size, pnl, "stop loss")
-
-# ============================================
-# QUICK TRADE
-# ============================================
-def quick_trade(price, support, resistance):
-
-    if (price - support)/price*100 < 0.4:
-        return "BUY_CALL", 72
-
-    if (resistance - price)/price*100 < 0.4:
-        return "BUY_PUT", 72
-
-    return None, 0
+            close(sym, size, pnl)
 
 # ============================================
 # EXECUTE
 # ============================================
-def execute(asset, direction, price, confidence):
-
-    if direction == "NO TRADE":
+def execute(asset, direction, price):
+    if direction == "NO":
         return
 
-    products = pub_get("/v2/products?states=live&page_size=500")["result"]
-
-    opt_type = "call_options" if direction == "BUY_CALL" else "put_options"
-
-    options = [
-        p for p in products
-        if p["contract_type"] == opt_type
-        and asset in p["symbol"]
-    ]
-
-    options = filter_liquid(options)
-    if not options:
+    option = get_option(asset, direction, price)
+    if not option:
         return
 
-    product = select_option(options, price)
-    size = get_size(bot_state["balance"])
-
-    log(f"{asset} {direction} size {size}")
+    log(f"{asset} {direction}")
 
     dx_post("/v2/orders", {
-        "product_id": product["id"],
-        "size": size,
+        "product_id": option["id"],
+        "size": get_size(),
         "side": "buy",
         "order_type": "market_order"
     })
 
 # ============================================
-# 🔥 COMPOUNDING ENGINE
+# COMPOUNDING
 # ============================================
-def compounding_reentry():
-
-    last = bot_state.get("last_exit")
-
+def compound():
+    last = bot_state["last_exit"]
     if not last:
         return
 
-    # only re-enter within 60 sec of exit
-    if time.time() - last["time"] > 60:
-        return
-
-    a = analysis()
-
-    if a["direction"] != "NO TRADE" and a["confidence"] > 65:
-        log("🔥 COMPOUND RE-ENTRY")
-        execute(a["asset"], a["direction"], a["price"], a["confidence"])
-
-        # reset so it doesn't spam
-        bot_state["last_exit"] = None
+    if time.time() - last < 30:
+        a = analysis()
+        if a and a[1] != "NO":
+            log("🔥 RE-ENTRY")
+            execute(a[0], a[1], a[2])
+            bot_state["last_exit"] = None
 
 # ============================================
 # BOT LOOP
@@ -247,33 +214,33 @@ def bot_loop():
     while bot_running:
         try:
             a = analysis()
-
-            # QUICK
-            d, c = quick_trade(a["price"], a["support"], a["resistance"])
-            if d:
-                execute(a["asset"], d, a["price"], c)
-
-            # MAIN
-            execute(a["asset"], a["direction"], a["price"], a["confidence"])
+            if a:
+                execute(a[0], a[1], a[2])
 
             manage_positions()
-
-            # 🔥 COMPOUNDING
-            compounding_reentry()
+            compound()
 
         except Exception as e:
             log(str(e))
 
-        time.sleep(15)
+        time.sleep(10)
 
 # ============================================
-# API
+# API ROUTES (STABLE)
 # ============================================
+@app.route("/")
+def home():
+    return "Bot running"
+
 @app.route("/api/start")
 def start():
-    global bot_running
-    bot_running = True
-    threading.Thread(target=bot_loop).start()
+    global bot_running, bot_thread
+
+    if not bot_running:
+        bot_running = True
+        bot_thread = threading.Thread(target=bot_loop, daemon=True)
+        bot_thread.start()
+
     return jsonify({"status": "started"})
 
 @app.route("/api/stop")
