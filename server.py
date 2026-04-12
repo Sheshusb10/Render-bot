@@ -171,15 +171,23 @@ def get_price(asset):
 def get_candles(asset, interval="1h", limit=50):
     sym = BINANCE_SYM.get(asset.upper())
     if not sym: return []
-    try:
-        r = requests.get(
-            f"https://api.binance.com/api/v3/klines"
-            f"?symbol={sym}&interval={interval}&limit={limit}",
-            timeout=8)
-        return [{"open": float(k[1]), "high": float(k[2]),
-                 "low":  float(k[3]), "close": float(k[4]),
-                 "volume": float(k[5])} for k in r.json()]
-    except: return []
+    urls = [
+        f"https://api.binance.us/api/v3/klines?symbol={sym}&interval={interval}&limit={limit}",
+        f"https://api.binance.com/api/v3/klines?symbol={sym}&interval={interval}&limit={limit}",
+        f"https://api1.binance.com/api/v3/klines?symbol={sym}&interval={interval}&limit={limit}",
+    ]
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=8)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list) and len(data) > 0:
+                    return [{"open": float(k[1]), "high": float(k[2]),
+                             "low":  float(k[3]), "close": float(k[4]),
+                             "volume": float(k[5])} for k in data]
+        except: continue
+    blog(f"[{asset}] All candle sources failed for {interval}", "warning")
+    return []
 
 # ── Technical Indicators ──────────────────────────────────────────
 def calc_rsi(candles, period=14):
