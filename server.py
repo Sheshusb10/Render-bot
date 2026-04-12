@@ -708,7 +708,7 @@ def risk_ok():
         if s["current_balance"] < s["profit_floor"]:
             s["daily_loss_limit_hit"] = True
             return False, "Profit floor breached"
-    if s["trades_today"] >= 6: return False, "Max 6 trades/day"
+    if s["trades_today"] >= 8: return False, "Max 8 trades/day"
     if s["consecutive_losses"] >= 3: return False, "3 consecutive losses — pause"
     return True, "OK"
 
@@ -785,7 +785,7 @@ def manage_positions():
             if pnl_pct > trail["peak"]:
                 trail["peak"] = pnl_pct
                 # Progressive floors
-                floors = [(50,40),(30,20),(25,20),(20,15),(15,10),(12,10),(10,8)]
+                floors = [(50,45),(30,25),(25,22),(20,17),(15,12),(12,10),(10,8),(8,6)]
                 for threshold, floor in floors:
                     if pnl_pct >= threshold:
                         trail["floor"] = floor
@@ -933,11 +933,11 @@ def execute_trade(analysis):
     hrs     = get_hours(product)
 
     # Size based on aggression
-    base_size = 3
-    if aggression == "HIGH":    size = min(5, max(1, round(base_size * size_mult * 1.5)))
-    elif aggression == "MEDIUM": size = min(3, max(1, round(base_size * size_mult)))
-    elif aggression == "LOW":    size = 1
-    else:                        size = min(3, max(1, round(base_size * size_mult)))
+    base_size = 4
+if aggression == "HIGH":    size = min(7, max(1, round(base_size * size_mult * 1.5)))
+elif aggression == "MEDIUM": size = min(5, max(1, round(base_size * size_mult)))
+elif aggression == "LOW":    size = 2
+else:                        size = min(4, max(1, round(base_size * size_mult)))
 
     blog(f"[{asset}] {direction} | Strike ${strike} | "
          f"Price ${price:.2f} | Conf {conf}% | "
