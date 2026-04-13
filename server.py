@@ -955,6 +955,7 @@ def manage_positions():
 
             should_close = False
             close_reason = ""
+            s = bot_state["stats"]  # needed for dynamic stop loss
 
             # Expiry check
             try:
@@ -967,34 +968,56 @@ def manage_positions():
                 hours_left = (expiry_dt - now).total_seconds() / 3600
                 blog(f"[{sym}] Expiry: {day}/{month}/{year} | Hours:{hours_left:.1f}","info")
 
-                if hours_left < 24:
-                    should_close = True
-                    close_reason = f"Expiry in {hours_left:.1f}h — salvaging value"
-                elif hours_left < 24 and pnl_pct < -5:
+                if hours_left < 24 and pnl_pct < -5:
                     should_close = True
                     close_reason = f"Expiry {hours_left:.1f}h + losing >5% — closing"
+                elif hours_left < 6:
+                    should_close = True
+                    close_reason = f"Expiry in {hours_left:.1f}h — salvaging value"
             except: pass
 
-            # Stop loss -25%
-            if not should_close and pnl_pct <= -25:
-                should_close = True
-                close_reason = f"Stop loss -25%: {pnl_pct:.1f}%"
+            # Dynamic stop loss — tightens based on consecutive losses
+            consec = s.get("consecutive_losses", 0)
+            if consec >= 3:
+                stop_loss = -10   # 3+ losses — cut quick
+            elif consec >= 2:
+                stop_loss = -15   # 2 losses — tighter
+            else:
+                stop_loss = -20   # normal
 
-            # Take profit +25%
-            if not should_close and pnl_pct >= 25:
+            if not should_close and pnl_pct <= stop_loss:
                 should_close = True
-                close_reason = f"Take profit +25%: {pnl_pct:.1f}%"
+                close_reason = f"Stop loss {stop_loss}% (consec:{consec}): {pnl_pct:.1f}%"
 
-            # Trailing stop
+            # Take profit ceiling at 100% — let winners run!
+            if not should_close and pnl_pct >= 100:
+                should_close = True
+                close_reason = f"🎯 Take profit 100%: {pnl_pct:.1f}%"
+
+            # Trailing stop with precise floors
             trail = bot_state["trail_state"].get(sym, {"peak": 0, "floor": None})
             if pnl_pct > trail["peak"]:
                 trail["peak"] = pnl_pct
-                # Progressive floors
-                floors = [(50,45),(30,25),(25,22),(20,17),(15,12),(12,10),(10,8),(8,6),(5,3),(3,2)]
+                # Progressive floors — ceil at each level, floor locks in gains
+                # Every level covered — floor = peak minus ~10-15% buffer
+                # Formula: floor = peak * 0.88 (keep 88% of gains)
+                # But use fixed steps for clean numbers
+                floors = [
+                    (100, 90), (95, 85), (90, 80), (85, 75), (80, 72),
+                    (75, 67),  (70, 62), (65, 58), (60, 53), (55, 48),
+                    (50, 45),  (48, 43), (45, 40), (42, 37), (40, 35),
+                    (38, 33),  (35, 30), (33, 28), (30, 26), (28, 24),
+                    (26, 22),  (25, 21), (24, 20), (23, 19), (22, 18),
+                    (21, 17),  (20, 16), (19, 15), (18, 14), (17, 13),
+                    (16, 12),  (15, 11), (14, 10), (13,  9), (12,  9),
+                    (11,  8),  (10,  8), (9,   7), (8,   6), (7,   5),
+                    (6,   4),  (5, 3.5), (4,   3), (3,   2),
+                ]
                 for threshold, floor in floors:
                     if pnl_pct >= threshold:
-                        trail["floor"] = floor
-                        blog(f"[{sym}] 🔒 Trail floor +{floor}% (peak +{pnl_pct:.1f}%)", "success")
+                        if trail["floor"] is None or floor > trail["floor"]:
+                            trail["floor"] = floor
+                            blog(f"[{sym}] 🔒 Trail floor +{floor}% (peak +{pnl_pct:.1f}%)", "success")
                         break
                 bot_state["trail_state"][sym] = trail
 
@@ -1032,12 +1055,14 @@ def manage_positions():
                             realized = entry_val * (pnl_pct / 100)
                             s = bot_state["stats"]
                             if pnl_pct > 0:
-                                s["wins"]         += 1
-                                s["profit_buffer"] += abs(realized)
-                                s["buffer_high"]   = max(s["buffer_high"], s["profit_buffer"])
+                                s["wins"]              += 1
+                                s["consecutive_losses"]  = 0  # reset on win
+                                s["profit_buffer"]      += abs(realized)
+                                s["buffer_high"]         = max(s["buffer_high"], s["profit_buffer"])
                                 blog(f"✅ WIN +{pnl_pct:.1f}% | Buffer: +${abs(realized):.3f} = ${s['profit_buffer']:.3f}","success")
                             else:
-                                s["losses"] += 1
+                                s["losses"]            += 1
+                                s["consecutive_losses"] += 1
                                 loss_amt = abs(realized)
                                 if s["profit_buffer"] >= loss_amt:
                                     s["profit_buffer"]   -= loss_amt
@@ -1047,7 +1072,7 @@ def manage_positions():
                                     remaining = loss_amt - s["profit_buffer"]
                                     s["profit_buffer"] = 0
                                     blog(f"❌ LOSS {pnl_pct:.1f}% | Capital hit: -${remaining:.3f}","error")
-                            s["daily_pnl"]          += upnl
+                            s["daily_pnl"]          += realized
                             s["total_exposure_pct"]  = max(0,s["total_exposure_pct"]-3.0)
                             # Clear trail
                             bot_state["trail_state"].pop(sym, None)
@@ -1063,7 +1088,7 @@ def manage_positions():
                                 setup_key = f"{mem_regime}_{direction_str}"
                                 if setup_key not in bot_state["setup_memory"]:
                                     bot_state["setup_memory"][setup_key] = {"wins": 0, "losses": 0}
-                                if upnl > 0:
+                                if pnl_pct > 0:
                                     bot_state["setup_memory"][setup_key]["wins"] += 1
                                 else:
                                     bot_state["setup_memory"][setup_key]["losses"] += 1
@@ -1680,7 +1705,7 @@ def run_cycle():
                 blog(f"[SWING] High conviction — trading immediately", "bot")
                 bot_state["pending_signal"] = {}
                 execute_trade(best)
-            elif same_asset and same_dir and pending_age < 600:
+            elif same_asset and same_dir and pending_age < 900:
                 blog(f"[SWING] Signal confirmed — executing", "bot")
                 bot_state["pending_signal"] = {}
                 execute_trade(best)
@@ -1705,12 +1730,19 @@ def run_cycle():
         # If swing found no setup and scalper has no active trade,
         # force best available signal if confidence >= 50%
         sc = bot_state["scalper"]
-        if not best and not sc["active_trade"] and analyses:
-            force_best = max(analyses.values(), key=lambda x: x["confidence"])
-            if force_best["confidence"] >= 50 and force_best["direction"] != "NO TRADE":
-                blog(f"⚡ Force trade: {force_best['asset']} "
-                     f"{force_best['direction']} {force_best['confidence']}%", "warning")
-                execute_trade(force_best)
+        if not sc["active_trade"] and a and a.get("direction") == "NO TRADE":
+            # Only force if no open positions at all
+            try:
+                open_pos = dx_get("/v2/positions/margined").get("result",[])
+                has_open = any(abs(float(p.get("size",0))) > 0 for p in open_pos)
+            except:
+                has_open = True
+            if not has_open and a.get("confidence",0) >= 52:
+                alt = full_analysis("BTC")
+                if alt and alt.get("confidence",0) >= 52 and alt.get("direction") != "NO TRADE":
+                    alt = execution_engine(alt)
+                    blog(f"⚡ Force trade: BTC {alt['direction']} {alt['confidence']}%", "warning")
+                    execute_trade(alt)
 
         total = s["wins"] + s["losses"]
         if total > 0: s["win_rate"] = round(s["wins"]/total*100, 1)
