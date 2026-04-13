@@ -178,6 +178,7 @@ def check_ip():
             "win_rate":         s["win_rate"],
             "last_signal":      s["last_signal"],
             "trail_state":      bot_state["trail_state"],
+            "setup_memory":     bot_state["setup_memory"],
         })
     except: pass
 
@@ -1051,8 +1052,8 @@ def manage_positions():
                             blog(f"[{sym}] Close no result: {str(resp)[:100]}", "error")
                         else:
                             blog(f"[{sym}] ✓ Closed automatically | PnL:{pnl_pct:.1f}%", "success")
-                            # Use pnl_pct as source of truth (upnl can be stale)
-                            realized = entry_val * (pnl_pct / 100)
+                            # Use actual upnl for buffer (real cash), pnl_pct for win/loss decision
+                            realized = upnl  # actual cash P&L from exchange
                             s = bot_state["stats"]
                             if pnl_pct > 0:
                                 s["wins"]              += 1
@@ -1106,6 +1107,14 @@ def manage_positions():
                                 "buffer_high":     s["buffer_high"],
                                 "losses_absorbed": s["losses_absorbed"],
                                 "trail_state":     bot_state["trail_state"],
+                                "wins":            s["wins"],
+                                "losses":          s["losses"],
+                                "win_rate":        s["win_rate"],
+                                "last_signal":     s["last_signal"],
+                                "setup_memory":    bot_state["setup_memory"],
+                                "starting_balance": s["starting_balance"],
+                                "peak_balance":    s["peak_balance"],
+                                "profit_floor":    s["profit_floor"],
                             })
                     except Exception as e:
                         blog(f"[{sym}] Close error: {e}", "error")
@@ -1113,7 +1122,7 @@ def manage_positions():
         blog(f"Position manager error: {e}", "error")
 
 # ── Execute Trade ─────────────────────────────────────────────────
-def execute_trade(analysis):
+def execute_trade(analysis, is_pyramid=False):
     asset     = analysis["asset"]
     direction = analysis["direction"]
     price     = analysis["price"]
@@ -1135,8 +1144,8 @@ def execute_trade(analysis):
         open_syms  = [p["product_symbol"] for p in open_pos
                       if abs(float(p.get("size",0))) > 0]
 
-        # Never open same asset twice
-        if any(asset.upper() in s for s in open_syms):
+        # Never open same asset twice — UNLESS pyramiding into winning position
+        if not is_pyramid and any(asset.upper() in s for s in open_syms):
             blog(f"[{asset}] Already have open position — skip","info")
             return False
 
@@ -1293,7 +1302,7 @@ def execute_trade(analysis):
         s = bot_state["stats"]
         s["trades_today"]       += 1
         s["total_exposure_pct"] += 3.0 * size
-        s["consecutive_losses"]  = 0
+        # consecutive_losses ONLY resets in manage_positions on WIN close
         s["last_signal"] = {
             "asset": asset, "direction": direction,
             "option": product["symbol"], "price": price,
@@ -1499,8 +1508,10 @@ def run_scalper(analyses):
                         if not resp.get("error"):
                             sc["trades_today"] += 1
                             sc["profit"]       += upnl
-                            if upnl > 0: sc["wins"]   += 1
-                            else:        sc["losses"] += 1
+                            # Use pnl_pct not upnl (upnl can be stale at close time)
+                            scalper_pnl = ((mark - entry) / entry * 100) if entry else 0
+                            if scalper_pnl > 0: sc["wins"]   += 1
+                            else:               sc["losses"] += 1
                             sc["active_trade"] = None
                             wr = (sc["wins"]/(sc["wins"]+sc["losses"])*100
                                   if sc["wins"]+sc["losses"] > 0 else 0)
@@ -1647,6 +1658,7 @@ def run_cycle():
             s["daily_loss_limit_hit"] = False
             s["consecutive_losses"] = 0
             bot_state["scalper"]["trades_today"] = 0
+            bot_state["pyramid_state"] = {}  # clear daily
             bot_state["last_reset_date"] = today
             blog(f"🔄 Daily reset — new day {today}", "success")
 
@@ -1722,6 +1734,75 @@ def run_cycle():
         else:
             blog("[SWING] No valid setup this cycle", "info")
 
+        # ── PYRAMIDING STRATEGY ───────────────────────────────────
+        # Add to winning position when profit > 15% + signal still strong
+        # Only 1 pyramid per original position, always 1 lot
+        try:
+            positions = dx_get("/v2/positions/margined").get("result", [])
+            open_pos  = [p for p in positions if abs(float(p.get("size", 0))) > 0]
+            pyramid_state = bot_state.get("pyramid_state", {})
+
+            for pos in open_pos:
+                sym   = pos.get("product_symbol", "")
+                if "BTC" not in sym: continue
+                entry = float(pos.get("entry_price", 0))
+                mark  = float(pos.get("mark_price", 0) or 0)
+                size  = abs(float(pos.get("size", 0)))
+                if entry <= 0 or mark <= 0: continue
+
+                pnl_pct  = ((mark - entry) / entry * 100)
+                is_call  = sym.startswith("C-")
+                is_put   = sym.startswith("P-")
+
+                # Get best current signal
+                best_sig = best if best else None
+
+                # Signal must match position direction
+                signal_matches = (
+                    best_sig and (
+                        (is_call and best_sig["direction"] == "BUY_CALL") or
+                        (is_put  and best_sig["direction"] == "BUY_PUT")
+                    )
+                )
+
+                already_pyramided = pyramid_state.get(sym, False)
+
+                # All pyramid conditions must be met
+                pyramid_ok = (
+                    pnl_pct >= 15                        and  # position winning
+                    signal_matches                       and  # signal confirms direction
+                    best_sig["confidence"] >= 75         and  # high confidence only
+                    not already_pyramided                and  # one pyramid per trade
+                    s["trades_today"] < 11               and  # leave room in cap
+                    s["consecutive_losses"] == 0         and  # no loss streak
+                    s["profit_buffer"] >= 0              and  # buffer intact
+                    s.get("current_balance", 0) > 50         # enough balance
+                )
+
+                if pyramid_ok:
+                    blog(f"[PYRAMID] 🔺 P1:{sym} at +{pnl_pct:.1f}% | "
+                         f"Conf:{best_sig['confidence']}% — adding P2", "success")
+                    success = execute_trade(best_sig, is_pyramid=True)
+                    if success:
+                        pyramid_state[sym] = True
+                        bot_state["pyramid_state"] = pyramid_state
+                        blog(f"[PYRAMID] ✅ P2 opened — compounding the trend", "success")
+                    else:
+                        blog(f"[PYRAMID] P2 blocked by risk/position check", "info")
+                elif pnl_pct >= 15 and not already_pyramided and best_sig:
+                    blog(f"[PYRAMID] +{pnl_pct:.1f}% but conf {best_sig['confidence']}% "
+                         f"< 75% or other condition failed — holding", "info")
+
+            # Clean pyramid state when positions close
+            open_syms = {p.get("product_symbol") for p in open_pos}
+            for sym in list(pyramid_state.keys()):
+                if sym not in open_syms:
+                    del pyramid_state[sym]
+            bot_state["pyramid_state"] = pyramid_state
+
+        except Exception as pe:
+            blog(f"[PYRAMID] Error: {pe}", "error")
+
         # ── MODE 2: SCALPER STRATEGY ─────────────────────────────
         # Independent — quick trades, 8% target, doesn't wait for swing
         run_scalper(analyses)
@@ -1730,14 +1811,15 @@ def run_cycle():
         # If swing found no setup and scalper has no active trade,
         # force best available signal if confidence >= 50%
         sc = bot_state["scalper"]
-        if not sc["active_trade"] and a and a.get("direction") == "NO TRADE":
+        _btc = analyses.get("BTC")
+        if not sc["active_trade"] and _btc and _btc.get("direction") == "NO TRADE":
             # Only force if no open positions at all
             try:
                 open_pos = dx_get("/v2/positions/margined").get("result",[])
                 has_open = any(abs(float(p.get("size",0))) > 0 for p in open_pos)
             except:
                 has_open = True
-            if not has_open and a.get("confidence",0) >= 52:
+            if not has_open and _btc.get("confidence",0) >= 52:
                 alt = full_analysis("BTC")
                 if alt and alt.get("confidence",0) >= 52 and alt.get("direction") != "NO TRADE":
                     alt = execution_engine(alt)
