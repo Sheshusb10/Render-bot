@@ -56,6 +56,7 @@ bot_state = {
     "log":      [],
     "cycle_lock": False,
     "startup_time": time.time(),
+    "last_reset_date": "",  # tracks last daily reset date
     "pending_signal": {},  # signal waiting for confirmation
     "scalper": {
         "enabled": True,
@@ -652,21 +653,8 @@ def full_analysis(asset):
     else:
         direction = "NO TRADE"; conf = max(bull_pct, bear_pct)
 
-    # ── Straddle for sideways/low vol market ─────────────────────
-    if direction == "NO TRADE" and vol_regime == "LOW":
-        # Low volatility = straddle opportunity regardless of regime
-        # Volume contraction check
-        vol_contracting = vol.get("volume_trend") == "FALLING"
-        oi_flat = oi == "STABLE"
-        if vol_contracting or oi_flat or bb_1h["squeeze"]:
-            direction = "STRADDLE"
-            conf      = 72
-            reasons.append(f"Low vol ({bb_width:.1f}%) + contraction — straddle")
-    elif direction == "NO TRADE" and regime == "NEUTRAL" and vol_regime == "MID":
-        if bb_1h["squeeze"] or (45 < rsi_1h < 55):
-            direction = "STRADDLE"
-            conf      = 65
-            reasons.append("Neutral regime + mid vol — straddle")
+    # Straddle disabled — directional only for now
+    # (MV products too risky near expiry)
 
     # High vol — only allow trend following trades
     if vol_regime == "HIGH" and direction != "NO TRADE":
@@ -918,7 +906,7 @@ def risk_ok():
 
 def get_products_cached():
     now = time.time()
-    if now - _cache["ts"] > 600 or not _cache["products"]:
+    if now - _cache["ts"] > 120 or not _cache["products"]:
         try:
             _cache["products"] = pub_get(
                 "/v2/products?states=live&page_size=500").get("result",[])
@@ -1010,15 +998,22 @@ def manage_positions():
                 if product:
                     try:
                         close_side = "sell" if side == "buy" else "buy"
-                        resp = dx_post("/v2/orders", {
+                        is_mv = "MV-" in sym
+                        order_body = {
                             "product_id":     product["id"],
                             "product_symbol": sym,
                             "size":           int(size),
                             "side":           close_side,
                             "order_type":     "market_order",
-                            "reduce_only":    "true",
-                        })
-                        if not resp.get("error"):
+                        }
+                        if not is_mv:
+                            order_body["reduce_only"] = "true"
+                        resp = dx_post("/v2/orders", order_body)
+                        if resp.get("error"):
+                            blog(f"[{sym}] Close FAILED: {resp['error']}", "error")
+                        elif not resp.get("result"):
+                            blog(f"[{sym}] Close no result: {str(resp)[:100]}", "error")
+                        else:
                             blog(f"[{sym}] ✓ Closed automatically", "success")
                             # Update profit buffer
                             s = bot_state["stats"]
@@ -1281,17 +1276,27 @@ def execute_straddle(asset, price, products):
     blog(f"[{asset}] STRADDLE — using Delta MV products", "bot")
 
     # Try Delta native straddle products first (MV-BTC, MV-ETH)
+    def mv_hours_left(p):
+        try:
+            e = p["symbol"].split("-")[-1]
+            d=int(e[0:2]); m=int(e[2:4]); y=int("20"+e[4:6])
+            dt = datetime(y,m,d,8,0,0,tzinfo=timezone.utc)
+            return (dt - datetime.now(timezone.utc)).total_seconds()/3600
+        except: return 999
+
     mv_products = [p for p in products
                    if p.get("contract_type") in ("move_options", "straddle", "move")
                    and asset.upper() in p.get("symbol","").upper()
-                   and p.get("state") == "live"]
+                   and p.get("state") == "live"
+                   and mv_hours_left(p) >= 20]  # min 20h left
 
     # Also try symbol pattern MV-BTC or MOVE
     if not mv_products:
         mv_products = [p for p in products
                        if ("MV-" + asset.upper() in p.get("symbol","")
                            or "MOVE" in p.get("symbol","").upper())
-                       and p.get("state") == "live"]
+                       and p.get("state") == "live"
+                       and mv_hours_left(p) >= 20]
 
     if mv_products:
         # Pick ATM move product
@@ -1441,14 +1446,17 @@ def run_scalper(analyses):
                                     if p.get("symbol") == sym), None)
                     if product:
                         close_side = "sell" if side == "buy" else "buy"
-                        resp = dx_post("/v2/orders", {
+                        is_mv = "MV-" in sym
+                        order_body = {
                             "product_id":     product["id"],
                             "product_symbol": sym,
                             "size":           int(size),
                             "side":           close_side,
                             "order_type":     "market_order",
-                            "reduce_only":    "true",
-                        })
+                        }
+                        if not is_mv:
+                            order_body["reduce_only"] = "true"
+                        resp = dx_post("/v2/orders", order_body)
                         if not resp.get("error"):
                             sc["trades_today"] += 1
                             sc["profit"]       += upnl
@@ -1582,6 +1590,19 @@ def run_cycle():
         blog(f"━━ PRO CYCLE | Trades:{s['trades_today']}/6 | "
              f"Bal:{s['current_balance']:.2f} | "
              f"Buffer:${s['profit_buffer']:.3f} ━━", "bot")
+
+        # ── Auto daily reset at midnight UTC ─────────────────────
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if bot_state.get("last_reset_date") != today:
+            s = bot_state["stats"]
+            s["trades_today"] = 0
+            s["daily_pnl"] = 0.0
+            s["total_exposure_pct"] = 0.0
+            s["daily_loss_limit_hit"] = False
+            s["consecutive_losses"] = 0
+            bot_state["scalper"]["trades_today"] = 0
+            bot_state["last_reset_date"] = today
+            blog(f"🔄 Daily reset — new day {today}", "success")
 
         # Check Delta Exchange status first
         delta_ok, delta_status = check_delta_status()
