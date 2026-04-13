@@ -1583,12 +1583,19 @@ def run_scalper(analyses):
 
 # ── Main Bot Cycle ────────────────────────────────────────────────
 def run_cycle():
-    if bot_state["cycle_lock"]: return
+    lock_time = bot_state.get("cycle_lock_time", 0)
+    if bot_state["cycle_lock"]:
+        if time.time() - lock_time > 60:
+            blog("Cycle lock auto-released", "warning")
+            bot_state["cycle_lock"] = False
+        else:
+            return
     bot_state["cycle_lock"] = True
+    bot_state["cycle_lock_time"] = time.time()
 
     try:
         s = bot_state["stats"]
-        blog(f"━━ PRO CYCLE | Trades:{s['trades_today']}/6 | "
+        blog(f"━━ PRO CYCLE | Trades:{s['trades_today']}/12 | "
              f"Bal:{s['current_balance']:.2f} | "
              f"Buffer:${s['profit_buffer']:.3f} ━━", "bot")
 
@@ -1809,7 +1816,7 @@ def api_bot_start():
     stop_event.clear()
     bot_thread = threading.Thread(target=bot_loop, daemon=True)
     bot_thread.start()
-    blog(f"PRO Bot started | {bot_state['interval']}s | max 6 trades/day","success")
+    blog(f"PRO Bot started | {bot_state['interval']}s | max 12 trades/day","success")
     return jsonify({"ok":True})
 
 @app.route("/api/bot/stop", methods=["POST"])
