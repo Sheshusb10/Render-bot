@@ -65,7 +65,7 @@ bot_state = {
         "wins": 0,
         "losses": 0,
         "profit": 0.0,
-        "max_trades": 6,        # max scalper trades per day
+        "max_trades": 8,        # max scalper trades per day
         "target_pct": 8.0,      # take profit at +8%
         "stop_pct": -12.0,      # stop loss at -12%
         "min_confidence": 52,   # min confidence to scalp
@@ -900,7 +900,7 @@ def risk_ok():
         if s["current_balance"] < s["profit_floor"]:
             s["daily_loss_limit_hit"] = True
             return False, "Profit floor breached"
-    if s["trades_today"] >= 8: return False, "Max 8 trades/day"
+    if s["trades_today"] >= 12: return False, "Max 12 trades/day"
     if s["consecutive_losses"] >= 4: return False, "4 consecutive losses — pause"
     return True, "OK"
 
@@ -977,7 +977,7 @@ def manage_positions():
             if pnl_pct > trail["peak"]:
                 trail["peak"] = pnl_pct
                 # Progressive floors
-                floors = [(50,45),(30,25),(25,22),(20,17),(15,12),(12,10),(10,8),(8,6),(5,3),(3,1)]
+                floors = [(50,45),(30,25),(25,22),(20,17),(15,12),(12,10),(10,8),(8,6),(5,3),(3,2)]
                 for threshold, floor in floors:
                     if pnl_pct >= threshold:
                         trail["floor"] = floor
@@ -1014,25 +1014,26 @@ def manage_positions():
                         elif not resp.get("result"):
                             blog(f"[{sym}] Close no result: {str(resp)[:100]}", "error")
                         else:
-                            blog(f"[{sym}] ✓ Closed automatically", "success")
-                            # Update profit buffer
+                            blog(f"[{sym}] ✓ Closed automatically | PnL:{pnl_pct:.1f}%", "success")
+                            # Use pnl_pct as source of truth (upnl can be stale)
+                            realized = entry_val * (pnl_pct / 100)
                             s = bot_state["stats"]
-                            if upnl > 0:
+                            if pnl_pct > 0:
                                 s["wins"]         += 1
-                                s["profit_buffer"] += upnl
-                                s["buffer_high"]   = max(s["buffer_high"],
-                                                         s["profit_buffer"])
-                                blog(f"Profit buffer: +${upnl:.3f} = ${s['profit_buffer']:.3f}","success")
+                                s["profit_buffer"] += abs(realized)
+                                s["buffer_high"]   = max(s["buffer_high"], s["profit_buffer"])
+                                blog(f"✅ WIN +{pnl_pct:.1f}% | Buffer: +${abs(realized):.3f} = ${s['profit_buffer']:.3f}","success")
                             else:
                                 s["losses"] += 1
-                                if s["profit_buffer"] >= abs(upnl):
-                                    s["profit_buffer"]   -= abs(upnl)
-                                    s["losses_absorbed"] += abs(upnl)
-                                    blog(f"Loss absorbed by buffer | Buffer: ${s['profit_buffer']:.3f}","warning")
+                                loss_amt = abs(realized)
+                                if s["profit_buffer"] >= loss_amt:
+                                    s["profit_buffer"]   -= loss_amt
+                                    s["losses_absorbed"] += loss_amt
+                                    blog(f"❌ LOSS {pnl_pct:.1f}% | Absorbed by buffer | Buffer: ${s['profit_buffer']:.3f}","warning")
                                 else:
-                                    remaining = abs(upnl) - s["profit_buffer"]
+                                    remaining = loss_amt - s["profit_buffer"]
                                     s["profit_buffer"] = 0
-                                    blog(f"Buffer exhausted — capital hit: -${remaining:.3f}","error")
+                                    blog(f"❌ LOSS {pnl_pct:.1f}% | Capital hit: -${remaining:.3f}","error")
                             s["daily_pnl"]          += upnl
                             s["total_exposure_pct"]  = max(0,s["total_exposure_pct"]-3.0)
                             # Clear trail
@@ -1110,9 +1111,9 @@ def execute_trade(analysis):
             is_call = "CALL" in direction
             is_put  = "PUT"  in direction
             if (is_call and existing_calls) or (is_put and existing_puts):
-                if conf < 85:
+                if conf < 72:
                     blog(f"[{asset}] Correlation block — same direction already open "
-                         f"(need 85%+ got {conf}%) — skip","info")
+                         f"(need 72%+ got {conf}%) — skip","info")
                     return False
                 else:
                     blog(f"[{asset}] High conviction {conf}% — allowing despite correlation","info")
@@ -1210,7 +1211,7 @@ def execute_trade(analysis):
     # risk per trade = 2% of balance * confidence factor
     s = bot_state["stats"]
     balance = s.get("current_balance", 70)
-    risk_pct = 0.02  # 2% max risk per trade
+    risk_pct = 0.03  # 3% max risk per trade
     conf_factor = conf / 100.0
     risk_amount = balance * risk_pct * conf_factor
 
@@ -1218,7 +1219,7 @@ def execute_trade(analysis):
     est_premium = price * 0.015  # 1.5% of spot as rough premium estimate
     if est_premium > 0:
         raw_size = risk_amount / est_premium
-        size = max(1, min(3, round(raw_size)))
+        size = max(1, min(2, round(raw_size)))
     else:
         size = 1
 
