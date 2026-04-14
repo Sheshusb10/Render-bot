@@ -531,6 +531,7 @@ function updPos(positions){
           '<div style="text-align:right">'+
           '<div style="color:'+col+';font-weight:700">'+(upnl>=0?'+':'')+upnl.toFixed(3)+'</div>'+
           '<span class="badge '+(pct>=0?'bg':'br')+'">'+(pct>=0?'+':'')+pct.toFixed(1)+'%</span>'+
+          (pct>=3?'<button onclick="addLot(\''+p.product_symbol+'\')" style="margin-top:4px;display:block;width:100%;padding:3px 8px;border-radius:6px;font-size:9px;font-weight:700;border:1px solid rgba(245,158,11,.4);background:rgba(245,158,11,.15);color:#f59e0b">+ ADD LOT</button>':'')+
           '</div></div>';
       }).join('');
       if(manBadge) manBadge.textContent='MONITORING '+manual.length;
@@ -578,6 +579,7 @@ function updPos(positions){
           </div>
           <div style="display:flex;gap:4px;justify-content:flex-end;margin-top:2px">
             <span class="badge ${pnlPct>=0?'bg':'br'}">${pnlPct>=0?'+':''}${pnlPct.toFixed(1)}%</span>
+            ${pnlPct>=3?'<button onclick="addLot(\'' + sym + '\')" style="padding:3px 8px;border-radius:6px;font-size:9px;font-weight:700;border:1px solid rgba(245,158,11,.4);background:rgba(245,158,11,.15);color:var(--acc)">+ ADD LOT</button>':''}
           </div>
         </div>
       </div>
@@ -689,6 +691,29 @@ async function resetStats(){
   document.getElementById('haltAlert').style.display='none';
   document.getElementById('targetDone').style.display='none';
   doPoll();
+}
+
+async function addLot(sym){
+  if(!confirm(`Add 1 lot to ${sym}?`)) return;
+  try{
+    // Get current signal direction
+    const bs = await fetch('/api/bot/status').then(r=>r.json());
+    const ls = (bs.stats||{}).last_signal||{};
+    const dir = ls.direction||'BUY_CALL';
+    // Trigger a forced pyramid via run_now
+    const r = await fetch('/api/bot/add_lot', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({symbol: sym, direction: dir})
+    });
+    const d = await r.json();
+    if(d.ok){
+      alert(`✅ Added lot to ${sym}`);
+    } else {
+      alert(`❌ Failed: ${d.error||'unknown'}`);
+    }
+    doPoll();
+  } catch(e){ alert('Error: '+e.message); }
 }
 
 async function setCap(n){

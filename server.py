@@ -2344,6 +2344,14 @@ def run_cycle():
                 is_call  = sym.startswith("C-")
                 is_put   = sym.startswith("P-")
 
+                # Detect manual vs bot position — both eligible for pyramid
+                last_bot_opt = s.get("last_signal", {}).get("option", "")
+                is_manual = (sym != last_bot_opt and
+                             sym not in bot_state.get("trail_state", {}))
+                if is_manual and pnl_pct > 0:
+                    blog(f"[PYRAMID] Manual position {sym} +{pnl_pct:.1f}% "
+                         f"— eligible for add", "info")
+
                 # Get best current signal
                 best_sig = best if best else None
 
@@ -2357,31 +2365,45 @@ def run_cycle():
 
                 already_pyramided = pyramid_state.get(sym, False)
 
-                # All pyramid conditions must be met
+                # ── Dynamic pyramid threshold ────────────────────────
+                # Higher confidence = add earlier (don't wait for +15%)
+                # conf >= 90%: add at +3%  — extreme conviction, catch the run early
+                # conf >= 82%: add at +8%  — high conviction
+                # conf >= 75%: add at +15% — standard pyramid
+                sig_conf = best_sig["confidence"] if best_sig else 0
+                if sig_conf >= 90:
+                    pyramid_threshold = 3.0
+                elif sig_conf >= 82:
+                    pyramid_threshold = 8.0
+                else:
+                    pyramid_threshold = 15.0
+
                 pyramid_ok = (
-                    pnl_pct >= 15                        and  # position winning
+                    pnl_pct >= pyramid_threshold         and  # dynamic threshold
                     signal_matches                       and  # signal confirms direction
-                    best_sig["confidence"] >= 75         and  # high confidence only
-                    not already_pyramided                and  # one pyramid per trade
+                    sig_conf >= 75                       and  # min confidence
+                    not already_pyramided                and  # one pyramid per original
                     s["trades_today"] < 11               and  # leave room in cap
                     s["consecutive_losses"] == 0         and  # no loss streak
-                    s["profit_buffer"] >= 0              and  # buffer intact
                     s.get("current_balance", 0) > 50         # enough balance
                 )
 
                 if pyramid_ok:
-                    blog(f"[PYRAMID] 🔺 P1:{sym} at +{pnl_pct:.1f}% | "
-                         f"Conf:{best_sig['confidence']}% — adding P2", "success")
+                    pos_type = "MANUAL" if is_manual else "BOT"
+                    blog(f"[PYRAMID] 🔺 {pos_type} {sym} +{pnl_pct:.1f}% "
+                         f">= {pyramid_threshold}% threshold | "
+                         f"Conf:{sig_conf}% — opening P2", "success")
                     success = execute_trade(best_sig, is_pyramid=True)
                     if success:
                         pyramid_state[sym] = True
                         bot_state["pyramid_state"] = pyramid_state
-                        blog(f"[PYRAMID] ✅ P2 opened — compounding the trend", "success")
+                        blog(f"[PYRAMID] ✅ P2 opened — compounding {sym}", "success")
                     else:
-                        blog(f"[PYRAMID] P2 blocked by risk/position check", "info")
-                elif pnl_pct >= 15 and not already_pyramided and best_sig:
-                    blog(f"[PYRAMID] +{pnl_pct:.1f}% but conf {best_sig['confidence']}% "
-                         f"< 75% or other condition failed — holding", "info")
+                        blog(f"[PYRAMID] P2 blocked by risk check", "warning")
+                elif pnl_pct > 0 and not already_pyramided and best_sig and signal_matches:
+                    blog(f"[PYRAMID] {sym} +{pnl_pct:.1f}% — "
+                         f"need +{pyramid_threshold:.0f}% to add "
+                         f"(conf:{sig_conf:.0f}%)", "info")
 
             # Clean pyramid state when positions close
             open_syms = {p.get("product_symbol") for p in open_pos}
@@ -2653,6 +2675,48 @@ def api_straddles():
                         "btc_types": btc_types})
     except Exception as e:
         return jsonify({"error": str(e)})
+
+
+@app.route("/api/bot/add_lot", methods=["POST"])
+def api_add_lot():
+    """
+    Manual ADD LOT — user taps button on dashboard.
+    Immediately places 1 more lot on same symbol or best current signal.
+    Bypasses swing cooldown and same-asset check (is_pyramid=True).
+    """
+    d      = request.json or {}
+    sym    = d.get("symbol", "")
+    blog(f"[MANUAL ADD] User requested add lot for {sym}", "warning")
+
+    try:
+        # Get current analysis
+        a = full_analysis("BTC")
+        if not a:
+            return jsonify({"ok": False, "error": "Analysis failed"})
+
+        a = execution_engine(a)
+
+        # Force direction from existing position type
+        if sym.startswith("C-"):
+            a["direction"] = "BUY_CALL"
+        elif sym.startswith("P-"):
+            a["direction"] = "BUY_PUT"
+
+        # Override: must be a valid direction
+        if a["direction"] not in ("BUY_CALL", "BUY_PUT"):
+            return jsonify({"ok": False, "error": "No valid signal for add"})
+
+        # Execute as pyramid (bypasses same-asset check)
+        success = execute_trade(a, is_pyramid=True)
+
+        if success:
+            blog(f"[MANUAL ADD] ✅ Lot added for {sym}", "success")
+            return jsonify({"ok": True, "symbol": sym})
+        else:
+            return jsonify({"ok": False, "error": "Trade blocked by risk check"})
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
 
 @app.route("/api/ip")
 def api_ip():
