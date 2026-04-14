@@ -58,7 +58,6 @@ bot_state = {
     "startup_time": time.time(),
     "last_reset_date": "",  # tracks last daily reset date
     "last_trade_time": 0,    # cooldown between entries
-    "trade_cooldown": 180,   # 3 min minimum between new trades
     "max_daily_trades": _saved.get("max_daily_trades", 12),
     "trade_cooldown":   _saved.get("trade_cooldown", 180),
     "monitor_manual": True,  # monitor manually placed trades too
@@ -190,6 +189,8 @@ def check_ip():
             "setup_memory":     bot_state["setup_memory"],
             "max_daily_trades": bot_state.get("max_daily_trades", 12),
             "trade_cooldown":   bot_state.get("trade_cooldown", 180),
+            "deep_memory":      bot_state.get("deep_memory", {}),
+            "signal_weights":   bot_state.get("signal_weights", {}),
         })
     except: pass
 
@@ -1194,6 +1195,8 @@ def check_signal_reversal(open_pos, current_direction, current_conf):
                             s["profit_buffer"] = 0
                             blog(f"[{sym}] ✓ Reversal exit {pnl_pct:.1f}% | "
                                  f"Capital hit: -${remaining:.3f}", "error")
+                        s["daily_pnl"]         += realized
+                        s["total_exposure_pct"] = max(0, s["total_exposure_pct"] - 3.0)
                         bot_state["trail_state"].pop(sym, None)
                         # Clean pyramid state
                         bot_state.get("pyramid_state", {}).pop(sym, None)
@@ -1503,10 +1506,11 @@ def manage_positions():
                                 sig_at_entry = last_s.get("signals_snapshot", {})
                                 hrs_at_entry = last_s.get("hours_to_expiry", 72)
                                 regime_used  = last_s.get("regime", "NEUTRAL")
+                                conf_used    = last_s.get("confidence", 0)  # from entry signal
                                 dir_used     = "CALL" if is_call_sym else "PUT"
                                 learn_from_trade(
                                     sym, pnl_pct, entry, mark,
-                                    regime_used, vr, conf if pnl_pct else 0,
+                                    regime_used, vr, conf_used,
                                     hrs_at_entry, stype, dir_used, sig_at_entry
                                 )
                             except Exception as le:
@@ -1529,6 +1533,8 @@ def manage_positions():
                                 "profit_floor":    s["profit_floor"],
                                 "max_daily_trades": bot_state.get("max_daily_trades", 12),
                                 "trade_cooldown":   bot_state.get("trade_cooldown", 180),
+                                "deep_memory":      bot_state.get("deep_memory", {}),
+                                "signal_weights":   bot_state.get("signal_weights", {}),
                             })
                     except Exception as e:
                         blog(f"[{sym}] Close error: {e}", "error")
@@ -1622,6 +1628,171 @@ def score_strike(strike, price, target_itm_pct, is_call, hours_to_expiry):
         wrong_side_penalty = 1.0
 
     return diff + wrong_side_penalty
+
+def get_orderbook(product_id):
+    """
+    Fetch best bid and ask for an option from Delta Exchange India.
+    Uses /v2/l2orderbook/{symbol} — public endpoint, no auth needed.
+    Returns: {"bid": float, "ask": float, "spread": float, "spread_pct": float}
+    or None if orderbook unavailable.
+    """
+    try:
+        # Resolve product_id to symbol from cached products
+        products = get_products_cached()
+        product  = next((p for p in products if p.get("id") == product_id), None)
+        if not product:
+            return None
+        sym = product.get("symbol", "")
+        if not sym:
+            return None
+        r    = pub_get(f"/v2/l2orderbook/{sym}?depth=5")
+        ob   = r.get("result", {})
+        bids = ob.get("buy", [])
+        asks = ob.get("sell", [])
+        if not bids or not asks:
+            return None
+        best_bid = float(bids[0][0]) if isinstance(bids[0], list) else float(bids[0].get("price", 0))
+        best_ask = float(asks[0][0]) if isinstance(asks[0], list) else float(asks[0].get("price", 0))
+        if best_bid <= 0 or best_ask <= 0:
+            return None
+        spread     = best_ask - best_bid
+        spread_pct = (spread / best_ask * 100) if best_ask > 0 else 999
+        return {
+            "bid":        best_bid,
+            "ask":        best_ask,
+            "spread":     round(spread, 4),
+            "spread_pct": round(spread_pct, 2),
+        }
+    except Exception as e:
+        blog(f"Orderbook error product_id={product_id}: {e}", "warning")
+        return None
+
+def place_smart_limit_order(product, size, asset, direction):
+    """
+    Smart limit order execution:
+    1. Fetch bid/ask from orderbook
+    2. Skip if spread > 3% or no liquidity
+    3. Place limit at bid + 40% of spread (queue-jump price)
+    4. Wait up to 4 seconds for fill
+    5. Cancel and fall back to market order if unfilled
+
+    Returns: (success: bool, fill_type: str)
+    """
+    sym        = product["symbol"]
+    product_id = product["id"]
+
+    # ── 1. Fetch orderbook ─────────────────────────────────────
+    ob = get_orderbook(product_id)
+
+    if ob is None:
+        blog(f"[{asset}] Orderbook unavailable for {sym} — falling back to market", "warning")
+        return _place_market_order(product, size, asset, direction), "market_fallback"
+
+    bid        = ob["bid"]
+    ask        = ob["ask"]
+    spread     = ob["spread"]
+    spread_pct = ob["spread_pct"]
+
+    blog(f"[{asset}] Orderbook: bid=${bid:.2f} ask=${ask:.2f} "
+         f"spread=${spread:.2f} ({spread_pct:.2f}%)", "info")
+
+    # ── 2. Skip if spread too wide ─────────────────────────────
+    if spread_pct > 3.0:
+        blog(f"[{asset}] ⚠️ Spread {spread_pct:.2f}% > 3% threshold — skipping trade", "warning")
+        return False, "skipped_wide_spread"
+
+    # ── 3. Compute optimal entry price ─────────────────────────
+    # bid + 40% of spread = queue-jump above passive bid
+    # pays less than ask but likely fills faster than resting at bid
+    entry_price = round(bid + spread * 0.4, 2)
+    blog(f"[{asset}] Limit entry: ${entry_price:.2f} "
+         f"(bid + 40% spread | ask save: ${ask - entry_price:.2f})", "info")
+
+    # ── 4. Place limit order ───────────────────────────────────
+    try:
+        resp = dx_post("/v2/orders", {
+            "product_id":     product_id,
+            "product_symbol": sym,
+            "size":           size,
+            "side":           "buy",
+            "order_type":     "limit_order",
+            "limit_price":    str(entry_price),
+        })
+        if resp.get("error"):
+            err = resp["error"]
+            blog(f"[{asset}] Limit order failed: {err.get('code','err')} "
+                 f"— falling back to market", "warning")
+            return _place_market_order(product, size, asset, direction), "market_fallback"
+
+        order_result = resp.get("result", {})
+        order_id     = order_result.get("id")
+        if not order_id:
+            blog(f"[{asset}] No order ID returned — market fallback", "warning")
+            return _place_market_order(product, size, asset, direction), "market_fallback"
+
+        blog(f"[{asset}] Limit order #{order_id} placed @ ${entry_price:.2f}", "info")
+
+    except Exception as e:
+        blog(f"[{asset}] Limit order exception: {e} — market fallback", "warning")
+        return _place_market_order(product, size, asset, direction), "market_fallback"
+
+    # ── 5. Wait up to 4s for fill ──────────────────────────────
+    fill_deadline = time.time() + 4.0
+    while time.time() < fill_deadline:
+        time.sleep(0.8)
+        try:
+            status_r = dx_get(f"/v2/orders/{order_id}")
+            order    = status_r.get("result", {})
+            state    = order.get("state", "")
+            filled   = float(order.get("size_filled", 0) or 0)
+
+            if state == "closed" and filled >= size:
+                avg_fill = float(order.get("average_fill_price", entry_price) or entry_price)
+                saving   = round((ask - avg_fill) * size, 4)
+                blog(f"[{asset}] ✅ Limit filled @ ${avg_fill:.2f} | "
+                     f"Saved ${saving:.4f} vs market ask", "success")
+                return True, "limit_filled"
+
+            if state in ("cancelled", "rejected"):
+                blog(f"[{asset}] Order {state} — market fallback", "warning")
+                return _place_market_order(product, size, asset, direction), "market_fallback"
+
+        except Exception as e:
+            blog(f"[{asset}] Fill check error: {e}", "warning")
+            break
+
+    # ── 6. Not filled — cancel and use market ─────────────────
+    blog(f"[{asset}] Limit unfilled after 4s — cancelling, switching to market", "warning")
+    try:
+        dx_delete("/v2/orders", {"id": order_id, "product_id": product_id})
+    except:
+        pass
+    return _place_market_order(product, size, asset, direction), "market_fallback"
+
+
+def _place_market_order(product, size, asset, direction):
+    """Fallback market order — used when limit fails or spread too wide."""
+    try:
+        resp = dx_post("/v2/orders", {
+            "product_id":     product["id"],
+            "product_symbol": product["symbol"],
+            "size":           size,
+            "side":           "buy",
+            "order_type":     "market_order",
+        })
+        if resp.get("error"):
+            err = resp["error"]
+            blog(f"[{asset}] Market fallback failed: {err.get('code','err')}", "error")
+            return False
+        if not resp.get("result"):
+            blog(f"[{asset}] Market fallback no result", "error")
+            return False
+        blog(f"[{asset}] ✓ Market order filled: {product['symbol']}", "success")
+        return True
+    except Exception as e:
+        blog(f"[{asset}] Market fallback exception: {e}", "error")
+        return False
+
 
 def execute_trade(analysis, is_pyramid=False):
     asset     = analysis["asset"]
@@ -1840,22 +2011,16 @@ def execute_trade(analysis, is_pyramid=False):
     blog(f"[{asset}] Reasons: {' | '.join(analysis['reasons'][:3])}", "info")
 
     try:
-        resp = dx_post("/v2/orders", {
-            "product_id":     product["id"],
-            "product_symbol": product["symbol"],
-            "size":           size,
-            "side":           "buy",
-            "order_type":     "market_order",
-        })
-        if resp.get("error"):
-            err = resp["error"]
-            blog(f"[{asset}] Failed: {err.get('code','err')} — {err.get('context','')}", "error")
-            return False
-        if not resp.get("result"):
-            blog(f"[{asset}] No result in response: {str(resp)[:100]}", "error")
-            return False
+        # ── Smart limit order execution ─────────────────────────────
+        # Tries limit at bid+40% spread first.
+        # Skips if spread >3% of price (wide/illiquid market).
+        # Falls back to market if unfilled within 4 seconds.
+        filled, fill_type = place_smart_limit_order(product, size, asset, direction)
 
-        blog(f"[{asset}] ✓ {direction} {size}x filled: {product['symbol']}", "success")
+        if not filled:
+            return False  # skip_wide_spread or market fallback also failed
+
+        blog(f"[{asset}] ✓ {direction} {size}x → {product['symbol']} ({fill_type})", "success")
         bot_state["last_trade_time"] = time.time()  # start cooldown
         s = bot_state["stats"]
         s["trades_today"]       += 1
@@ -1879,11 +2044,17 @@ def execute_trade(analysis, is_pyramid=False):
             "hours_to_expiry": hrs_snap,
             "strike_type": stype_snap,
             "time": datetime.now(timezone.utc).isoformat(),
+            # Snapshot signals for learning on close
+            "signals_snapshot": {
+                "polymarket": analysis.get("poly_bull", False),
+                "order_flow": analysis.get("flow_buy", False),
+                "rsi":        analysis["indicators"].get("rsi_1h", 50) < 50,
+                "macd":       analysis["indicators"].get("macd_1h") == "BULLISH",
+            },
         }
         return True
     except Exception as e:
         blog(f"[{asset}] Exception: {e}", "error")
-        # Don't count order errors as losses — only real closed positions count
         return False
 
 def execute_straddle(asset, price, products):
@@ -1941,13 +2112,14 @@ def execute_straddle(asset, price, products):
                 "size":           1,
                 "side":           "buy",
                 "order_type":     "market_order",
+                
             })
             if not resp.get("error"):
                 blog(f"[{asset}] ✓ MV Straddle filled: {product['symbol']}","success")
                 s = bot_state["stats"]
                 s["trades_today"]       += 1
                 s["total_exposure_pct"] += 4.0
-                s["consecutive_losses"]  = 0
+                # Note: consecutive_losses only resets on WIN CLOSE, not on trade entry
                 return True
             else:
                 blog(f"[{asset}] MV order failed: {resp['error']}","error")
@@ -2005,7 +2177,6 @@ def execute_straddle(asset, price, products):
         s = bot_state["stats"]
         s["trades_today"]       += 1
         s["total_exposure_pct"] += 6.0
-        s["consecutive_losses"]  = 0
         blog(f"[{asset}] ✓ Full straddle placed","success")
         return True
     return False
@@ -2432,11 +2603,10 @@ def run_cycle():
             except:
                 has_open = True
             if not has_open and _btc.get("confidence",0) >= 52:
-                alt = full_analysis("BTC")
-                if alt and alt.get("confidence",0) >= 52 and alt.get("direction") != "NO TRADE":
-                    alt = execution_engine(alt)
-                    blog(f"⚡ Force trade: BTC {alt['direction']} {alt['confidence']}%", "warning")
-                    execute_trade(alt)
+                # Reuse already-computed analysis — don't waste 8 API calls
+                if _btc.get("direction") != "NO TRADE":
+                    blog(f"⚡ Force trade: BTC {_btc['direction']} {_btc['confidence']}%", "warning")
+                    execute_trade(_btc)
 
         total = s["wins"] + s["losses"]
         if total > 0: s["win_rate"] = round(s["wins"]/total*100, 1)
@@ -2588,13 +2758,21 @@ def api_bot_run_now():
 
 @app.route("/api/bot/status")
 def api_bot_status():
+    # Summarize learning state for dashboard
+    sw = bot_state.get("signal_weights", {})
+    sw_summary = {k: {"weight": round(v["weight"],2), "accuracy": round(v["correct"]/v["total"]*100) if v["total"]>0 else 50, "total": v["total"]} for k,v in sw.items()}
+    dm = bot_state.get("deep_memory", {})
+    dm_summary = {k: {"wr": round(v["wins"]/(v["wins"]+v["losses"])*100) if v["wins"]+v["losses"]>0 else 0, "count": v["wins"]+v["losses"]} for k,v in dm.items() if v["wins"]+v["losses"]>=2}
     return jsonify({
-        "running":  bot_state["running"],
-        "strategy": bot_state["strategy"],
-        "interval": bot_state["interval"],
-        "stats":    bot_state["stats"],
-        "log":      bot_state["log"][-200:],
-        "ip":       _ip_state["current"],
+        "running":        bot_state["running"],
+        "strategy":       bot_state["strategy"],
+        "interval":       bot_state["interval"],
+        "stats":          bot_state["stats"],
+        "log":            bot_state["log"][-200:],
+        "ip":             _ip_state["current"],
+        "signal_weights": sw_summary,
+        "deep_memory":    dm_summary,
+        "trade_cap":      {"cap": bot_state.get("max_daily_trades",12), "cooldown": bot_state.get("trade_cooldown",180)},
     })
 
 @app.route("/api/bot/set_cap", methods=["POST"])
@@ -2616,6 +2794,8 @@ def api_set_cap():
         "setup_memory": bot_state["setup_memory"],
         "max_daily_trades": bot_state["max_daily_trades"],
         "trade_cooldown": bot_state["trade_cooldown"],
+        "deep_memory":    bot_state.get("deep_memory", {}),
+        "signal_weights": bot_state.get("signal_weights", {}),
     })
     return jsonify({"ok": True, "cap": cap})
 
@@ -2637,6 +2817,8 @@ def api_set_cooldown():
         "setup_memory": bot_state["setup_memory"],
         "max_daily_trades": bot_state["max_daily_trades"],
         "trade_cooldown": bot_state["trade_cooldown"],
+        "deep_memory":    bot_state.get("deep_memory", {}),
+        "signal_weights": bot_state.get("signal_weights", {}),
     })
     return jsonify({"ok": True, "seconds": seconds})
 
