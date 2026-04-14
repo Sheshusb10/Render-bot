@@ -196,7 +196,7 @@ BINANCE_SYM = {
 
 # Price cache — avoid hammering Binance every cycle
 _price_cache = {}
-_price_cache_ttl = 30  # seconds
+_price_cache_ttl = 5   # seconds — fresh price for accurate strike selection
 
 def get_price(asset):
     # Return cached price if fresh
@@ -1267,7 +1267,7 @@ def manage_positions():
             if cached_vol == "HIGH":
                 base_stop = -12   # HIGH vol — cut quick
             elif cached_vol == "LOW":
-                base_stop = -20   # LOW vol — give room
+                base_stop = -15   # LOW vol BB squeeze = breakout risk, NOT safe!
             else:
                 base_stop = -15   # MID vol — normal
             
@@ -1504,53 +1504,99 @@ def execute_trade(analysis, is_pyramid=False):
     if not valid: valid = [p for p in options if get_hours(p) > 24]
     if not valid: valid = options
 
-    def strike_dist(p):
-        try: return abs(float(p["symbol"].split("-")[2]) - price)
-        except: return 999999
+    # ── SMART STRIKE SELECTION ──────────────────────────────────────
+    # The right strike depends on regime and confidence:
+    #
+    # STRONG signal (conf>=75) in trending regime:
+    #   CALL → ITM: strike 0.5-1.5% BELOW price → delta 0.6-0.8 → moves more with BTC
+    #   PUT  → ITM: strike 0.5-1.5% ABOVE price → delta 0.6-0.8 → moves more as BTC falls
+    #
+    # NORMAL signal (conf 55-75):
+    #   → ATM: strike within 0.5% of price → delta ~0.5 → balanced
+    #
+    # WEAK signal or high vol:
+    #   → Slightly OTM → cheaper premium, defined loss
+    #
+    # ITM options cost more but earn MORE per $ BTC moves (higher delta)
+    # OTM options are cheaper but need big BTC move to profit (low delta)
 
-    # Sort by strike distance first
-    valid.sort(key=strike_dist)
+    regime    = analysis.get("regime", "NEUTRAL")
+    is_strong = regime in ("STRONG_BULL", "BULL", "STRONG_BEAR", "BEAR")
+    is_call   = direction == "BUY_CALL"
+    is_put    = direction == "BUY_PUT"
 
-    # Liquidity check — skip options with no volume
-    liquid_options = []
-    for p in valid:
-        vol_24h = float(p.get("volume", 0) or p.get("turnover_24h", 0) or 0)
-        oi = float(p.get("open_interest", 0) or 0)
-        if vol_24h > 0 or oi > 0:
-            liquid_options.append(p)
-
-    if not liquid_options:
-        blog(f"[{asset}] No liquid options — using best available", "warning")
-        liquid_options = valid  # fallback to any option
-
-    # Smart strike selection:
-    # PUT: pick strike 0.5-2% BELOW current price (OTM put)
-    # CALL: pick strike 0.5-2% ABOVE current price (OTM call)
-    def otm_score(p):
+    def strike_score(p):
+        """Score each option: lower = better. Prefers ITM on strong signals."""
         try:
-            strike = float(p["symbol"].split("-")[2])
-            if direction == "BUY_PUT":
-                # Prefer strike slightly below price
-                diff = price - strike
-                if 0 < diff <= price * 0.03:  # 0-3% OTM
-                    return (0, diff)  # best range
-                elif diff > price * 0.03:
-                    return (1, diff)  # too far OTM
-                else:
-                    return (2, abs(diff))  # ITM put (avoid)
-            else:  # BUY_CALL
-                diff = strike - price
-                if 0 < diff <= price * 0.03:  # 0-3% OTM
-                    return (0, diff)
-                elif diff > price * 0.03:
-                    return (1, diff)
-                else:
-                    return (2, abs(diff))
-        except:
-            return (3, 999999)
+            strike     = float(p["symbol"].split("-")[2])
+            diff_pct   = (strike - price) / price * 100  # + = above price, - = below price
 
-    liquid_options.sort(key=otm_score)
-    product = liquid_options[0]  # Best OTM option with liquidity
+            if is_call:
+                if conf >= 75 and is_strong:
+                    # STRONG BULL → ITM call (strike below price = negative diff_pct)
+                    # Best: -1.5% to -0.3% ITM | Good: ATM | Avoid: OTM
+                    if -2.0 <= diff_pct <= -0.3:  return (0, abs(diff_pct))  # ✅ ITM sweet spot
+                    elif -0.3 < diff_pct <= 0.3:  return (1, abs(diff_pct))  # ✅ ATM
+                    elif 0.3 < diff_pct <= 1.0:   return (2, diff_pct)        # ⚠ slight OTM
+                    elif diff_pct < -2.0:          return (3, abs(diff_pct))  # deep ITM
+                    else:                          return (4, diff_pct)        # far OTM
+                else:
+                    # NORMAL/WEAK → ATM preferred
+                    if -0.5 <= diff_pct <= 0.5:   return (0, abs(diff_pct))  # ATM
+                    elif -1.5 <= diff_pct <= 1.5: return (1, abs(diff_pct))  # near ATM
+                    else:                          return (2, abs(diff_pct))  # far
+            else:  # BUY_PUT
+                if conf >= 75 and is_strong:
+                    # STRONG BEAR → ITM put (strike above price = positive diff_pct)
+                    if 0.3 <= diff_pct <= 2.0:    return (0, abs(diff_pct))  # ✅ ITM sweet spot
+                    elif -0.3 <= diff_pct < 0.3:  return (1, abs(diff_pct))  # ✅ ATM
+                    elif -1.0 <= diff_pct < -0.3: return (2, abs(diff_pct))  # ⚠ slight OTM
+                    elif diff_pct > 2.0:           return (3, diff_pct)        # deep ITM
+                    else:                          return (4, abs(diff_pct))  # far OTM
+                else:
+                    if -0.5 <= diff_pct <= 0.5:   return (0, abs(diff_pct))
+                    elif -1.5 <= diff_pct <= 1.5: return (1, abs(diff_pct))
+                    else:                          return (2, abs(diff_pct))
+        except:
+            return (5, 999999)
+
+    # Sort all options by strike score (best first)
+    valid.sort(key=strike_score)
+
+    # Prefer liquid options but don't discard illiquid ones
+    liquid_options = [p for p in valid
+                      if float(p.get("volume", 0) or 0) > 0
+                      or float(p.get("open_interest", 0) or 0) > 0]
+    if not liquid_options:
+        blog(f"[{asset}] No liquid options — using best strike regardless", "warning")
+        liquid_options = valid
+    else:
+        liquid_options.sort(key=strike_score)  # re-sort liquids by strategy score
+
+    # Block re-buying same option that just lost
+    last_sig = bot_state["stats"].get("last_signal", {})
+    last_opt = last_sig.get("option", "")
+    consec   = bot_state["stats"].get("consecutive_losses", 0)
+    if consec > 0 and last_opt:
+        elapsed_since_last = time.time() - bot_state.get("last_trade_time", 0)
+        if elapsed_since_last < 700:
+            before = len(liquid_options)
+            liquid_options = [p for p in liquid_options if p["symbol"] != last_opt]
+            if len(liquid_options) < before:
+                blog(f"[{asset}] Skipping recently lost {last_opt} — next best strike", "info")
+
+    product = liquid_options[0] if liquid_options else (valid[0] if valid else None)
+    if not product:
+        blog(f"[{asset}] No options available after filtering", "warning")
+        return False
+
+    # Log the strategy applied
+    chosen_strike  = float(product["symbol"].split("-")[2]) if "-" in product["symbol"] else 0
+    diff_pct_final = (chosen_strike - price) / price * 100 if price else 0
+    strike_type    = ("ITM" if (is_call and diff_pct_final < -0.3) or (is_put and diff_pct_final > 0.3)
+                      else "ATM" if abs(diff_pct_final) <= 0.5 else "OTM")
+    blog(f"[{asset}] Strike: {strike_type} | ${chosen_strike:.0f} vs BTC ${price:.0f} "
+         f"({diff_pct_final:+.2f}%) | Regime:{regime} Conf:{conf}%", "info")
     strike  = product["symbol"].split("-")[2] if "-" in product["symbol"] else "?"
     hrs     = get_hours(product)
     vol_24h = float(product.get("volume", 0) or 0)
@@ -2029,23 +2075,30 @@ def run_cycle():
             same_dir    = pending.get("direction") == best["direction"]
             pending_age = time.time() - pending.get("ts", 0)
 
-            if best["confidence"] >= 75:
-                blog(f"[SWING] High conviction — trading immediately", "bot")
+            # After losses, raise the bar — prevent revenge trading
+            consec = bot_state["stats"].get("consecutive_losses", 0)
+            imm_threshold  = min(88, 75 + consec * 7)  # 75→82→89 per loss, cap 88
+            conf_threshold = min(72, 55 + consec * 5)  # 55→60→65 per loss, cap 72
+
+            if best["confidence"] >= imm_threshold:
+                blog(f"[SWING] High conviction {best['confidence']}% "
+                     f"(threshold:{imm_threshold}%) — trading", "bot")
                 bot_state["pending_signal"] = {}
                 execute_trade(best)
-            elif same_asset and same_dir and pending_age < 900:
-                blog(f"[SWING] Signal confirmed — executing", "bot")
+            elif same_asset and same_dir and pending_age < 900 and best["confidence"] >= conf_threshold:
+                blog(f"[SWING] Signal confirmed (need {conf_threshold}%) — executing", "bot")
                 bot_state["pending_signal"] = {}
                 execute_trade(best)
-            elif best["confidence"] >= 55:
+            elif best["confidence"] >= conf_threshold:
                 bot_state["pending_signal"] = {
                     "asset": best["asset"], "direction": best["direction"],
                     "confidence": best["confidence"], "ts": time.time(),
                 }
                 blog(f"[SWING] Pending confirmation: {best['asset']} "
-                     f"{best['direction']} {best['confidence']}%", "info")
+                     f"{best['direction']} {best['confidence']}% "
+                     f"(need {imm_threshold}% to fire immediately)", "info")
             else:
-                blog(f"[SWING] Confidence too low — skipping", "info")
+                blog(f"[SWING] Confidence {best['confidence']}% below {conf_threshold}% — skipping", "info")
                 bot_state["pending_signal"] = {}
         else:
             blog("[SWING] No valid setup this cycle", "info")
@@ -2149,6 +2202,19 @@ def run_cycle():
         blog(f"Cycle error: {traceback.format_exc()}","error")
     finally:
         bot_state["cycle_lock"] = False
+
+def position_monitor_loop():
+    """
+    Lightweight position monitor — runs every 90s independently.
+    Catches stop losses faster than the 5-min main cycle.
+    Only checks stops/trails, doesn't open new trades.
+    """
+    while not stop_event.is_set():
+        try:
+            if bot_state["running"] and API_KEY:
+                manage_positions()
+        except: pass
+        stop_event.wait(90)
 
 def bot_loop():
     while not stop_event.is_set():
@@ -2259,7 +2325,10 @@ def api_bot_start():
     stop_event.clear()
     bot_thread = threading.Thread(target=bot_loop, daemon=True)
     bot_thread.start()
-    blog(f"PRO Bot started | {bot_state['interval']}s | max 12 trades/day","success")
+    # Start fast position monitor (90s cycle for stop loss protection)
+    monitor_thread = threading.Thread(target=position_monitor_loop, daemon=True)
+    monitor_thread.start()
+    blog(f"PRO Bot started | {bot_state['interval']}s | position monitor: 90s","success")
     return jsonify({"ok":True})
 
 @app.route("/api/bot/stop", methods=["POST"])
