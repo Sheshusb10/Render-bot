@@ -57,6 +57,10 @@ bot_state = {
     "cycle_lock": False,
     "startup_time": time.time(),
     "last_reset_date": "",  # tracks last daily reset date
+    "last_trade_time": 0,    # cooldown between entries
+    "trade_cooldown": 180,   # 3 min minimum between new trades
+    "max_daily_trades": 12,  # user configurable daily cap
+    "monitor_manual": True,  # monitor manually placed trades too
     "pending_signal": {},  # signal waiting for confirmation
     "scalper": {
         "enabled": True,
@@ -377,6 +381,131 @@ def get_crypto_sentiment():
     except:
         return {"sentiment": "NEUTRAL", "bull_pct": 50, "headlines": []}
 
+
+def get_polymarket_sentiment():
+    """
+    Polymarket BTC prediction markets — real money sentiment.
+    "Will BTC be above $X?" YES price = crowd bull confidence.
+    Weight: 15 points toward call/put decision.
+    """
+    try:
+        r = requests.get(
+            "https://clob.polymarket.com/markets?active=true&closed=false",
+            timeout=8)
+        if r.status_code != 200:
+            return {"sentiment": "NEUTRAL", "bull_pct": 50, "markets": 0}
+
+        markets = r.json().get("data", [])
+        btc_markets = [m for m in markets
+                       if any(x in m.get("question", "").lower()
+                              for x in ["bitcoin", "btc"])
+                       and any(x in m.get("question", "").lower()
+                               for x in ["above", "below", "reach", "price",
+                                         "higher", "lower", "exceed"])]
+
+        if not btc_markets:
+            return {"sentiment": "NEUTRAL", "bull_pct": 50, "markets": 0}
+
+        bull_scores = []
+        bear_scores = []
+
+        for m in btc_markets[:8]:
+            q = m.get("question", "").lower()
+            tokens = m.get("tokens", [])
+            for t in tokens:
+                outcome = t.get("outcome", "").lower()
+                price   = float(t.get("price", 0.5))
+                # YES on "above" = bull
+                if outcome == "yes" and any(x in q for x in ["above","exceed","higher","reach"]):
+                    bull_scores.append(price)
+                # YES on "below" = bear
+                elif outcome == "yes" and any(x in q for x in ["below","lower","under","drop"]):
+                    bear_scores.append(price)
+                # NO on "above" = bear
+                elif outcome == "no" and any(x in q for x in ["above","exceed"]):
+                    bear_scores.append(price)
+                # NO on "below" = bull
+                elif outcome == "no" and any(x in q for x in ["below","lower"]):
+                    bull_scores.append(price)
+
+        total_scores = len(bull_scores) + len(bear_scores)
+        if total_scores == 0:
+            return {"sentiment": "NEUTRAL", "bull_pct": 50, "markets": len(btc_markets)}
+
+        avg_bull = sum(bull_scores) / len(bull_scores) if bull_scores else 0
+        avg_bear = sum(bear_scores) / len(bear_scores) if bear_scores else 0
+        denom = avg_bull + avg_bear if (avg_bull + avg_bear) > 0 else 1
+        bull_pct = round((avg_bull / denom) * 100, 1)
+
+        sentiment = ("BULLISH" if bull_pct >= 62
+                     else "BEARISH" if bull_pct <= 38
+                     else "NEUTRAL")
+
+        return {
+            "sentiment": sentiment,
+            "bull_pct":  bull_pct,
+            "markets":   len(btc_markets),
+        }
+    except:
+        return {"sentiment": "NEUTRAL", "bull_pct": 50, "markets": 0}
+
+
+def get_deribit_iv():
+    """
+    Deribit BTC Volatility Index — real options market IV.
+    Much more accurate than BB_width for volatility regime.
+    IV < 45: Low vol — good for directional options (sniper mode)
+    IV 45-65: Normal vol
+    IV > 65: High fear — options expensive, tighter entries
+    IV > 80: Extreme — avoid buying options (too expensive)
+    """
+    try:
+        r = requests.get(
+            "https://www.deribit.com/api/v2/public/get_volatility_index"
+            "?currency=BTC&resolution=60",
+            timeout=6)
+        data = r.json()
+        if data.get("result") and data["result"].get("data"):
+            iv = float(data["result"]["data"][-1][4])  # close value
+            if iv < 45:   iv_regime = "LOW"
+            elif iv > 65: iv_regime = "HIGH"
+            else:         iv_regime = "NORMAL"
+            return {"iv": round(iv, 1), "regime": iv_regime}
+    except: pass
+    # Fallback — try simpler endpoint
+    try:
+        r = requests.get(
+            "https://www.deribit.com/api/v2/public/get_index_price"
+            "?index_name=btc_usd",
+            timeout=5)
+        # If Deribit unreachable, return neutral
+    except: pass
+    return {"iv": 55, "regime": "NORMAL"}  # safe default
+
+def get_order_flow():
+    """
+    Binance futures taker buy/sell ratio.
+    > 1.2: Buyers dominating — institutional buying → BUY_CALL signal
+    < 0.8: Sellers dominating — institutional selling → BUY_PUT signal
+    1.2 ≥ x ≥ 0.8: Neutral flow
+    """
+    try:
+        r = requests.get(
+            "https://fapi.binance.com/futures/data/takerlongshortRatio"
+            "?symbol=BTCUSDT&period=5m&limit=3",
+            timeout=6)
+        data = r.json()
+        if isinstance(data, list) and len(data) > 0:
+            # Average last 3 periods for stability
+            ratios = [float(d.get("buySellRatio", 1.0)) for d in data]
+            avg_ratio = sum(ratios) / len(ratios)
+            if avg_ratio > 1.2:   flow = "BUY"
+            elif avg_ratio < 0.8: flow = "SELL"
+            else:                  flow = "NEUTRAL"
+            return {"flow": flow, "ratio": round(avg_ratio, 3)}
+    except: pass
+    return {"flow": "NEUTRAL", "ratio": 1.0}
+
 def check_delta_status():
     """Check if Delta Exchange API is healthy."""
     try:
@@ -477,9 +606,15 @@ def full_analysis(asset):
     fg      = get_fear_greed()
     funding = get_funding_rate(asset)
     oi      = get_oi_trend(asset)
+    dv_iv   = get_deribit_iv()
+    flow    = get_order_flow()
     news    = get_crypto_sentiment()
+    poly    = get_polymarket_sentiment()
     blog(f"[{asset}] News:{news['sentiment']} ({news['bull_pct']}% bull) | "
          f"Headline: {news['headlines'][0] if news['headlines'] else 'none'}", "info")
+    if poly["markets"] > 0:
+        blog(f"[{asset}] Polymarket:{poly['sentiment']} ({poly['bull_pct']}% bull) | "
+             f"{poly['markets']} BTC markets", "info")
 
     chg_1h = ((c1h[-1]["close"]-c1h[-2]["close"])/c1h[-2]["close"]*100) if len(c1h)>=2 else 0
     chg_4h = ((c4h[-1]["close"]-c4h[-2]["close"])/c4h[-2]["close"]*100) if len(c4h)>=2 else 0
@@ -498,7 +633,15 @@ def full_analysis(asset):
     else:
         vol_regime = "MID"    # normal directional
 
-    blog(f"[{asset}] VolRegime:{vol_regime} BB_width:{bb_width:.2f}%", "info")
+    blog(f"[{asset}] VolRegime:{vol_regime} BB_width:{bb_width:.2f}% | "
+         f"DeribitIV:{dv_iv['iv']} ({dv_iv['regime']}) | "
+         f"OrderFlow:{flow['flow']} ({flow['ratio']}x)", "info")
+    # Use Deribit IV to refine vol regime if available
+    if dv_iv["regime"] == "HIGH" and vol_regime != "HIGH":
+        vol_regime = "HIGH"  # Deribit says high vol — trust it
+    elif dv_iv["regime"] == "LOW" and vol_regime == "HIGH":
+        vol_regime = "MID"   # Deribit disagrees — use middle ground
+    bot_state["last_vol_regime"] = vol_regime  # save for stop loss
 
     highs = [c["high"] for c in c1h[-20:]]
     lows  = [c["low"]  for c in c1h[-20:]]
@@ -617,6 +760,18 @@ def full_analysis(asset):
     elif news["sentiment"] == "BEARISH":
         bear += 8; reasons.append(f"News bearish ({100-news['bull_pct']}%)")
 
+    # ── Polymarket (real money prediction markets) ────────────────
+    # Strong signal — people bet real $ on these outcomes
+    if poly["markets"] > 0:
+        if poly["sentiment"] == "BULLISH":
+            pts = 20 if poly["bull_pct"] >= 70 else 12
+            bull += pts
+            reasons.append(f"Polymarket bullish ({poly['bull_pct']}% bull money)")
+        elif poly["sentiment"] == "BEARISH":
+            pts = 20 if poly["bull_pct"] <= 30 else 12
+            bear += pts
+            reasons.append(f"Polymarket bearish ({100-poly['bull_pct']}% bear money)")
+
     # ── Funding — ignored in strong bull regime ───────────────────
     if regime not in ("STRONG_BULL", "BULL"):
         if funding > 0.05:
@@ -627,6 +782,22 @@ def full_analysis(asset):
     # ── OI ────────────────────────────────────────────────────────
     if oi == "RISING" and chg_1h > 0:   bull += 10
     elif oi == "RISING" and chg_1h < 0: bear += 10
+
+    # ── Order Flow (institutional taker activity) ─────────────────
+    if flow["flow"] == "BUY":
+        bull += 15; reasons.append(f"Order flow: buyers {flow['ratio']}x dominating")
+    elif flow["flow"] == "SELL":
+        bear += 15; reasons.append(f"Order flow: sellers {flow['ratio']}x dominating")
+
+    # ── Deribit IV adjustment ─────────────────────────────────────
+    if dv_iv["regime"] == "HIGH":
+        # High IV = options expensive = reduce confidence on buys
+        conf_penalty = 8 if dv_iv["iv"] > 80 else 4
+        reasons.append(f"High IV {dv_iv['iv']} — options expensive, reduced conf")
+    elif dv_iv["regime"] == "LOW":
+        # Low IV = vol compression = breakout likely, boost confidence
+        bull += 5; bear += 5  # boost both — breakout coming, direction TBD
+        reasons.append(f"Low IV {dv_iv['iv']} — vol squeeze, breakout incoming")
 
     # ── Momentum ─────────────────────────────────────────────────
     if chg_1h > 1:   bull += 10
@@ -646,13 +817,18 @@ def full_analysis(asset):
     bull_pct = round(bull / total * 100, 1)
     bear_pct = round(bear / total * 100, 1)
 
-    # ── Direction with minimum confidence 75% ────────────────────
+    # ── Direction with minimum confidence ───────────────────────
     if bull > bear and bull_pct >= 55:
         direction = "BUY_CALL"; conf = bull_pct
     elif bear > bull and bear_pct >= 55:
         direction = "BUY_PUT";  conf = bear_pct
     else:
         direction = "NO TRADE"; conf = max(bull_pct, bear_pct)
+
+    # Apply IV penalty — high IV = expensive options = reduce conf
+    if dv_iv["regime"] == "HIGH" and direction != "NO TRADE":
+        iv_penalty = 8 if dv_iv["iv"] > 80 else 4
+        conf = max(0, conf - iv_penalty)
 
     # Straddle disabled — directional only for now
     # (MV products too risky near expiry)
@@ -697,7 +873,7 @@ def full_analysis(asset):
             vol_factor = -5  # loosen veto in low vol
 
     veto_thresholds = {
-        "STRONG_BULL": {"PUT": 60 + vol_factor, "CALL": 0},
+        "STRONG_BULL": {"PUT": 65 + vol_factor, "CALL": 0},
         "BULL":        {"PUT": 58 + vol_factor, "CALL": 0},
         "NEUTRAL":     {"PUT": 0,               "CALL": 0},
         "BEAR":        {"PUT": 0,  "CALL": 52 + vol_factor},
@@ -901,21 +1077,37 @@ def risk_ok():
         if s["current_balance"] < s["profit_floor"]:
             s["daily_loss_limit_hit"] = True
             return False, "Profit floor breached"
-    # Auto-scale daily cap based on win rate
+    # User-configurable daily cap (from dashboard)
+    user_cap = bot_state.get("max_daily_trades", 12)
+    # Auto-scale within user cap based on win rate
     total_trades = s["wins"] + s["losses"]
-    if total_trades >= 5:
+    if user_cap == 0:
+        daily_cap = 999  # 0 = unlimited (user chose no cap)
+    elif total_trades >= 5:
         win_rate = s["wins"] / total_trades * 100
         if win_rate > 50:
-            daily_cap = 999  # winning streak — no cap
+            daily_cap = user_cap  # winning — use full user cap
         elif win_rate >= 40:
-            daily_cap = 12   # neutral
+            daily_cap = max(6, int(user_cap * 0.75))  # neutral — 75% of cap
         else:
-            daily_cap = 8    # losing — slow down
+            daily_cap = max(4, int(user_cap * 0.5))   # losing — 50% of cap
     else:
-        daily_cap = 12  # default before enough data
+        daily_cap = user_cap  # default to user cap before enough data
     if s["trades_today"] >= daily_cap:
-        return False, f"Max {daily_cap} trades/day (WR-based)"
+        return False, f"Max {daily_cap} trades/day (cap:{user_cap} WR-scaled)"
     if s["consecutive_losses"] >= 4: return False, "4 consecutive losses — pause"
+
+    # Daily P&L circuit breakers
+    start_bal = s.get("starting_balance", 0)
+    cur_bal   = s.get("current_balance", 0)
+    if start_bal > 0 and cur_bal > 0:
+        daily_pnl_pct = (cur_bal - start_bal) / start_bal * 100
+        if daily_pnl_pct >= 12:
+            return False, f"🎯 Daily target +12% hit ({daily_pnl_pct:.1f}%) — locking profits"
+        if daily_pnl_pct <= -8:
+            s["daily_loss_limit_hit"] = True
+            return False, f"🛑 Daily loss -8% hit ({daily_pnl_pct:.1f}%) — stopping"
+
     return True, "OK"
 
 def get_products_cached():
@@ -929,8 +1121,79 @@ def get_products_cached():
     return _cache["products"]
 
 # ── Position Manager ──────────────────────────────────────────────
+
+def check_signal_reversal(open_pos, current_direction, current_conf):
+    """
+    If we have an open CALL and signal is now strong PUT (or vice versa),
+    close the losing position to stop the bleeding.
+    Only acts when: signal is opposite direction AND conf >= 65%
+    """
+    if current_direction == "NO TRADE" or current_conf < 65:
+        return
+    
+    products = get_products_cached()
+    now = datetime.now(timezone.utc)
+    
+    for pos in open_pos:
+        sym  = pos.get("product_symbol", "")
+        size = abs(float(pos.get("size", 0)))
+        if size == 0: continue
+        
+        entry = float(pos.get("entry_price", 0))
+        mark  = float(pos.get("mark_price", 0) or 0)
+        if entry <= 0: continue
+        
+        pnl_pct = ((mark - entry) / entry * 100)
+        is_call = sym.startswith("C-")
+        is_put  = sym.startswith("P-")
+        
+        # Check for signal reversal
+        reversal = (
+            (is_call and current_direction == "BUY_PUT" and pnl_pct < -5) or
+            (is_put  and current_direction == "BUY_CALL" and pnl_pct < -5)
+        )
+        
+        if reversal:
+            blog(f"[{sym}] 🔄 Signal reversal: position {'CALL' if is_call else 'PUT'} "
+                 f"but signal is {current_direction} at {current_conf}% | "
+                 f"PnL:{pnl_pct:.1f}% — closing to stop loss", "warning")
+            
+            product = next((p for p in products if p.get("symbol") == sym), None)
+            if product:
+                try:
+                    side = "buy" if float(pos.get("size", 0)) < 0 else "sell"
+                    resp = dx_post("/v2/orders", {
+                        "product_id":     product["id"],
+                        "product_symbol": sym,
+                        "size":           int(size),
+                        "side":           side,
+                        "order_type":     "market_order",
+                        "reduce_only":    "true",
+                    })
+                    if not resp.get("error"):
+                        realized = entry * size * (pnl_pct / 100)
+                        s = bot_state["stats"]
+                        s["losses"] += 1
+                        s["consecutive_losses"] += 1
+                        loss_amt = abs(realized)
+                        if s["profit_buffer"] >= loss_amt:
+                            s["profit_buffer"] -= loss_amt
+                            s["losses_absorbed"] += loss_amt
+                            blog(f"[{sym}] ✓ Reversal exit {pnl_pct:.1f}% | "
+                                 f"Buffer: ${s['profit_buffer']:.3f}", "warning")
+                        else:
+                            remaining = loss_amt - s["profit_buffer"]
+                            s["profit_buffer"] = 0
+                            blog(f"[{sym}] ✓ Reversal exit {pnl_pct:.1f}% | "
+                                 f"Capital hit: -${remaining:.3f}", "error")
+                        bot_state["trail_state"].pop(sym, None)
+                        # Clean pyramid state
+                        bot_state.get("pyramid_state", {}).pop(sym, None)
+                except Exception as e:
+                    blog(f"[{sym}] Reversal exit error: {e}", "error")
+
 def manage_positions():
-    """Auto-manage all open positions."""
+    """Auto-manage all open positions including manually placed ones."""
     try:
         positions = dx_get("/v2/positions/margined").get("result",[])
         open_pos  = [p for p in positions if abs(float(p.get("size",0))) > 0]
@@ -938,6 +1201,15 @@ def manage_positions():
 
         products = get_products_cached()
         now      = datetime.now(timezone.utc)
+
+        # Detect manually placed trades (not in last_signal)
+        last_opt = bot_state["stats"].get("last_signal", {}).get("option", "")
+        for pos in open_pos:
+            sym = pos.get("product_symbol","")
+            if sym != last_opt and sym not in bot_state.get("trail_state", {}):
+                if bot_state.get("monitor_manual", True):
+                    blog(f"[MANUAL] Detected external position: {sym} — applying trail stops", "warning")
+                    # Initialize trail state so it gets monitored like auto trades
 
         for pos in open_pos:
             sym   = pos.get("product_symbol","")
@@ -977,14 +1249,31 @@ def manage_positions():
                     close_reason = f"Expiry in {hours_left:.1f}h — salvaging value"
             except: pass
 
-            # Dynamic stop loss — tightens based on consecutive losses
+            # Dynamic stop loss — tightens based on vol regime AND consecutive losses
             consec = s.get("consecutive_losses", 0)
-            if consec >= 3:
-                stop_loss = -10   # 3+ losses — cut quick
-            elif consec >= 2:
-                stop_loss = -15   # 2 losses — tighter
+            # Vol regime lookup from trail_state context
+            # Use BB_width via position symbol to determine vol (approximation)
+            # PRIMARY: vol regime based stop
+            try:
+                # Get current vol regime from cached analysis if available
+                cached_vol = bot_state.get("last_vol_regime", "MID")
+            except:
+                cached_vol = "MID"
+            
+            if cached_vol == "HIGH":
+                base_stop = -12   # HIGH vol — cut quick
+            elif cached_vol == "LOW":
+                base_stop = -20   # LOW vol — give room
             else:
-                stop_loss = -20   # normal
+                base_stop = -15   # MID vol — normal
+            
+            # Tighten further on consecutive losses
+            if consec >= 3:
+                stop_loss = max(base_stop, -10)
+            elif consec >= 2:
+                stop_loss = max(base_stop, -12)
+            else:
+                stop_loss = base_stop
 
             if not should_close and pnl_pct <= stop_loss:
                 should_close = True
@@ -1138,6 +1427,14 @@ def execute_trade(analysis, is_pyramid=False):
     if not ok:
         blog(f"[{asset}] Risk blocked: {reason}", "warning")
         return False
+
+    # Trade cooldown — prevent rapid re-entries
+    if not is_pyramid:
+        elapsed = time.time() - bot_state.get("last_trade_time", 0)
+        cooldown = bot_state.get("trade_cooldown", 180)
+        if elapsed < cooldown:
+            blog(f"[{asset}] Cooldown: {int(cooldown-elapsed)}s remaining", "info")
+            return False
 
     try:
         open_pos   = dx_get("/v2/positions/margined").get("result",[])
@@ -1299,6 +1596,7 @@ def execute_trade(analysis, is_pyramid=False):
             return False
 
         blog(f"[{asset}] ✓ {direction} {size}x filled: {product['symbol']}", "success")
+        bot_state["last_trade_time"] = time.time()  # start cooldown
         s = bot_state["stats"]
         s["trades_today"]       += 1
         s["total_exposure_pct"] += 3.0 * size
@@ -1695,8 +1993,18 @@ def run_cycle():
                 blog(f"[{asset}] Error: {traceback.format_exc()}","error")
 
         # ── MODE 1: SWING STRATEGY ───────────────────────────────
-        # High confidence, holds hours/days, signal confirmation
         manage_positions()
+
+        # ── SIGNAL REVERSAL CHECK ────────────────────────────────
+        # If open position and signal flips hard → exit to stop bleeding
+        try:
+            _open = dx_get("/v2/positions/margined").get("result", [])
+            _open = [p for p in _open if abs(float(p.get("size", 0))) > 0]
+            if _open and analyses.get("BTC"):
+                _a = analyses["BTC"]
+                check_signal_reversal(_open, _a["direction"], _a["confidence"])
+        except Exception as _re:
+            blog(f"Reversal check error: {_re}", "error")
 
         best = None; best_conf = 0
         for asset, a in analyses.items():
@@ -1968,6 +2276,25 @@ def api_bot_status():
         "log":      bot_state["log"][-200:],
         "ip":       _ip_state["current"],
     })
+
+@app.route("/api/bot/set_cap", methods=["POST"])
+def api_set_cap():
+    d = request.json or {}
+    cap = int(d.get("cap", 12))
+    cap = max(0, min(50, cap))  # clamp 0-50
+    bot_state["max_daily_trades"] = cap
+    label = "unlimited" if cap == 0 else str(cap)
+    blog(f"Daily trade cap set to {label} trades", "info")
+    return jsonify({"ok": True, "cap": cap})
+
+@app.route("/api/bot/set_cooldown", methods=["POST"])
+def api_set_cooldown():
+    d = request.json or {}
+    seconds = int(d.get("seconds", 180))
+    seconds = max(60, min(600, seconds))  # clamp 60s-10min
+    bot_state["trade_cooldown"] = seconds
+    blog(f"Trade cooldown set to {seconds}s", "info")
+    return jsonify({"ok": True, "seconds": seconds})
 
 @app.route("/api/bot/reset", methods=["POST"])
 def api_bot_reset():

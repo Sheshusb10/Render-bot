@@ -235,16 +235,69 @@ button,input{font-family:'JetBrains Mono',monospace;cursor:pointer;outline:none}
       </div>
 
       <div class="card">
-        <div class="card-title">Controls</div>
-        <div class="ilabel">Cycle (seconds)</div>
-        <input class="inp" type="number" id="intInp" value="300" min="180"/>
-        <div class="ilabel" style="margin-top:10px">Daily target (%)</div>
-        <input class="inp" type="number" id="targetInp" value="10" min="3" max="100"/>
-        <div class="g2" style="margin-top:10px">
+        <div class="card-title">Bot Controls</div>
+
+        <div class="g2" style="margin-bottom:10px">
+          <div>
+            <div class="ilabel">Cycle (seconds)</div>
+            <input class="inp" type="number" id="intInp" value="300" min="180"/>
+          </div>
+          <div>
+            <div class="ilabel">Daily target (%)</div>
+            <input class="inp" type="number" id="targetInp" value="10" min="3" max="100"/>
+          </div>
+        </div>
+
+        <!-- Trade cap control -->
+        <div style="background:var(--bg3);border-radius:8px;padding:10px;border:1px solid var(--border);margin-bottom:10px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <div class="ilabel" style="color:var(--acc)">Daily Trade Cap</div>
+            <span class="badge by" id="capBadge">12</span>
+          </div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
+            <button class="btn b-gry" style="width:auto;padding:5px 10px;font-size:10px" onclick="setCap(0)">∞ Unlimited</button>
+            <button class="btn b-gry" style="width:auto;padding:5px 10px;font-size:10px" onclick="setCap(5)">5</button>
+            <button class="btn b-gry" style="width:auto;padding:5px 10px;font-size:10px" onclick="setCap(8)">8</button>
+            <button class="btn b-gry" style="width:auto;padding:5px 10px;font-size:10px" onclick="setCap(12)">12</button>
+            <button class="btn b-gry" style="width:auto;padding:5px 10px;font-size:10px" onclick="setCap(20)">20</button>
+          </div>
+          <div style="display:flex;gap:6px">
+            <input class="inp" type="number" id="capInp" value="12" min="0" max="50" style="margin-top:0;flex:1"/>
+            <button class="btn b-acc" style="width:auto;padding:8px 14px;font-size:11px;margin-top:0" onclick="setCapCustom()">Set</button>
+          </div>
+        </div>
+
+        <!-- Cooldown control -->
+        <div style="background:var(--bg3);border-radius:8px;padding:10px;border:1px solid var(--border);margin-bottom:10px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <div class="ilabel" style="color:var(--pur)">Trade Cooldown</div>
+            <span class="badge bp" id="cooldownBadge">3 min</span>
+          </div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
+            <button class="btn b-gry" style="width:auto;padding:5px 10px;font-size:10px" onclick="setCooldown(60)">1 min</button>
+            <button class="btn b-gry" style="width:auto;padding:5px 10px;font-size:10px" onclick="setCooldown(180)">3 min</button>
+            <button class="btn b-gry" style="width:auto;padding:5px 10px;font-size:10px" onclick="setCooldown(300)">5 min</button>
+            <button class="btn b-gry" style="width:auto;padding:5px 10px;font-size:10px" onclick="setCooldown(600)">10 min</button>
+          </div>
+        </div>
+
+        <div class="g2">
           <button class="btn b-acc" onclick="runNow()">↻ Run Now</button>
           <button class="btn b-gry" onclick="resetStats()">Reset Stats</button>
         </div>
-        <button class="btn b-gry" style="margin-top:8px" onclick="setTarget()">✓ Set Target</button>
+        <button class="btn b-gry" style="margin-top:8px" onclick="saveSettings()">✓ Save Settings</button>
+      </div>
+
+      <!-- Manual Trade Monitor -->
+      <div class="card" style="border-color:rgba(167,139,250,.3)">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+          <div class="card-title" style="margin:0;color:var(--pur)">Manual Trade Monitor</div>
+          <span class="badge bp" id="manualBadge">ACTIVE</span>
+        </div>
+        <div style="font-size:10px;color:var(--t3);margin-bottom:10px;line-height:1.6">
+          Bot monitors ALL positions on Delta — including ones you place manually. Trail stops and stop losses apply to manual trades too.
+        </div>
+        <div id="manualPosList" style="font-size:11px;color:var(--t2)">No external positions detected</div>
       </div>
 
       <!-- Positions — FIX: shows trail floor indicator -->
@@ -374,6 +427,7 @@ function updStatus(bs){
   const ls=s.last_signal||{};
   if(ls.price) document.getElementById('btcPrice').textContent='$'+parseFloat(ls.price).toLocaleString();
   document.getElementById('btcRegime').textContent='Regime: '+(ls.regime||'—');
+  window._lastSig=ls;
   document.getElementById('btcChg').textContent=ls.direction==='BUY_CALL'?'▲ CALL':
     ls.direction==='BUY_PUT'?'▼ PUT':ls.direction||'—';
   document.getElementById('btcChg').style.color=
@@ -455,6 +509,35 @@ function updWallet(){
 
 // FIX: positions now show trail floor bar
 function updPos(positions){
+  // Separate bot vs manual positions
+  const lastOpt=(window._lastSig||{}).option||'';
+  const manual=positions.filter(p=>p.product_symbol!==lastOpt && 
+    !p.product_symbol.startsWith('MV-') && p.product_symbol!==lastOpt);
+  const manEl=document.getElementById('manualPosList');
+  if(manual.length>0){
+    manEl.innerHTML=manual.map(p=>{
+      const pnl=parseFloat(p.unrealized_pnl||0);
+      const mark=parseFloat(p.mark_price||0);
+      const entry=parseFloat(p.entry_price||0);
+      const pct=entry>0?((mark-entry)/entry*100):0;
+      return \`<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border)">
+        <div>
+          <div style="font-weight:700">\${p.product_symbol}</div>
+          <div style="font-size:9px;color:var(--t3)">MANUAL · Entry \$\${entry.toFixed(0)}</div>
+        </div>
+        <div style="text-align:right">
+          <div style="color:\${pnl>=0?'var(--grn)':'var(--red)';font-weight:700}">\${pnl>=0?'+':''}\${pnl.toFixed(3)}</div>
+          <span class="badge \${pct>=0?'bg':'br'}">\${pct>=0?'+':''}\${pct.toFixed(1)}%</span>
+        </div>
+      </div>\`;
+    }).join('');
+    document.getElementById('manualBadge').textContent='MONITORING '+manual.length;
+  } else {
+    manEl.innerHTML='<div style="color:var(--t3);font-size:10px">No external positions detected</div>';
+    document.getElementById('manualBadge').textContent='ACTIVE';
+  }
+
+function _updPos(positions){
   const c=document.getElementById('posCard');
   if(!positions.length){c.style.display='none';return;}
   c.style.display='block';
@@ -603,6 +686,41 @@ async function resetStats(){
   await fetch(A+'/bot/reset',{method:'POST'});
   document.getElementById('haltAlert').style.display='none';
   document.getElementById('targetDone').style.display='none';
+  doPoll();
+}
+
+async function setCap(n){
+  document.getElementById('capInp').value=n;
+  await fetch('/api/bot/set_cap',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({cap:n})});
+  document.getElementById('capBadge').textContent=n===0?'∞':n;
+  doPoll();
+}
+
+async function setCapCustom(){
+  const n=parseInt(document.getElementById('capInp').value)||12;
+  await setCap(n);
+}
+
+async function setCooldown(s){
+  await fetch('/api/bot/set_cooldown',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({seconds:s})});
+  const m=s<60?s+'s':Math.round(s/60)+' min';
+  document.getElementById('cooldownBadge').textContent=m;
+  doPoll();
+}
+
+async function saveSettings(){
+  const iv=parseInt(document.getElementById('intInp').value)||300;
+  const t=parseFloat(document.getElementById('targetInp').value)||10;
+  await fetch('/api/bot/set_target',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({target:t})});
+  if(running){
+    await fetch('/api/bot/stop',{method:'POST'});
+    await new Promise(r=>setTimeout(r,500));
+    await fetch('/api/bot/start',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({interval:iv})});
+  }
   doPoll();
 }
 
