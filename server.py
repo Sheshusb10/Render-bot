@@ -1337,7 +1337,8 @@ def manage_positions():
             close_reason = ""
             s = bot_state["stats"]  # needed for dynamic stop loss
 
-            # Expiry check
+            # Expiry check — hours_left used for stop loss tightening too
+            hours_left = 999  # default = plenty of time (no expiry tightening)
             try:
                 parts      = sym.split("-")
                 expiry_str = parts[-1]
@@ -1356,25 +1357,34 @@ def manage_positions():
                     close_reason = f"Expiry in {hours_left:.1f}h — salvaging value"
             except: pass
 
-            # Dynamic stop loss — tightens based on vol regime AND consecutive losses
-            consec = s.get("consecutive_losses", 0)
-            # Vol regime lookup from trail_state context
-            # Use BB_width via position symbol to determine vol (approximation)
-            # PRIMARY: vol regime based stop
-            try:
-                # Get current vol regime from cached analysis if available
-                cached_vol = bot_state.get("last_vol_regime", "MID")
-            except:
-                cached_vol = "MID"
-            
+            # Dynamic stop loss — vol regime + consecutive losses + TIME TO EXPIRY
+            # Options near expiry have accelerating theta decay — cut losses faster
+            consec    = s.get("consecutive_losses", 0)
+            cached_vol = bot_state.get("last_vol_regime", "MID")
+
+            # ── Step 1: Base stop from vol regime ──────────────────
             if cached_vol == "HIGH":
                 base_stop = -12   # HIGH vol — cut quick
-            elif cached_vol == "LOW":
-                base_stop = -15   # LOW vol BB squeeze = breakout risk, NOT safe!
             else:
-                base_stop = -15   # MID vol — normal
-            
-            # Tighten further on consecutive losses
+                base_stop = -15   # LOW/MID vol — normal room
+
+            # ── Step 2: Tighten based on time to expiry ────────────
+            # The closer to expiry, the less time to recover → cut faster
+            # hours_left is already calculated above (from expiry_str)
+            try:
+                if hours_left < 12:
+                    base_stop = max(base_stop, -5)   # <12h: very tight
+                elif hours_left < 24:
+                    base_stop = max(base_stop, -8)   # <24h: tight
+                elif hours_left < 48:
+                    base_stop = max(base_stop, -10)  # <48h: moderate  ← YOUR CASE (35h)
+                elif hours_left < 72:
+                    base_stop = max(base_stop, -12)  # <72h: slightly tight
+                # >72h: full base_stop applies (plenty of time)
+            except:
+                pass
+
+            # ── Step 3: Tighten further on consecutive losses ──────
             if consec >= 3:
                 stop_loss = max(base_stop, -10)
             elif consec >= 2:
