@@ -59,7 +59,8 @@ bot_state = {
     "last_reset_date": "",  # tracks last daily reset date
     "last_trade_time": 0,    # cooldown between entries
     "trade_cooldown": 180,   # 3 min minimum between new trades
-    "max_daily_trades": 12,  # user configurable daily cap
+    "max_daily_trades": _saved.get("max_daily_trades", 12),
+    "trade_cooldown":   _saved.get("trade_cooldown", 180),
     "monitor_manual": True,  # monitor manually placed trades too
     "pending_signal": {},  # signal waiting for confirmation
     "scalper": {
@@ -183,6 +184,8 @@ def check_ip():
             "last_signal":      s["last_signal"],
             "trail_state":      bot_state["trail_state"],
             "setup_memory":     bot_state["setup_memory"],
+            "max_daily_trades": bot_state.get("max_daily_trades", 12),
+            "trade_cooldown":   bot_state.get("trade_cooldown", 180),
         })
     except: pass
 
@@ -1097,16 +1100,17 @@ def risk_ok():
         return False, f"Max {daily_cap} trades/day (cap:{user_cap} WR-scaled)"
     if s["consecutive_losses"] >= 4: return False, "4 consecutive losses — pause"
 
-    # Daily P&L circuit breakers
-    start_bal = s.get("starting_balance", 0)
-    cur_bal   = s.get("current_balance", 0)
-    if start_bal > 0 and cur_bal > 0:
-        daily_pnl_pct = (cur_bal - start_bal) / start_bal * 100
-        if daily_pnl_pct >= 12:
-            return False, f"🎯 Daily target +12% hit ({daily_pnl_pct:.1f}%) — locking profits"
-        if daily_pnl_pct <= -8:
+    # Daily P&L circuit breakers — use daily_pnl tracked from closed trades
+    cur_bal = s.get("current_balance", 0)
+    daily_pnl = s.get("daily_pnl", 0.0)
+    if cur_bal > 0 and daily_pnl != 0:
+        daily_pct = (daily_pnl / cur_bal) * 100
+        target = bot_state.get("daily_target", 10)
+        if daily_pct >= target:
+            return False, f"🎯 Daily target +{target}% hit ({daily_pct:.1f}%) — locking profits"
+        if daily_pct <= -8:
             s["daily_loss_limit_hit"] = True
-            return False, f"🛑 Daily loss -8% hit ({daily_pnl_pct:.1f}%) — stopping"
+            return False, f"🛑 Daily loss -8% hit ({daily_pct:.1f}%) — stopping"
 
     return True, "OK"
 
@@ -1404,6 +1408,8 @@ def manage_positions():
                                 "starting_balance": s["starting_balance"],
                                 "peak_balance":    s["peak_balance"],
                                 "profit_floor":    s["profit_floor"],
+                                "max_daily_trades": bot_state.get("max_daily_trades", 12),
+                                "trade_cooldown":   bot_state.get("trade_cooldown", 180),
                             })
                     except Exception as e:
                         blog(f"[{sym}] Close error: {e}", "error")
@@ -1942,7 +1948,9 @@ def run_cycle():
 
     try:
         s = bot_state["stats"]
-        blog(f"━━ PRO CYCLE | Trades:{s['trades_today']}/12 | "
+        _cap = bot_state.get("max_daily_trades", 12)
+        _cap_lbl = "∞" if _cap == 0 else str(_cap)
+        blog(f"━━ PRO CYCLE | Trades:{s['trades_today']}/{_cap_lbl} | "
              f"Bal:{s['current_balance']:.2f} | "
              f"Buffer:${s['profit_buffer']:.3f} ━━", "bot")
 
@@ -2285,6 +2293,18 @@ def api_set_cap():
     bot_state["max_daily_trades"] = cap
     label = "unlimited" if cap == 0 else str(cap)
     blog(f"Daily trade cap set to {label} trades", "info")
+    s = bot_state["stats"]
+    save_state({
+        "last_ip": _ip_state.get("current",""),
+        "profit_buffer": s["profit_buffer"], "buffer_high": s["buffer_high"],
+        "losses_absorbed": s["losses_absorbed"], "starting_balance": s["starting_balance"],
+        "peak_balance": s["peak_balance"], "profit_floor": s["profit_floor"],
+        "wins": s["wins"], "losses": s["losses"], "win_rate": s["win_rate"],
+        "last_signal": s["last_signal"], "trail_state": bot_state["trail_state"],
+        "setup_memory": bot_state["setup_memory"],
+        "max_daily_trades": bot_state["max_daily_trades"],
+        "trade_cooldown": bot_state["trade_cooldown"],
+    })
     return jsonify({"ok": True, "cap": cap})
 
 @app.route("/api/bot/set_cooldown", methods=["POST"])
@@ -2294,7 +2314,28 @@ def api_set_cooldown():
     seconds = max(60, min(600, seconds))  # clamp 60s-10min
     bot_state["trade_cooldown"] = seconds
     blog(f"Trade cooldown set to {seconds}s", "info")
+    s = bot_state["stats"]
+    save_state({
+        "last_ip": _ip_state.get("current",""),
+        "profit_buffer": s["profit_buffer"], "buffer_high": s["buffer_high"],
+        "losses_absorbed": s["losses_absorbed"], "starting_balance": s["starting_balance"],
+        "peak_balance": s["peak_balance"], "profit_floor": s["profit_floor"],
+        "wins": s["wins"], "losses": s["losses"], "win_rate": s["win_rate"],
+        "last_signal": s["last_signal"], "trail_state": bot_state["trail_state"],
+        "setup_memory": bot_state["setup_memory"],
+        "max_daily_trades": bot_state["max_daily_trades"],
+        "trade_cooldown": bot_state["trade_cooldown"],
+    })
     return jsonify({"ok": True, "seconds": seconds})
+
+@app.route("/api/bot/set_target", methods=["POST"])
+def api_set_target():
+    d = request.json or {}
+    target = float(d.get("target", 10))
+    target = max(1, min(100, target))
+    bot_state["daily_target"] = target
+    blog(f"Daily target set to {target}%", "info")
+    return jsonify({"ok": True, "target": target})
 
 @app.route("/api/bot/reset", methods=["POST"])
 def api_bot_reset():
