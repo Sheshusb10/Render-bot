@@ -75,14 +75,18 @@ bot_state = {
         "stop_pct": -12.0,      # stop loss at -12%
         "min_confidence": 52,   # min confidence to scalp
     },
-    "setup_memory": _saved.get("setup_memory", {
-        "STRONG_BEAR_CALL": {"wins": 0, "losses": 0},
-        "STRONG_BEAR_PUT":  {"wins": 0, "losses": 0},
-        "BEAR_CALL":        {"wins": 0, "losses": 0},
-        "BEAR_PUT":         {"wins": 0, "losses": 0},
-        "NEUTRAL_STRADDLE": {"wins": 0, "losses": 0},
-        "BULL_CALL":        {"wins": 0, "losses": 0},
-        "STRONG_BULL_CALL": {"wins": 0, "losses": 0},
+    "setup_memory": _saved.get("setup_memory", {}),
+    # Extended memory: regime_direction_striketype_vol_expiry → {wins, losses, avg_pnl}
+    "deep_memory":  _saved.get("deep_memory", {}),
+    # Signal source accuracy tracking
+    "signal_weights": _saved.get("signal_weights", {
+        "polymarket":   {"weight": 1.0, "correct": 0, "total": 0},
+        "order_flow":   {"weight": 1.0, "correct": 0, "total": 0},
+        "deribit_iv":   {"weight": 1.0, "correct": 0, "total": 0},
+        "rsi":          {"weight": 1.0, "correct": 0, "total": 0},
+        "macd":         {"weight": 1.0, "correct": 0, "total": 0},
+        "news":         {"weight": 1.0, "correct": 0, "total": 0},
+        "volume":       {"weight": 1.0, "correct": 0, "total": 0},
     }),
     "stats": {
         "trades_today":       0,
@@ -1196,6 +1200,102 @@ def check_signal_reversal(open_pos, current_direction, current_conf):
                 except Exception as e:
                     blog(f"[{sym}] Reversal exit error: {e}", "error")
 
+
+def learn_from_trade(sym, pnl_pct, entry_price, mark_price,
+                     regime, vol_regime, conf, hours_left,
+                     strike_type, direction, signals_at_entry):
+    """
+    Called every time a position closes.
+    Updates 3 learning systems:
+      1. deep_memory  — tracks win rate per exact setup combo
+      2. signal_weights — tracks which signals were right
+      3. ITM target adjustments — learns best ITM per regime/vol
+    """
+    won = pnl_pct > 0
+    s   = bot_state
+
+    # ── 1. Deep memory — 4-dimensional key ───────────────────────
+    expiry_bucket = ("short" if hours_left < 48
+                     else "medium" if hours_left < 120
+                     else "long")
+    deep_key = f"{regime}_{direction}_{strike_type}_{vol_regime}_{expiry_bucket}"
+    dm = s.get("deep_memory", {})
+    if deep_key not in dm:
+        dm[deep_key] = {"wins": 0, "losses": 0, "total_pnl": 0.0, "count": 0}
+    dm[deep_key]["wins"   if won else "losses"] += 1
+    dm[deep_key]["total_pnl"] += pnl_pct
+    dm[deep_key]["count"]     += 1
+    s["deep_memory"] = dm
+
+    # Win rate and avg PnL for this key
+    d    = dm[deep_key]
+    tot  = d["wins"] + d["losses"]
+    wr   = d["wins"] / tot * 100 if tot else 0
+    avg  = d["total_pnl"] / d["count"] if d["count"] else 0
+    blog(f"[LEARN] DeepMemory: {deep_key} → "
+         f"{wr:.0f}% WR ({d['wins']}W/{d['losses']}L) avg:{avg:.1f}%", "info")
+
+    # ── 2. Signal source accuracy ─────────────────────────────────
+    sw = s.get("signal_weights", {})
+    for source, was_bullish in (signals_at_entry or {}).items():
+        if source not in sw:
+            sw[source] = {"weight": 1.0, "correct": 0, "total": 0}
+        sw[source]["total"] += 1
+        # Signal was correct if: bullish+won OR bearish+lost (for the direction traded)
+        is_call = "CALL" in direction
+        signal_correct = (
+            (was_bullish and is_call and won) or
+            (was_bullish and is_call and not won) is False or
+            (not was_bullish and not is_call and won) or
+            (not was_bullish and not is_call and not won) is False
+        )
+        # Simplified: signal correct = it agreed with winning direction
+        agreed_with_trade = (was_bullish and is_call) or (not was_bullish and not is_call)
+        if (agreed_with_trade and won) or (not agreed_with_trade and not won):
+            sw[source]["correct"] += 1
+            # Boost signal weight slightly
+            sw[source]["weight"] = min(1.5, sw[source]["weight"] * 1.05)
+        else:
+            # Signal was wrong — reduce weight slightly
+            sw[source]["weight"] = max(0.5, sw[source]["weight"] * 0.95)
+
+        acc = sw[source]["correct"] / sw[source]["total"] * 100 if sw[source]["total"] else 50
+        if sw[source]["total"] >= 5:  # only log after enough data
+            blog(f"[LEARN] Signal '{source}': {acc:.0f}% accuracy "
+                 f"weight:{sw[source]['weight']:.2f}", "info")
+    s["signal_weights"] = sw
+
+    # ── 3. ITM target self-adjustment ────────────────────────────
+    # If this strike_type has bad win rate → note for future adjustment
+    # (actual parameter adjustment happens in get_optimal_itm_target via deep_memory)
+    if tot >= 5 and wr < 35 and strike_type == "OTM":
+        blog(f"[LEARN] ⚠️ OTM calls losing in {regime}/{vol_regime} — "
+             f"will prefer ITM next time", "info")
+    elif tot >= 5 and wr > 65:
+        blog(f"[LEARN] ✅ {strike_type} working well in {regime}/{vol_regime} "
+             f"({wr:.0f}% WR) — strategy confirmed", "info")
+
+    # Save immediately
+    save_state({
+        "last_ip":         _ip_state.get("current", ""),
+        "profit_buffer":   s["stats"]["profit_buffer"],
+        "buffer_high":     s["stats"]["buffer_high"],
+        "losses_absorbed": s["stats"]["losses_absorbed"],
+        "starting_balance": s["stats"]["starting_balance"],
+        "peak_balance":    s["stats"]["peak_balance"],
+        "profit_floor":    s["stats"]["profit_floor"],
+        "wins":            s["stats"]["wins"],
+        "losses":          s["stats"]["losses"],
+        "win_rate":        s["stats"]["win_rate"],
+        "last_signal":     s["stats"]["last_signal"],
+        "trail_state":     bot_state["trail_state"],
+        "setup_memory":    bot_state["setup_memory"],
+        "deep_memory":     bot_state.get("deep_memory", {}),
+        "signal_weights":  bot_state.get("signal_weights", {}),
+        "max_daily_trades": bot_state.get("max_daily_trades", 12),
+        "trade_cooldown":  bot_state.get("trade_cooldown", 180),
+    })
+
 def manage_positions():
     """Auto-manage all open positions including manually placed ones."""
     try:
@@ -1393,6 +1493,25 @@ def manage_positions():
                                      f"({mem['wins']}W/{mem['losses']}L)", "info")
                             except Exception as me:
                                 pass
+
+                            # ── Deep learning from this trade ──────────
+                            try:
+                                is_call_sym  = sym.startswith("C-")
+                                stype        = bot_state.get("_last_strike_type", "OTM")
+                                vr           = bot_state.get("last_vol_regime", "MID")
+                                last_s       = bot_state["stats"].get("last_signal", {})
+                                sig_at_entry = last_s.get("signals_snapshot", {})
+                                hrs_at_entry = last_s.get("hours_to_expiry", 72)
+                                regime_used  = last_s.get("regime", "NEUTRAL")
+                                dir_used     = "CALL" if is_call_sym else "PUT"
+                                learn_from_trade(
+                                    sym, pnl_pct, entry, mark,
+                                    regime_used, vr, conf if pnl_pct else 0,
+                                    hrs_at_entry, stype, dir_used, sig_at_entry
+                                )
+                            except Exception as le:
+                                blog(f"[LEARN] Error: {le}", "warning")
+
                             # Save state
                             save_state({
                                 "last_ip":         _ip_state["current"],
@@ -1417,6 +1536,93 @@ def manage_positions():
         blog(f"Position manager error: {e}", "error")
 
 # ── Execute Trade ─────────────────────────────────────────────────
+
+def get_optimal_itm_target(regime, vol_regime, conf, hours_to_expiry, is_call):
+    """
+    Returns the ideal ITM depth as a % of BTC price.
+    Positive = ITM for calls (strike below price)
+    Positive = ITM for puts  (strike above price)
+
+    Matrix: regime × vol_regime × expiry
+    """
+    # ── Base ITM target from regime × vol ──────────────────────
+    # Table: (regime, vol) → (min_itm_pct, max_itm_pct)
+    itm_table = {
+        ("STRONG_BULL", "LOW"):  (2.0, 3.0),
+        ("STRONG_BULL", "MID"):  (1.5, 2.5),
+        ("STRONG_BULL", "HIGH"): (0.5, 1.0),
+        ("BULL",        "LOW"):  (1.0, 2.0),
+        ("BULL",        "MID"):  (0.5, 1.5),
+        ("BULL",        "HIGH"): (0.0, 0.5),   # ATM in high vol
+        ("NEUTRAL",     "LOW"):  (-0.3, 0.3),  # ATM
+        ("NEUTRAL",     "MID"):  (-0.3, 0.3),
+        ("NEUTRAL",     "HIGH"): (-1.0, 0.0),  # slight OTM
+        ("BEAR",        "LOW"):  (1.0, 2.0),
+        ("BEAR",        "MID"):  (0.5, 1.5),
+        ("BEAR",        "HIGH"): (0.0, 0.5),
+        ("STRONG_BEAR", "LOW"):  (2.0, 3.0),
+        ("STRONG_BEAR", "MID"):  (1.5, 2.5),
+        ("STRONG_BEAR", "HIGH"): (0.5, 1.0),
+    }
+
+    key = (regime, vol_regime)
+    if key not in itm_table:
+        key = ("NEUTRAL", "MID")  # safe fallback
+
+    min_itm, max_itm = itm_table[key]
+
+    # ── Scale within range based on confidence ──────────────────
+    # conf 55 = min target, conf 90+ = max target
+    conf_scale = max(0, min(1, (conf - 55) / 35))  # 0 at 55%, 1 at 90%
+    target_itm = min_itm + (max_itm - min_itm) * conf_scale
+
+    # ── Adjust for expiry ───────────────────────────────────────
+    if hours_to_expiry < 24:
+        target_itm *= 0.3   # near expiry: theta risk, go ATM
+    elif hours_to_expiry < 48:
+        target_itm *= 0.6   # short: reduce ITM depth
+    elif hours_to_expiry > 120:
+        target_itm *= 1.2   # long dated: can go deeper safely
+
+    # Clamp to reasonable bounds
+    target_itm = max(-1.5, min(3.5, target_itm))
+
+    return round(target_itm, 2)
+
+
+def score_strike(strike, price, target_itm_pct, is_call, hours_to_expiry):
+    """
+    Score a strike option for selection.
+    Lower score = better match for strategy.
+
+    target_itm_pct: how deep ITM we want (% of price)
+      Positive = ITM (call: strike below; put: strike above)
+      Zero = ATM
+      Negative = OTM
+    """
+    if is_call:
+        # For calls: ITM means strike BELOW price
+        # actual_itm = (price - strike) / price * 100
+        actual_itm = (price - strike) / price * 100
+    else:
+        # For puts: ITM means strike ABOVE price
+        # actual_itm = (strike - price) / price * 100
+        actual_itm = (strike - price) / price * 100
+
+    # Distance from ideal ITM depth
+    diff = abs(actual_itm - target_itm_pct)
+
+    # Penalty for being on wrong side (OTM when we want ITM)
+    wrong_side_penalty = 0
+    if target_itm_pct > 0.3 and actual_itm < 0:
+        # Wanted ITM but got OTM — heavy penalty
+        wrong_side_penalty = 3.0 + abs(actual_itm)
+    elif target_itm_pct < -0.3 and actual_itm > 0.5:
+        # Wanted OTM but got deep ITM
+        wrong_side_penalty = 1.0
+
+    return diff + wrong_side_penalty
+
 def execute_trade(analysis, is_pyramid=False):
     asset     = analysis["asset"]
     direction = analysis["direction"]
@@ -1520,50 +1726,49 @@ def execute_trade(analysis, is_pyramid=False):
     # ITM options cost more but earn MORE per $ BTC moves (higher delta)
     # OTM options are cheaper but need big BTC move to profit (low delta)
 
-    regime    = analysis.get("regime", "NEUTRAL")
-    is_strong = regime in ("STRONG_BULL", "BULL", "STRONG_BEAR", "BEAR")
-    is_call   = direction == "BUY_CALL"
-    is_put    = direction == "BUY_PUT"
+    regime   = analysis.get("regime", "NEUTRAL")
+    vol_reg  = bot_state.get("last_vol_regime", "MID")
+    is_call  = direction == "BUY_CALL"
+    is_put   = direction == "BUY_PUT"
 
-    def strike_score(p):
-        """Score each option: lower = better. Prefers ITM on strong signals."""
+    # ── Get optimal ITM target for this exact market condition ──
+    # Uses: regime × vol_regime × confidence × expiry
+    avg_expiry = 72  # default, will recalc per option
+    target_itm = get_optimal_itm_target(regime, vol_reg, conf, avg_expiry, is_call)
+
+    # Check deep_memory — if OTM has been losing for this regime/vol, go more ITM
+    dm = bot_state.get("deep_memory", {})
+    for stype in ["OTM", "ATM"]:
+        key = f"{regime}_{'CALL' if is_call else 'PUT'}_{stype}_{vol_reg}_medium"
+        if key in dm:
+            d = dm[key]
+            tot = d["wins"] + d["losses"]
+            if tot >= 4:
+                wr = d["wins"] / tot * 100
+                if wr < 35 and stype == "OTM":
+                    target_itm = max(target_itm, target_itm + 0.5)  # push more ITM
+                    blog(f"[LEARN] Nudging ITM target +0.5% — {key} losing ({wr:.0f}% WR)", "info")
+                elif wr < 35 and stype == "ATM":
+                    target_itm = max(target_itm, target_itm + 0.3)
+                    blog(f"[LEARN] Nudging ITM target +0.3% — ATM losing in {regime}", "info")
+
+    blog(f"[{asset}] Strike target: {target_itm:+.1f}% ITM | "
+         f"Regime:{regime} Vol:{vol_reg} Conf:{conf}%", "info")
+
+    # Sort all options using the score_strike engine
+    def smart_score(p):
         try:
-            strike     = float(p["symbol"].split("-")[2])
-            diff_pct   = (strike - price) / price * 100  # + = above price, - = below price
-
-            if is_call:
-                if conf >= 75 and is_strong:
-                    # STRONG BULL → ITM call (strike below price = negative diff_pct)
-                    # Best: -1.5% to -0.3% ITM | Good: ATM | Avoid: OTM
-                    if -2.0 <= diff_pct <= -0.3:  return (0, abs(diff_pct))  # ✅ ITM sweet spot
-                    elif -0.3 < diff_pct <= 0.3:  return (1, abs(diff_pct))  # ✅ ATM
-                    elif 0.3 < diff_pct <= 1.0:   return (2, diff_pct)        # ⚠ slight OTM
-                    elif diff_pct < -2.0:          return (3, abs(diff_pct))  # deep ITM
-                    else:                          return (4, diff_pct)        # far OTM
-                else:
-                    # NORMAL/WEAK → ATM preferred
-                    if -0.5 <= diff_pct <= 0.5:   return (0, abs(diff_pct))  # ATM
-                    elif -1.5 <= diff_pct <= 1.5: return (1, abs(diff_pct))  # near ATM
-                    else:                          return (2, abs(diff_pct))  # far
-            else:  # BUY_PUT
-                if conf >= 75 and is_strong:
-                    # STRONG BEAR → ITM put (strike above price = positive diff_pct)
-                    if 0.3 <= diff_pct <= 2.0:    return (0, abs(diff_pct))  # ✅ ITM sweet spot
-                    elif -0.3 <= diff_pct < 0.3:  return (1, abs(diff_pct))  # ✅ ATM
-                    elif -1.0 <= diff_pct < -0.3: return (2, abs(diff_pct))  # ⚠ slight OTM
-                    elif diff_pct > 2.0:           return (3, diff_pct)        # deep ITM
-                    else:                          return (4, abs(diff_pct))  # far OTM
-                else:
-                    if -0.5 <= diff_pct <= 0.5:   return (0, abs(diff_pct))
-                    elif -1.5 <= diff_pct <= 1.5: return (1, abs(diff_pct))
-                    else:                          return (2, abs(diff_pct))
+            strike = float(p["symbol"].split("-")[2])
+            hrs    = get_hours(p)
+            # Recalculate target with actual expiry for precision
+            itm_for_this = get_optimal_itm_target(regime, vol_reg, conf, hrs, is_call)
+            return score_strike(strike, price, itm_for_this, is_call, hrs)
         except:
-            return (5, 999999)
+            return 999.0
 
-    # Sort all options by strike score (best first)
-    valid.sort(key=strike_score)
+    valid.sort(key=smart_score)
 
-    # Prefer liquid options but don't discard illiquid ones
+    # Prefer liquid, re-sort by same strategy
     liquid_options = [p for p in valid
                       if float(p.get("volume", 0) or 0) > 0
                       or float(p.get("open_interest", 0) or 0) > 0]
@@ -1571,7 +1776,7 @@ def execute_trade(analysis, is_pyramid=False):
         blog(f"[{asset}] No liquid options — using best strike regardless", "warning")
         liquid_options = valid
     else:
-        liquid_options.sort(key=strike_score)  # re-sort liquids by strategy score
+        liquid_options.sort(key=smart_score)
 
     # Block re-buying same option that just lost
     last_sig = bot_state["stats"].get("last_signal", {})
@@ -1583,20 +1788,23 @@ def execute_trade(analysis, is_pyramid=False):
             before = len(liquid_options)
             liquid_options = [p for p in liquid_options if p["symbol"] != last_opt]
             if len(liquid_options) < before:
-                blog(f"[{asset}] Skipping recently lost {last_opt} — next best strike", "info")
+                blog(f"[{asset}] Skipping recently lost {last_opt} — next best", "info")
 
     product = liquid_options[0] if liquid_options else (valid[0] if valid else None)
     if not product:
-        blog(f"[{asset}] No options available after filtering", "warning")
+        blog(f"[{asset}] No options available", "warning")
         return False
 
-    # Log the strategy applied
-    chosen_strike  = float(product["symbol"].split("-")[2]) if "-" in product["symbol"] else 0
-    diff_pct_final = (chosen_strike - price) / price * 100 if price else 0
-    strike_type    = ("ITM" if (is_call and diff_pct_final < -0.3) or (is_put and diff_pct_final > 0.3)
-                      else "ATM" if abs(diff_pct_final) <= 0.5 else "OTM")
-    blog(f"[{asset}] Strike: {strike_type} | ${chosen_strike:.0f} vs BTC ${price:.0f} "
-         f"({diff_pct_final:+.2f}%) | Regime:{regime} Conf:{conf}%", "info")
+    # Log selected strike and how it compares to target
+    chosen_strike = float(product["symbol"].split("-")[2]) if "-" in product["symbol"] else 0
+    actual_itm    = ((price - chosen_strike) / price * 100 if is_call
+                     else (chosen_strike - price) / price * 100)
+    strike_type   = ("ITM" if actual_itm > 0.3
+                     else "ATM" if actual_itm >= -0.3
+                     else "OTM")
+    blog(f"[{asset}] ✅ Strike selected: {product['symbol']} | "
+         f"Type:{strike_type} | Actual ITM:{actual_itm:+.2f}% | "
+         f"Target:{target_itm:+.1f}% | BTC:${price:.0f}", "info")
     strike  = product["symbol"].split("-")[2] if "-" in product["symbol"] else "?"
     hrs     = get_hours(product)
     vol_24h = float(product.get("volume", 0) or 0)
@@ -1653,10 +1861,23 @@ def execute_trade(analysis, is_pyramid=False):
         s["trades_today"]       += 1
         s["total_exposure_pct"] += 3.0 * size
         # consecutive_losses ONLY resets in manage_positions on WIN close
+        # Snapshot signals and strike info for learning when trade closes
+        actual_itm_snap = ((price - float(product["symbol"].split("-")[2])) / price * 100
+                           if is_call else
+                           (float(product["symbol"].split("-")[2]) - price) / price * 100
+                           ) if "-" in product["symbol"] else 0
+        stype_snap = ("ITM" if actual_itm_snap > 0.3
+                      else "ATM" if actual_itm_snap >= -0.3 else "OTM")
+        bot_state["_last_strike_type"] = stype_snap
+
+        hrs_snap = get_hours(product)
         s["last_signal"] = {
             "asset": asset, "direction": direction,
             "option": product["symbol"], "price": price,
             "confidence": conf, "size": size,
+            "regime": analysis.get("regime", "NEUTRAL"),
+            "hours_to_expiry": hrs_snap,
+            "strike_type": stype_snap,
             "time": datetime.now(timezone.utc).isoformat(),
         }
         return True
