@@ -933,6 +933,521 @@ def full_analysis(asset):
     return result
 
 # ── Execution Engine ──────────────────────────────────────────────
+
+# ════ STRATEGY FIXES: Signal Conflict Detection & Momentum Filters ════
+def detect_signal_conflict(analysis):
+    """
+    Detect when signals contradict each other.
+    For options: momentum takes priority over regime.
+    """
+    regime = analysis.get("regime", "NEUTRAL")
+    confidence = analysis.get("confidence", 0)
+    rsi_1h = analysis.get("rsi_1h", 50)
+    macd_1h = analysis.get("macd_1h", "NEUTRAL")
+    direction = analysis.get("direction", "NO TRADE")
+    
+    conflict = False
+    conflict_reason = ""
+    
+    # CONFLICT 1: Bullish regime but oversold momentum
+    if direction == "BUY_CALL" and rsi_1h < 35:
+        conflict = True
+        conflict_reason = f"BUY_CALL but RSI only {rsi_1h:.0f} (oversold)"
+    
+    # CONFLICT 2: Bullish regime but bearish MACD
+    if direction == "BUY_CALL" and macd_1h == "BEARISH":
+        conflict = True
+        conflict_reason = f"BUY_CALL but MACD is BEARISH"
+    
+    # CONFLICT 3: Bearish regime but overbought momentum
+    if direction == "BUY_PUT" and rsi_1h > 65:
+        conflict = True
+        conflict_reason = f"BUY_PUT but RSI {rsi_1h:.0f} (overbought)"
+    
+    # CONFLICT 4: Bearish regime but bullish MACD
+    if direction == "BUY_PUT" and macd_1h == "BULLISH":
+        conflict = True
+        conflict_reason = f"BUY_PUT but MACD is BULLISH"
+    
+    return conflict, conflict_reason
+
+
+def can_trade_option(analysis):
+    """
+    Options are leveraged bets on direction + timing.
+    Don't enter if momentum and regime disagree.
+    Momentum matters more for short-dated options.
+    """
+    rsi_1h = analysis.get("rsi_1h", 50)
+    rsi_4h = analysis.get("rsi_4h", 50)
+    macd_1h = analysis.get("macd_1h", "NEUTRAL")
+    macd_4h = analysis.get("macd_4h", "NEUTRAL")
+    direction = analysis.get("direction", "NO TRADE")
+    confidence = analysis.get("confidence", 0)
+    hours_to_expiry = analysis.get("hours_to_expiry", 168)
+    
+    if direction == "NO TRADE":
+        return False, "No signal"
+    
+    # RULE 1: Don't buy calls if RSI < 40 (oversold)
+    if direction == "BUY_CALL":
+        if rsi_1h < 40:
+            return False, f"BUY_CALL blocked: RSI only {rsi_1h:.0f} (oversold momentum)"
+        if rsi_4h < 40:
+            return False, f"BUY_CALL blocked: RSI 4h only {rsi_4h:.0f} (oversold)"
+    
+    # RULE 2: Don't buy puts if RSI > 60 (overbought)
+    if direction == "BUY_PUT":
+        if rsi_1h > 60:
+            return False, f"BUY_PUT blocked: RSI {rsi_1h:.0f} (overbought momentum)"
+        if rsi_4h > 60:
+            return False, f"BUY_PUT blocked: RSI 4h {rsi_4h:.0f} (overbought)"
+    
+    # RULE 3: MACD bearish = avoid calls on short expiry
+    if direction == "BUY_CALL" and macd_1h == "BEARISH":
+        if hours_to_expiry < 72:
+            return False, f"BUY_CALL blocked: MACD is BEARISH (no momentum)"
+    
+    # RULE 4: MACD bullish = avoid puts on short expiry
+    if direction == "BUY_PUT" and macd_1h == "BULLISH":
+        if hours_to_expiry < 72:
+            return False, f"BUY_PUT blocked: MACD is BULLISH (no downside momentum)"
+    
+    # RULE 5: For ultra-short expiry, require both regime AND momentum
+    if hours_to_expiry < 24:
+        if direction == "BUY_CALL":
+            if rsi_1h < 50 or macd_1h != "BULLISH":
+                return False, "Ultra-short expiry: need RSI>50 AND MACD bullish for calls"
+        if direction == "BUY_PUT":
+            if rsi_1h > 50 or macd_1h != "BEARISH":
+                return False, "Ultra-short expiry: need RSI<50 AND MACD bearish for puts"
+    
+    return True, "Entry OK"
+
+
+def apply_veto_conditions(analysis):
+    """
+    Hard veto conditions — don't trade these scenarios.
+    Better to miss a trade than take a bad one.
+    """
+    rsi_1h = analysis.get("rsi_1h", 50)
+    rsi_4h = analysis.get("rsi_4h", 50)
+    macd_1h = analysis.get("macd_1h", "NEUTRAL")
+    macd_4h = analysis.get("macd_4h", "NEUTRAL")
+    direction = analysis.get("direction", "NO TRADE")
+    
+    veto = False
+    veto_reason = ""
+    
+    # VETO 1: Momentum completely against direction
+    if direction == "BUY_CALL":
+        if rsi_1h < 30 and rsi_4h < 40:
+            veto = True
+            veto_reason = f"VETO BUY_CALL: Deeply oversold (RSI 1h:{rsi_1h:.0f}, 4h:{rsi_4h:.0f})"
+        if macd_1h == "BEARISH" and macd_4h == "BEARISH":
+            veto = True
+            veto_reason = "VETO BUY_CALL: MACD bearish on both 1h and 4h"
+    
+    if direction == "BUY_PUT":
+        if rsi_1h > 70 and rsi_4h > 60:
+            veto = True
+            veto_reason = f"VETO BUY_PUT: Deeply overbought (RSI 1h:{rsi_1h:.0f}, 4h:{rsi_4h:.0f})"
+        if macd_1h == "BULLISH" and macd_4h == "BULLISH":
+            veto = True
+            veto_reason = "VETO BUY_PUT: MACD bullish on both 1h and 4h"
+    
+    # VETO 2: Price at extreme
+    if direction == "BUY_CALL" and rsi_1h > 75:
+        veto = True
+        veto_reason = f"VETO BUY_CALL: RSI {rsi_1h:.0f} too overbought, no room to run"
+    
+    if direction == "BUY_PUT" and rsi_1h < 25:
+        veto = True
+        veto_reason = f"VETO BUY_PUT: RSI {rsi_1h:.0f} too oversold, no room to fall"
+    
+    return veto, veto_reason
+
+
+def calculate_confidence_smart(analysis):
+    """
+    Smart confidence calculation with time-aware weighting.
+    Short-dated options prioritize momentum.
+    Long-dated options prioritize regime.
+    """
+    regime_score = analysis.get("regime_confidence", 50)
+    polymarket_score = analysis.get("polymarket_bull", 50) if analysis.get("direction") == "BUY_CALL" else (100 - analysis.get("polymarket_bull", 50))
+    order_flow_score = analysis.get("order_flow_score", 50)
+    rsi_1h = analysis.get("rsi_1h", 50)
+    macd_1h = analysis.get("macd_1h", "NEUTRAL")
+    hours_to_expiry = analysis.get("hours_to_expiry", 168)
+    direction = analysis.get("direction", "NO TRADE")
+    
+    # Calculate momentum score from RSI
+    momentum_score = 50
+    if rsi_1h > 70:
+        momentum_score = 90
+    elif rsi_1h > 60:
+        momentum_score = 70
+    elif rsi_1h > 50:
+        momentum_score = 60
+    elif rsi_1h < 30:
+        momentum_score = 10
+    elif rsi_1h < 40:
+        momentum_score = 30
+    elif rsi_1h < 50:
+        momentum_score = 40
+    
+    # For calls: overbought RSI = less room to run
+    if direction == "BUY_CALL" and rsi_1h > 65:
+        momentum_score *= 0.7
+    
+    # For puts: oversold RSI = less room to fall
+    if direction == "BUY_PUT" and rsi_1h < 35:
+        momentum_score *= 0.7
+    
+    # Adjust weights by time to expiry
+    if hours_to_expiry < 24:
+        weights = {"regime": 0.20, "polymarket": 0.10, "order_flow": 0.10, "momentum": 0.60}
+    elif hours_to_expiry < 72:
+        weights = {"regime": 0.30, "polymarket": 0.15, "order_flow": 0.15, "momentum": 0.40}
+    else:
+        weights = {"regime": 0.50, "polymarket": 0.20, "order_flow": 0.15, "momentum": 0.15}
+    
+    confidence = (
+        regime_score * weights["regime"] +
+        polymarket_score * weights["polymarket"] +
+        order_flow_score * weights["order_flow"] +
+        momentum_score * weights["momentum"]
+    )
+    
+    return int(min(100, max(0, confidence)))
+
+
+
+
+# ════ ADVANCED SELF-LEARNING SYSTEM: Adaptive Bot Based on Market Performance ════
+
+class AdaptiveMarketLearner:
+    """
+    Self-learning system that adapts bot strategy based on:
+    - Win/loss patterns by regime, time-of-day, volatility
+    - MACD divergence detection (the real edge)
+    - ADX trend strength filtering
+    - Time-of-day seasonal patterns
+    - Volatility regime adjustments
+    - RSI optimal thresholds per market condition
+    """
+    
+    def __init__(self):
+        self.session_learning = {
+            "rsi_thresholds": {"call": 40, "put": 60},  # Adaptive RSI entry levels
+            "macd_divergence_weight": 0.35,  # Gets boosted when divergences predict correctly
+            "adx_threshold": 20,  # Below = no trend, skip trades
+            "time_of_day_biases": {},  # Learns call/put biases per UTC hour
+            "volatility_regimes": {"low": 0, "mid": 0, "high": 0},  # Win rates by vol regime
+            "regime_win_rates": {},  # Tracks which regimes are most profitable
+            "macro_blackout_hours": [13, 19],  # CPI/FOMC typically here (UTC)
+            "asian_session_bias": 1.0,  # Call bias (01:00-02:00 UTC)
+            "ny_session_bias": -1.0,  # Put bias (14:00-14:30 UTC)
+        }
+        self.trade_history = []  # Track all trades for learning
+        self.regime_transitions = {}  # Detect when regimes flip
+    
+    def learn_from_trade_result(self, trade_info):
+        """
+        Called after every trade closes.
+        Updates all learning parameters based on actual P&L.
+        """
+        entry_time = trade_info.get("entry_time")
+        exit_time = trade_info.get("exit_time")
+        entry_regime = trade_info.get("regime")
+        direction = trade_info.get("direction")  # BUY_CALL or BUY_PUT
+        pnl_pct = trade_info.get("pnl_pct", 0)
+        rsi_at_entry = trade_info.get("rsi_1h", 50)
+        macd_at_entry = trade_info.get("macd_1h", "NEUTRAL")
+        volatility_regime = trade_info.get("vol_regime", "MID")
+        confidence = trade_info.get("confidence", 50)
+        
+        # Track trade result
+        self.trade_history.append(trade_info)
+        
+        # 1. LEARN TIME-OF-DAY BIASES
+        hour_utc = int(entry_time.split(":")[0]) if entry_time else 12
+        if hour_utc not in self.session_learning["time_of_day_biases"]:
+            self.session_learning["time_of_day_biases"][hour_utc] = {"calls": [], "puts": []}
+        
+        if direction == "BUY_CALL":
+            self.session_learning["time_of_day_biases"][hour_utc]["calls"].append(pnl_pct)
+        elif direction == "BUY_PUT":
+            self.session_learning["time_of_day_biases"][hour_utc]["puts"].append(pnl_pct)
+        
+        # 2. LEARN VOLATILITY REGIME PERFORMANCE
+        if volatility_regime not in self.session_learning["volatility_regimes"]:
+            self.session_learning["volatility_regimes"][volatility_regime] = []
+        self.session_learning["volatility_regimes"][volatility_regime].append(pnl_pct)
+        
+        # 3. LEARN REGIME WIN RATES
+        regime_key = f"{entry_regime}_{direction}"
+        if regime_key not in self.session_learning["regime_win_rates"]:
+            self.session_learning["regime_win_rates"][regime_key] = []
+        self.session_learning["regime_win_rates"][regime_key].append(pnl_pct)
+        
+        # 4. ADAPT RSI THRESHOLDS
+        # If we keep winning with RSI at 45-50 and losing at <35, raise the threshold
+        if pnl_pct > 3 and rsi_at_entry > 45:
+            self.session_learning["rsi_thresholds"][direction.split("_")[1].lower()] = max(
+                self.session_learning["rsi_thresholds"][direction.split("_")[1].lower()],
+                int(rsi_at_entry - 5)
+            )
+        elif pnl_pct < -5 and rsi_at_entry < 35:
+            self.session_learning["rsi_thresholds"][direction.split("_")[1].lower()] = max(
+                self.session_learning["rsi_thresholds"][direction.split("_")[1].lower()],
+                40
+            )
+        
+        # 5. LEARN MACD DIVERGENCE WEIGHT
+        # If MACD divergences predicted correctly, boost their weight
+        if trade_info.get("macd_divergence_detected", False):
+            if pnl_pct > 2:  # Divergence predicted correctly
+                self.session_learning["macd_divergence_weight"] = min(
+                    0.50, self.session_learning["macd_divergence_weight"] + 0.02
+                )
+            else:
+                self.session_learning["macd_divergence_weight"] = max(
+                    0.20, self.session_learning["macd_divergence_weight"] - 0.01
+                )
+        
+        return self.session_learning
+    
+    def get_optimal_time_to_trade(self, hour_utc):
+        """
+        Returns confidence adjustment based on learned time-of-day bias.
+        """
+        if hour_utc not in self.session_learning["time_of_day_biases"]:
+            return 1.0  # Neutral
+        
+        hour_data = self.session_learning["time_of_day_biases"][hour_utc]
+        
+        call_avg = sum(hour_data["calls"]) / len(hour_data["calls"]) if hour_data["calls"] else 0
+        put_avg = sum(hour_data["puts"]) / len(hour_data["puts"]) if hour_data["puts"] else 0
+        
+        if call_avg > 2:  # Strong call bias
+            return 1.3 if direction == "BUY_CALL" else 0.7
+        elif put_avg > 2:  # Strong put bias
+            return 1.3 if direction == "BUY_PUT" else 0.7
+        else:
+            return 1.0
+    
+    def detect_regime_transition(self, current_regime, previous_regime):
+        """
+        Detects when regime flips.
+        Increases caution after transition (first 5 trades in new regime).
+        """
+        if current_regime != previous_regime:
+            self.regime_transitions[current_regime] = len(self.trade_history)
+            return True
+        return False
+    
+    def get_regime_transition_penalty(self, current_regime):
+        """
+        Returns confidence penalty if we just transitioned to a new regime.
+        """
+        if current_regime not in self.regime_transitions:
+            return 1.0
+        
+        trades_since = len(self.trade_history) - self.regime_transitions[current_regime]
+        if trades_since < 5:
+            return 0.7 + (trades_since * 0.06)  # Ramp from 0.7 to 1.0
+        return 1.0
+    
+    def estimate_expected_move(self, atr_value, minutes_to_close, atm_premium):
+        """
+        Compares expected move (ATR × time) vs option decay.
+        Skip trade if expected move < 1.5× premium decay.
+        """
+        daily_decay_pct = 0.015  # 1.5% per day option decay (rough)
+        minutes_in_day = 1440
+        expected_decay = atm_premium * (daily_decay_pct * minutes_to_close / minutes_in_day)
+        expected_move = atr_value * (minutes_to_close / 60)  # Rough: ATR per hour
+        
+        if expected_move < 1.5 * expected_decay:
+            return False, f"Expected move ${expected_move:.2f} < 1.5× decay ${expected_decay:.2f}"
+        return True, "Expected move favorable"
+
+# Initialize the adaptive learner
+adaptive_learner = AdaptiveMarketLearner()
+
+
+def apply_adx_filter(adx_value, direction):
+    """
+    ADX is the trend strength indicator.
+    Below 20 = chop (no trend), skip directional trades.
+    20-25 = transition (half size).
+    Above 25 = trend (full size).
+    """
+    if adx_value < 20:
+        return False, f"ADX {adx_value:.0f} < 20: No trend, skipping directional trade"
+    elif adx_value < 25:
+        return True, f"ADX {adx_value:.0f}: Transition zone (half size)"
+    else:
+        return True, f"ADX {adx_value:.0f}: Trend confirmed (full size)"
+
+
+def detect_macd_divergence(current_macd_val, current_price, prev_macd_val, prev_price):
+    """
+    Detect MACD divergence: price makes lower low but MACD makes higher high (bullish).
+    Or: price makes higher high but MACD makes lower high (bearish).
+    This is THE most reliable reversal signal (according to BTC autopsy).
+    """
+    bullish_div = (current_price < prev_price) and (current_macd_val > prev_macd_val)
+    bearish_div = (current_price > prev_price) and (current_macd_val < prev_macd_val)
+    
+    return bullish_div, bearish_div, bullish_div or bearish_div
+
+
+def apply_macro_blackout(hour_utc):
+    """
+    CPI data: typically 13:30 UTC
+    FOMC: typically 19:00 UTC
+    NFP: typically 13:30 UTC (Fridays)
+    Don't trade 15 min before/after these.
+    """
+    if hour_utc in [13, 19]:  # Minutes around these hours are risky
+        return False, "Macro blackout hour (CPI/FOMC/NFP)"
+    return True, "OK"
+
+
+def optimize_ema_ribbon_check(price, ema8, ema21, ema55, ema200):
+    """
+    STRONG_BULL requires: ema8 > ema21 > ema55 > ema200 (stacked up).
+    STRONG_BEAR requires: ema8 < ema21 < ema55 < ema200 (stacked down).
+    This prevents regime=STRONG_BULL when price is actually trending down.
+    """
+    bull_stack = (ema8 > ema21) and (ema21 > ema55) and (ema55 > ema200)
+    bear_stack = (ema8 < ema21) and (ema21 < ema55) and (ema55 < ema200)
+    
+    if bull_stack:
+        return "STRONG_BULL_CONFIRMED"
+    elif bear_stack:
+        return "STRONG_BEAR_CONFIRMED"
+    else:
+        return "REGIME_UNDEFINED"  # Wait for clarity
+
+
+def calculate_adaptive_confidence(analysis):
+    """
+    Seven-pillar confidence score from BTC autopsy analysis.
+    Integrates all learnings.
+    """
+    regime_score = analysis.get("regime_confidence", 50)
+    polymarket_score = analysis.get("polymarket_bull", 50)
+    order_flow_score = analysis.get("order_flow_score", 50)
+    rsi_1h = analysis.get("rsi_1h", 50)
+    macd_1h = analysis.get("macd_1h", "NEUTRAL")
+    adx_14 = analysis.get("adx_14", 20)
+    hours_to_expiry = analysis.get("hours_to_expiry", 168)
+    hour_utc = analysis.get("hour_utc", 12)
+    volatility_regime = analysis.get("vol_regime", "MID")
+    direction = analysis.get("direction", "NO TRADE")
+    
+    # PILLAR 1: Regime (EMA stack + ADX)
+    regime_score = regime_score * (0.9 if adx_14 > 25 else 0.7)
+    
+    # PILLAR 2: Higher-timeframe alignment (5m + 15m)
+    htf_score = analysis.get("htf_alignment", 50)
+    
+    # PILLAR 3: Momentum (RSI + MACD histogram + divergence)
+    momentum_score = 50
+    if macd_1h == "BULLISH":
+        momentum_score = 70
+    elif macd_1h == "BEARISH":
+        momentum_score = 30
+    
+    if analysis.get("macd_divergence_detected", False):
+        momentum_score += 20  # Divergence is THE edge
+    
+    if rsi_1h > 55:
+        momentum_score = min(90, momentum_score + 10)
+    elif rsi_1h < 45:
+        momentum_score = max(10, momentum_score - 10)
+    
+    # PILLAR 4: Volume
+    volume_score = analysis.get("volume_confirmed", 50)
+    
+    # PILLAR 5: Volatility regime
+    if volatility_regime == "HIGH":
+        volatility_score = 40  # Expensive, reduce size
+    elif volatility_regime == "LOW":
+        volatility_score = 70  # Cheap premium, good risk/reward
+    else:
+        volatility_score = 60
+    
+    # PILLAR 6: Time-of-day bias
+    time_score = 50
+    if hour_utc in [1, 2]:  # Asian session: call bias
+        if direction == "BUY_CALL":
+            time_score = 70
+        elif direction == "BUY_PUT":
+            time_score = 30
+    elif hour_utc in [14, 15]:  # NY open: put bias
+        if direction == "BUY_PUT":
+            time_score = 75
+        elif direction == "BUY_CALL":
+            time_score = 30
+    
+    # PILLAR 7: Funding/OI context
+    funding_score = analysis.get("funding_oi_context", 50)
+    
+    # Adaptive weights based on time to expiry (from BTC autopsy)
+    if hours_to_expiry < 24:
+        weights = {
+            "regime": 0.15,
+            "htf": 0.15,
+            "momentum": 0.35,  # Momentum is KING near expiry
+            "volume": 0.10,
+            "volatility": 0.10,
+            "time": 0.10,
+            "funding": 0.05
+        }
+    elif hours_to_expiry < 72:
+        weights = {
+            "regime": 0.25,
+            "htf": 0.20,
+            "momentum": 0.25,
+            "volume": 0.10,
+            "volatility": 0.10,
+            "time": 0.07,
+            "funding": 0.03
+        }
+    else:
+        weights = {
+            "regime": 0.35,
+            "htf": 0.20,
+            "momentum": 0.15,
+            "volume": 0.10,
+            "volatility": 0.10,
+            "time": 0.05,
+            "funding": 0.05
+        }
+    
+    confidence = (
+        regime_score * weights["regime"] +
+        htf_score * weights["htf"] +
+        momentum_score * weights["momentum"] +
+        volume_score * weights["volume"] +
+        volatility_score * weights["volatility"] +
+        time_score * weights["time"] +
+        funding_score * weights["funding"]
+    )
+    
+    # Apply learned adjustments
+    if adaptive_learner:
+        regime_transition_penalty = adaptive_learner.get_regime_transition_penalty(analysis.get("regime", "NEUTRAL"))
+        confidence *= regime_transition_penalty
+    
+    return int(min(100, max(0, confidence)))
+
+
 def execution_engine(analysis):
     """
     Never blocks trades — adjusts size and confidence instead.
@@ -1049,7 +1564,34 @@ def execution_engine(analysis):
     analysis["confidence"]      = final_conf
     analysis["size_multiplier"] = result["size_multiplier"]
     analysis["aggression"]      = result["aggression"]
-    return analysis
+    # NEW FIX: Detect signal conflicts
+    conflict, reason = detect_signal_conflict(analysis)
+    if conflict:
+        blog(f"⚠️ SIGNAL CONFLICT: {reason} — reducing confidence", "warning")
+        analysis["confidence"] *= 0.5
+        if analysis["confidence"] < 55:
+            analysis["direction"] = "NO TRADE"
+            return analysis
+    
+    # NEW FIX: Apply momentum-based entry filter
+    ok_to_trade, reason = can_trade_option(analysis)
+    if not ok_to_trade:
+        blog(f"🚫 {reason}", "warning")
+        analysis["direction"] = "NO TRADE"
+        return analysis
+    
+    # NEW FIX: Apply hard veto conditions
+    veto, reason = apply_veto_conditions(analysis)
+    if veto:
+        blog(f"🚫 {reason}", "error")
+        analysis["direction"] = "NO TRADE"
+        return analysis
+    
+    # NEW FIX: Recalculate confidence with smart weighting
+    if analysis["direction"] != "NO TRADE":
+        analysis["confidence"] = calculate_adaptive_confidence(analysis)
+    
+        return analysis
 
 # ── Balance + Risk ────────────────────────────────────────────────
 def refresh_balance():
