@@ -41,10 +41,10 @@ log = logging.getLogger("ALPHA")
 # CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 class Cfg:
-    # Keys loaded from env/file OR set at runtime via /api/connect
-    API_KEY    = os.getenv("DELTA_API_KEY", "")
+    # Keys: env var OR Render Secret File (auto-stripped of whitespace/newlines)
+    API_KEY    = os.getenv("DELTA_API_KEY", "").strip()
     _sf = "/etc/secrets/DELTA_API_SECRET"
-    API_SECRET = (os.getenv("DELTA_API_SECRET", "") or
+    API_SECRET = (os.getenv("DELTA_API_SECRET", "").strip() or
                   (open(_sf).read().strip() if os.path.exists(_sf) else ""))
     BASE_URL   = "https://api.india.delta.exchange"
 
@@ -175,12 +175,17 @@ class DeltaAPI:
             return None
 
     def get_candles(self, symbol="BTCUSD", resolution=5, limit=100):
+        """Public endpoint — no auth needed, works before and after login."""
         end   = int(time.time())
         start = end - (resolution * 60 * limit)
-        d = self._get("/v2/history/candles",
-                      {"symbol": symbol, "resolution": resolution,
-                       "start": start, "end": end})
-        return d.get("result", []) if d and d.get("success") else []
+        qs = f"?symbol={symbol}&resolution={resolution}&start={start}&end={end}"
+        try:
+            r = self.session.get(f"{self.base}/v2/history/candles{qs}", timeout=10)
+            d = r.json()
+            return d.get("result", []) if d and d.get("success") else []
+        except Exception as e:
+            log.warning(f"Candles fetch failed: {e}")
+            return []
 
     def get_ticker(self, symbol="BTCUSD"):
         """Public endpoint — no auth needed, works before login."""
@@ -195,8 +200,11 @@ class DeltaAPI:
     def get_wallet(self):
         d = self._get("/v2/wallet/balances")
         if d and d.get("success"):
-            return {b["asset_symbol"]: float(b["available_balance"])
+            return {b["asset_symbol"]: float(b.get("available_balance") or 0)
                     for b in d.get("result", [])}
+        # Log what went wrong for debugging
+        if d:
+            log.warning(f"Wallet API response: success={d.get('success')} error={d.get('error','none')} meta={d.get('meta','')}")
         return {}
 
     def get_positions(self):
@@ -2398,11 +2406,11 @@ function renderState(s){
   const ls=s.last_long_score||0, ss=s.last_short_score||0;
   const lv=s.last_long_veto||'', sv=s.last_short_veto||'';
   const lEl=document.getElementById('longScore');
-  lEl.textContent=ls||'&#8212;';
+  lEl.textContent=ls||'—';
   lEl.className='sig-val '+(ls>=58?'sig-g':'sig-n');
   document.getElementById('longStatus').innerHTML=lv?'<span style="color:var(--r);font-size:9px">&#10005; '+lv+'</span>':ls>=58?'<span style="color:var(--g);font-size:9px">&#10003; Above threshold</span>':'<span style="font-size:9px">Below threshold</span>';
   const sEl=document.getElementById('shortScore');
-  sEl.textContent=ss||'&#8212;';
+  sEl.textContent=ss||'—';
   sEl.className='sig-val '+(ss>=58?'sig-r':'sig-n');
   document.getElementById('shortStatus').innerHTML=sv?'<span style="color:var(--r);font-size:9px">&#10005; '+sv+'</span>':ss>=58?'<span style="color:var(--r);font-size:9px">&#10003; Above threshold</span>':'<span style="font-size:9px">Below threshold</span>';
 
@@ -2429,13 +2437,13 @@ function renderState(s){
   // Live indicators
   const rsi=s.last_rsi||0;
   const rEl=document.getElementById('indRsi');
-  rEl.textContent=rsi>0?rsi.toFixed(1):'&#8212;';
+  rEl.textContent=rsi>0?rsi.toFixed(1):'—';
   rEl.className='ind-v '+(rsi>70?'iv-r':rsi<30?'iv-g':'iv-y');
   const adx=s.last_adx||0;
   const aEl=document.getElementById('indAdx');
-  aEl.textContent=adx>0?adx.toFixed(1):'&#8212;';
+  aEl.textContent=adx>0?adx.toFixed(1):'—';
   aEl.className='ind-v '+(adx>25?'iv-g':adx>15?'iv-y':'iv-r');
-  document.getElementById('indAtr').textContent=s.last_atr_pct>0?s.last_atr_pct.toFixed(2)+'%':'&#8212;';
+  document.getElementById('indAtr').textContent=s.last_atr_pct>0?s.last_atr_pct.toFixed(2)+'%':'—';
 
   // Wallet
   const cap=s.capital||0, sc=s.starting_capital||0, pnl=s.total_pnl||0, pct=s.pnl_pct||0;
@@ -2468,7 +2476,7 @@ function renderState(s){
 
   // Stats
   const wr=s.win_rate||0, tt=s.total_trades||0;
-  document.getElementById('stWR').textContent=tt>=3?wr.toFixed(1)+'%':'&#8212;';
+  document.getElementById('stWR').textContent=tt>=3?wr.toFixed(1)+'%':'—';
   document.getElementById('stTr').textContent=tt+' trades';
   document.getElementById('stToday').textContent=s.trades_today||0;
   document.getElementById('stWeek').textContent=(s.trades_week||0)+' this week';
@@ -2476,12 +2484,12 @@ function renderState(s){
   const skE=document.getElementById('stSk');
   skE.textContent=(sk>0?'+':'')+sk+(sk>2?' &#128293;':sk<-2?' &#129488;':'');
   skE.className='sv '+(sk>0?'sv-g':sk<0?'sv-r':'');
-  document.getElementById('stKelly').textContent=s.kelly_fraction>0?s.kelly_fraction.toFixed(2):'&#8212;';
+  document.getElementById('stKelly').textContent=s.kelly_fraction>0?s.kelly_fraction.toFixed(2):'—';
 
   // Status
   const ico=document.getElementById('sIco');
   ico.className='sico '+(s.running?'si-run':s.in_recovery?'si-warn':'si-stop');
-  ico.innerHTML=s.running?'&#9654;':s.in_recovery?'&#9888;':'&#9208;';
+  ico.innerHTML=s.running?'&#9654;':s.in_recovery?'⚠':'&#9208;';
   document.getElementById('sTxt').textContent=s.status||'Bot stopped — connect in Settings';
   document.getElementById('sTime').textContent=new Date().toISOString().substr(0,19).replace('T',' ')+' UTC';
 
@@ -2504,7 +2512,7 @@ function renderState(s){
   const lrn=s.learning||{};
   document.getElementById('learnBadge').textContent=(lrn.trades_remembered||0)+' trades';
   const rr=lrn.rsi_long_range||[40,55];
-  document.getElementById('lRsi').textContent=rr[0]+'&#8211;'+rr[1];
+  document.getElementById('lRsi').textContent=rr[0]+'–'+rr[1];
   document.getElementById('lAdx').textContent=lrn.adx_min||25;
   document.getElementById('lHrs').textContent=(lrn.best_hours&&lrn.best_hours.length)?lrn.best_hours.join(', '):'Learning...';
 
@@ -2548,9 +2556,9 @@ function renderTrades(trades){
     const icTxt=side==='long'?'&#8593;':side==='short'?'&#8595;':'&#9675;';
     const pnl=ic?((won?'+':'')+t.pnl_pct?.toFixed(2)+'%'):'Open';
     const pCls=ic?(won?'tp-u':'tp-d'):'tp-n';
-    const tm=t.time?t.time.substr(5,11).replace('T',' '):'&#8212;';
+    const tm=t.time?t.time.substr(5,11).replace('T',' '):'—';
     const manual=t.reason==='manual'?' <span style="background:var(--ob);color:var(--o);font-size:8px;padding:1px 4px;border-radius:3px;font-weight:700">MANUAL</span>':'';
-    return '<div class="trow"><div class="tl"><div class="tico '+icCls+'">'+icTxt+'</div><div><div class="tsym">'+(t.symbol||'BTC')+manual+'</div><div class="ttm">'+tm+' &middot; '+side.toUpperCase()+'</div></div></div><div class="trr"><div class="tpnl '+pCls+'">'+pnl+'</div><div class="tpr">$'+(t.price?.toFixed(0)||'&#8212;')+(t.confidence?' C:'+t.confidence:'')+'</div></div></div>';
+    return '<div class="trow"><div class="tl"><div class="tico '+icCls+'">'+icTxt+'</div><div><div class="tsym">'+(t.symbol||'BTC')+manual+'</div><div class="ttm">'+tm+' &middot; '+side.toUpperCase()+'</div></div></div><div class="trr"><div class="tpnl '+pCls+'">'+pnl+'</div><div class="tpr">$'+(t.price?.toFixed(0)||'—')+(t.confidence?' C:'+t.confidence:'')+'</div></div></div>';
   }
   const rev=[...trades].reverse();
   document.getElementById('recTrades').innerHTML=rev.slice(0,5).map(row).join('');
