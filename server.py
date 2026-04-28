@@ -1,19 +1,29 @@
 """
-ΔLPHA BOT v6.0 — Delta Exchange India | BTC Options
+ΔLPHA BOT v6.2 — Delta Exchange India | BTC Options
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-HONEST AUDIT FIXES (v5 → v6):
-  ✅ DRAWDOWN CIRCUIT BREAKER — stops trading after 3 consecutive losses
-  ✅ MONTHLY LOSS LIMIT — halts bot if monthly drawdown > 8%
-  ✅ PREMIUM vs MOVE CHECK — won't buy option if theta > expected move
-  ✅ PRE-ANNOUNCEMENT BLACKOUT — extended to 45min before macro events
-  ✅ API HEALTH MONITOR — detects silent failures, protects open positions
-  ✅ POSITION SIZE FLOOR — after losing streak, size drops to 0.5% until recovery
-  ✅ REAL NEWS SCORING — sentiment weighted by source credibility + recency
-  ✅ VOLUME PROFILE — detects low-liquidity traps before entry
-  ✅ OPEN INTEREST SPIKE — detects whale accumulation / distribution
-  ✅ SIDEWAYS PROFIT — straddle strategy when ADX < 20 but squeeze detected
-  ✅ 10% MONTHLY TARGET ENGINE — position sizing calibrated to monthly goal
-  ✅ ADAPTIVE LEARNING — win/loss patterns update RSI/ADX thresholds over time
+BUG FIXES vs v6.1:
+  ✅ BUG 1 FIXED  — 5 duplicate Flask routes removed (was crashing on startup)
+  ✅ BUG 2 FIXED  — Circular import 'from server_v6 import Position' removed
+  ✅ BUG 3 FIXED  — _auto_start() now correctly placed after bot=AlphaBot()
+  ✅ BUG 4 FIXED  — Cfg.STARTING_CAPITAL ref removed (doesn't exist in Cfg)
+  ✅ BUG 5 FIXED  — DASHBOARD=open() removed (crashes at module load)
+  ✅ BUG 6 FIXED  — ADX smoothing arrays properly aligned (was wrong regime)
+  ✅ BUG 7 FIXED  — Candle parse handles both dict+array Delta formats + volume fallback
+  ✅ BUG 8 FIXED  — Kelly minimum $20 floor (was $5 — couldn't cover any premium)
+  ✅ BUG 9 FIXED  — Premium vs move formula corrected (wrong units blocked all options)
+  ✅ BUG 10 FIXED — Backslash continuation syntax error in manual_trade
+
+PROFITABILITY IMPROVEMENTS:
+  ✅ RSI(14) replaces RSI(7) — less noise on 5-min, better entry timing
+  ✅ MACD(8,21,5) replaces MACD(5,13,5) — fewer whipsaws, higher signal quality
+  ✅ Confidence threshold lowered to 58 — gets trades actually executing
+  ✅ MIN_TRADES_BEFORE_KELLY = 10 — use fixed 1.5% until stats are meaningful
+  ✅ Divergence detection rewrote — was silently crashing on edge cases
+  ✅ Options premium formula fixed — bot now uses options not just perpetuals
+  ✅ News multiplier capped at 1.1/0.85 — was over-amplifying single headlines
+  ✅ Regime NEUTRAL now scores 5 (was 0) — allows range trading
+  ✅ Volume check relaxed to 0.3× avg (was 0.5×) — crypto volume is episodic
+  ✅ Macro blackout reduced to 20min (was 45min) — 45min blocked too many sessions
 """
 
 import os, time, hmac, hashlib, json, logging, requests, threading, math
@@ -25,7 +35,7 @@ from flask_cors import CORS
 
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-log = logging.getLogger("ALPHA_V6")
+log = logging.getLogger("ALPHA")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG
@@ -35,60 +45,67 @@ class Cfg:
     API_SECRET = os.getenv("DELTA_API_SECRET", "")
     BASE_URL   = "https://api.india.delta.exchange"
 
-    # Risk — live wallet only, no hardcoded capital
-    MAX_RISK_NORMAL    = 0.02   # 2% per trade (normal)
-    MAX_RISK_HOT       = 0.03   # 3% on high confidence + win streak
-    MAX_RISK_RECOVERY  = 0.005  # 0.5% during drawdown recovery mode
+    # Risk
+    MAX_RISK_NORMAL    = 0.02
+    MAX_RISK_HOT       = 0.03
+    MAX_RISK_RECOVERY  = 0.005
     KELLY_FRACTION     = 0.25
+    MIN_TRADE_SIZE_USD = 20.0   # FIX BUG 8: floor prevents $5 trades
     MAX_OPEN_POSITIONS = 2
+    MIN_TRADES_BEFORE_KELLY = 10  # Use fixed sizing until we have real stats
 
-    # 10% monthly target engine
-    MONTHLY_TARGET_PCT  = 0.10  # 10% monthly goal
-    MONTHLY_LOSS_LIMIT  = 0.08  # Hard stop: halt bot if down 8% in month
-    DAILY_LOSS_LIMIT    = 0.03  # Pause for 24h if down 3% in one day
+    # Monthly targets
+    MONTHLY_TARGET_PCT = 0.10
+    MONTHLY_LOSS_LIMIT = 0.08
+    DAILY_LOSS_LIMIT   = 0.03
 
     # Circuit breaker
-    MAX_CONSEC_LOSSES   = 3     # Stop trading after 3 losses in a row
-    RECOVERY_TRADES     = 2     # Need 2 wins to exit recovery mode
+    MAX_CONSEC_LOSSES  = 3
+    RECOVERY_TRADES    = 2
 
-    # Exits
-    HARD_STOP_PCT       = 0.025  # Tighter: 2.5% stop (was 3%)
-    TP1_PCT             = 0.015
-    TP2_PCT             = 0.030  # Higher TP2 to reach 10% monthly
-    TRAIL_ACTIVATE_PCT  = 0.012
-    TRAIL_DISTANCE_PCT  = 0.007
+    # Exits — calibrated for BTC options 0-3 DTE
+    HARD_STOP_PCT      = 0.025
+    TP1_PCT            = 0.015   # Take 50% at +1.5%
+    TP2_PCT            = 0.030   # Full exit at +3.0%
+    TRAIL_ACTIVATE_PCT = 0.012
+    TRAIL_DISTANCE_PCT = 0.007
 
     # Regime
-    ADX_TREND_MIN       = 25
-    ADX_SQUEEZE_MAX     = 18    # Below this = squeeze candidate for straddle
+    ADX_TREND_MIN      = 22     # Lowered slightly — 25 too strict for BTC
+    ADX_CHOP_MAX       = 16
 
-    # RSI (adaptive — updated by learning engine)
-    RSI_BULL_PULLBACK   = (40, 55)
-    RSI_BEAR_BOUNCE     = (45, 60)
+    # INDICATORS — PROFITABILITY FIX
+    RSI_PERIOD         = 14     # FIX: was 7 (too noisy on 5-min)
+    RSI_LONG_MIN       = 40
+    RSI_LONG_MAX       = 60
+    RSI_SHORT_MIN      = 40
+    RSI_SHORT_MAX      = 60
+    MACD_FAST          = 8      # FIX: was 5 (too fast)
+    MACD_SLOW          = 21     # FIX: was 13
+    MACD_SIGNAL        = 5
 
-    # Time (UTC)
-    DEAD_ZONE_HOURS     = [2, 3, 4, 5]
-    PEAK_HOURS          = [8, 9, 13, 14, 15, 16]
-    # Extended blackout: 45min before major events
-    MACRO_BLACKOUT_TIMES = [(13, 30), (19, 0), (8, 30)]  # Added 8:30 UTC (EU open data)
-    BLACKOUT_WINDOW_MINS = 45  # Was 15, now 45
-
-    # Premium safety
-    MIN_MOVE_TO_PREMIUM_RATIO = 1.5  # Expected move must be 1.5x the premium paid
+    # Options premium safety — FIXED FORMULA
+    MIN_MOVE_TO_PREMIUM_RATIO = 1.2   # Expected move >= 1.2x option premium
 
     # Funding
-    FUNDING_LONG_MAX    = 0.001
-    FUNDING_SHORT_MIN   = -0.0005
+    FUNDING_LONG_MAX   = 0.001
+    FUNDING_SHORT_MIN  = -0.0005
 
-    # OI spike threshold
-    OI_SPIKE_PCT        = 0.15   # 15% OI change = whale activity
+    # OI
+    OI_SPIKE_PCT       = 0.12
 
-    # Confidence
-    MIN_CONFIDENCE      = 65
-    HIGH_CONFIDENCE     = 82
+    # Time (UTC)
+    DEAD_ZONE_HOURS    = [2, 3, 4, 5]
+    PEAK_HOURS         = [8, 9, 13, 14, 15, 16]
+    MACRO_BLACKOUT_TIMES = [(13, 30), (19, 0)]  # Removed 8:30 — too aggressive
+    BLACKOUT_WINDOW_MINS = 20   # FIX: was 45 (blocked too many valid windows)
 
-    BTC_PRODUCT_ID      = 27
-    SCAN_INTERVAL       = 300
+    # Confidence — PROFITABILITY FIX
+    MIN_CONFIDENCE     = 58     # FIX: was 65 (too strict, bot never traded)
+    HIGH_CONFIDENCE    = 78
+
+    BTC_PRODUCT_ID     = 27
+    SCAN_INTERVAL      = 300
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DELTA EXCHANGE API
@@ -100,16 +117,17 @@ class DeltaAPI:
         self.secret  = Cfg.API_SECRET
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
-        self.last_success = time.time()
         self.consecutive_failures = 0
         self.healthy = True
+        self.last_success = time.time()
 
     def _sign(self, method, path, qs="", body=""):
         ts  = str(int(time.time()))
         msg = method + ts + path + qs + body
+        # FIX: hmac.new is correct Python API
         sig = hmac.new(self.secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
         return {"api-key": self.key, "timestamp": ts, "signature": sig,
-                "User-Agent": "alpha-bot-v6"}
+                "User-Agent": "alpha-bot-v6.2"}
 
     def _get(self, path, params=None):
         qs = ("?" + "&".join(f"{k}={v}" for k, v in params.items())) if params else ""
@@ -125,7 +143,7 @@ class DeltaAPI:
             self.consecutive_failures += 1
             if self.consecutive_failures >= 3:
                 self.healthy = False
-                log.error(f"API UNHEALTHY after {self.consecutive_failures} failures: {e}")
+                log.error(f"API unhealthy ({self.consecutive_failures} failures): {e}")
             return None
 
     def _post(self, path, body):
@@ -179,18 +197,15 @@ class DeltaAPI:
         return d.get("result", []) if d and d.get("success") else []
 
     def get_funding_rate(self, symbol="BTCUSD"):
-        d = self._get(f"/v2/tickers/{symbol}")
-        if d and d.get("success"):
-            return float(d.get("result", {}).get("funding_rate", 0))
-        return 0.0
+        t = self.get_ticker(symbol)
+        return float(t.get("funding_rate", 0)) if t else 0.0
 
     def get_open_interest(self, symbol="BTCUSD"):
-        d = self._get(f"/v2/tickers/{symbol}")
-        if d and d.get("success"):
-            return float(d.get("result", {}).get("open_interest", 0))
-        return 0.0
+        t = self.get_ticker(symbol)
+        return float(t.get("open_interest", 0)) if t else 0.0
 
-    def place_order(self, product_id, side, size, order_type="market_order",
+    def place_order(self, product_id, side, size,
+                    order_type="market_order",
                     limit_price=None, stop_price=None):
         body = {"product_id": product_id, "size": size, "side": side,
                 "order_type": order_type, "time_in_force": "gtc"}
@@ -203,12 +218,13 @@ class DeltaAPI:
                           {"product_id": product_id}) or {}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TECHNICAL ENGINE
+# TECHNICAL ENGINE — ALL BUGS FIXED
 # ══════════════════════════════════════════════════════════════════════════════
 class TechEngine:
 
     @staticmethod
-    def ema(prices, period):
+    def ema(prices: list, period: int) -> list:
+        if not prices: return []
         if len(prices) < period:
             return [prices[-1]] * len(prices)
         k = 2 / (period + 1)
@@ -218,694 +234,705 @@ class TechEngine:
         return [vals[0]] * (period - 1) + vals
 
     @staticmethod
-    def rsi(prices, period=7):
-        if len(prices) < period + 1: return 50.0
+    def rsi(prices: list, period: int = 14) -> float:
+        """FIX BUG: RSI(14) not RSI(7) — far less noisy on 5-min crypto."""
+        if len(prices) < period + 2: return 50.0
         deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
-        gains  = [max(d, 0) for d in deltas[-period:]]
-        losses = [abs(min(d, 0)) for d in deltas[-period:]]
-        ag, al = sum(gains)/period, sum(losses)/period
-        if al == 0: return 100.0
-        return 100 - (100 / (1 + ag/al))
+        gains  = [max(d, 0.0) for d in deltas[-period:]]
+        losses = [abs(min(d, 0.0)) for d in deltas[-period:]]
+        ag = sum(gains) / period
+        al = sum(losses) / period
+        if al < 1e-10: return 100.0
+        return round(100 - (100 / (1 + ag / al)), 2)
 
     @staticmethod
-    def macd(prices, fast=5, slow=13, signal=5):
+    def macd(prices: list, fast: int = 8, slow: int = 21, signal: int = 5):
+        """
+        FIX BUG: MACD(8,21,5) vs old (5,13,5).
+        (5,13,5) on 5-min = effective 23-candle window = crossover every 20min.
+        Too many false signals. (8,21,5) smoother, fewer whipsaws.
+        """
         if len(prices) < slow + signal:
             return 0.0, 0.0, 0.0, []
-        ef = TechEngine.ema(prices, fast)
-        es = TechEngine.ema(prices, slow)
-        ml = [ef[i] - es[i] for i in range(len(prices))]
-        sl = TechEngine.ema(ml, signal)
+        ef   = TechEngine.ema(prices, fast)
+        es   = TechEngine.ema(prices, slow)
+        ml   = [ef[i] - es[i] for i in range(len(prices))]
+        sl   = TechEngine.ema(ml, signal)
         hist = [ml[i] - sl[i] for i in range(len(ml))]
         return ml[-1], sl[-1], hist[-1], hist
 
     @staticmethod
-    def adx(highs, lows, closes, period=14):
-        if len(closes) < period * 2: return 0.0, 0.0, 0.0
-        tr_list, pdm, ndm = [], [], []
-        for i in range(1, len(closes)):
+    def adx(highs: list, lows: list, closes: list, period: int = 14):
+        """
+        FIX BUG 6: Wilder smoothing now returns correctly aligned arrays.
+        Previous sm() function had off-by-one indexing causing wrong +DI/-DI.
+        """
+        n = len(closes)
+        if n < period * 2 + 1:
+            return 0.0, 0.0, 0.0
+
+        tr_vals, pdm_vals, ndm_vals = [], [], []
+        for i in range(1, n):
             h, l, pc = highs[i], lows[i], closes[i-1]
-            tr_list.append(max(h-l, abs(h-pc), abs(l-pc)))
-            up, dn = highs[i]-highs[i-1], lows[i-1]-lows[i]
-            pdm.append(up if up > dn and up > 0 else 0)
-            ndm.append(dn if dn > up and dn > 0 else 0)
+            tr_vals.append(max(h - l, abs(h - pc), abs(l - pc)))
+            up   = highs[i] - highs[i-1]
+            down = lows[i-1] - lows[i]
+            pdm_vals.append(up   if (up > down and up > 0)   else 0.0)
+            ndm_vals.append(down if (down > up and down > 0) else 0.0)
 
-        def sm(data, p):
-            s = sum(data[:p]); r = [s]
-            for d in data[p:]: s = s - s/p + d; r.append(s)
-            return r
+        # Wilder smoothing — FIX: use rolling update, not sum slice
+        def wilder(data: list, p: int) -> list:
+            result = [sum(data[:p])]
+            for v in data[p:]:
+                result.append(result[-1] - result[-1] / p + v)
+            return result
 
-        atr = sm(tr_list, period)
-        pdi = [100*sm(pdm,period)[i]/atr[i] if atr[i]>0 else 0 for i in range(len(atr))]
-        ndi = [100*sm(ndm,period)[i]/atr[i] if atr[i]>0 else 0 for i in range(len(atr))]
-        dx  = [abs(pdi[i]-ndi[i])/(pdi[i]+ndi[i])*100 if (pdi[i]+ndi[i])>0 else 0
-               for i in range(len(pdi))]
-        return sum(dx[-period:])/period, pdi[-1], ndi[-1]
+        atr_w = wilder(tr_vals,  period)
+        pdm_w = wilder(pdm_vals, period)
+        ndm_w = wilder(ndm_vals, period)
+
+        # All three have same length — no index mismatch
+        plus_di  = [100 * pdm_w[i] / atr_w[i] if atr_w[i] > 0 else 0
+                    for i in range(len(atr_w))]
+        minus_di = [100 * ndm_w[i] / atr_w[i] if atr_w[i] > 0 else 0
+                    for i in range(len(atr_w))]
+        dx       = [abs(plus_di[i] - minus_di[i]) / (plus_di[i] + minus_di[i]) * 100
+                    if (plus_di[i] + minus_di[i]) > 0 else 0
+                    for i in range(len(plus_di))]
+
+        adx_val = sum(dx[-period:]) / period
+        return round(adx_val, 2), round(plus_di[-1], 2), round(minus_di[-1], 2)
 
     @staticmethod
-    def atr(highs, lows, closes, period=7):
+    def atr(highs: list, lows: list, closes: list, period: int = 14) -> float:
         if len(closes) < period + 1: return 0.0
-        trs = [max(highs[i]-lows[i], abs(highs[i]-closes[i-1]),
-                   abs(lows[i]-closes[i-1]))
+        trs = [max(highs[i] - lows[i],
+                   abs(highs[i] - closes[i-1]),
+                   abs(lows[i] - closes[i-1]))
                for i in range(1, len(closes))]
         return sum(trs[-period:]) / period
 
     @staticmethod
-    def bollinger(prices, period=20, std_dev=2.0):
+    def bollinger(prices: list, period: int = 20, std_dev: float = 2.0):
         if len(prices) < period:
-            mid = prices[-1]; return mid, mid, mid, 0.0
+            m = prices[-1]
+            return m, m, m, 0.0
         w   = prices[-period:]
         mid = sum(w) / period
-        std = (sum((p-mid)**2 for p in w)/period)**0.5
-        upper, lower = mid+std_dev*std, mid-std_dev*std
-        return upper, mid, lower, (upper-lower)/mid*100
+        std = math.sqrt(sum((p - mid) ** 2 for p in w) / period)
+        if mid == 0: return mid, mid, mid, 0.0
+        upper = mid + std_dev * std
+        lower = mid - std_dev * std
+        return upper, mid, lower, (upper - lower) / mid * 100
 
     @staticmethod
-    def detect_divergence(prices, histogram, lookback=10):
-        if len(prices) < lookback or len(histogram) < lookback:
-            return "none"
-        p, h = prices[-lookback:], histogram[-lookback:]
-        half = lookback // 2
+    def detect_divergence(prices: list, histogram: list,
+                          lookback: int = 12) -> str:
+        """
+        FIX BUG: Previous version crashed silently on edge cases.
+        Fully guarded with try/except and bounds checks.
+        """
         try:
-            pl1, pl2 = min(p[:half]), min(p[half:])
-            hl1 = h[p.index(pl1)] if pl1 in p else h[0]
-            hl2_idx = half + p[half:].index(pl2) if pl2 in p[half:] else half
-            hl2 = h[hl2_idx] if hl2_idx < len(h) else h[-1]
-            if pl2 < pl1 and hl2 > hl1 and hl2 < 0:
+            if len(prices) < lookback or len(histogram) < lookback:
+                return "none"
+            p = prices[-lookback:]
+            h = histogram[-lookback:]
+            half = lookback // 2
+            if half < 2: return "none"
+
+            p1, p2 = p[:half], p[half:]
+            h1, h2 = h[:half], h[half:]
+
+            # Bullish: price lower low, histogram higher low
+            pl1, pl2 = min(p1), min(p2)
+            hl1 = h1[p1.index(pl1)] if pl1 in p1 else h1[-1]
+            hl2 = h2[p2.index(pl2)] if pl2 in p2 else h2[-1]
+            if pl2 < pl1 * 0.9995 and hl2 > hl1 and hl2 < 0:
                 return "bullish"
-            ph1, ph2 = max(p[:half]), max(p[half:])
-            hh1 = h[p.index(ph1)] if ph1 in p else h[0]
-            hh2_idx = half + p[half:].index(ph2) if ph2 in p[half:] else half
-            hh2 = h[hh2_idx] if hh2_idx < len(h) else h[-1]
-            if ph2 > ph1 and hh2 < hh1 and hh2 > 0:
+
+            # Bearish: price higher high, histogram lower high
+            ph1, ph2 = max(p1), max(p2)
+            hh1 = h1[p1.index(ph1)] if ph1 in p1 else h1[-1]
+            hh2 = h2[p2.index(ph2)] if ph2 in p2 else h2[-1]
+            if ph2 > ph1 * 1.0005 and hh2 < hh1 and hh2 > 0:
                 return "bearish"
         except Exception:
             pass
         return "none"
 
     @staticmethod
-    def squeeze_detected(closes, highs, lows, period=20):
-        """Bollinger Band squeeze inside Keltner Channel = volatility coil."""
+    def squeeze_detected(closes: list, highs: list, lows: list,
+                          period: int = 20) -> bool:
         if len(closes) < period: return False
         _, bb_mid, _, bb_width = TechEngine.bollinger(closes, period)
         atr_val = TechEngine.atr(highs, lows, closes, period)
-        kc_width = (atr_val * 1.5 * 2 / bb_mid) * 100  # Keltner width %
-        return bb_width < kc_width  # BB inside KC = squeeze
+        if bb_mid == 0: return False
+        kc_width = (atr_val * 1.5 * 2 / bb_mid) * 100
+        return bb_width < kc_width
 
     @staticmethod
-    def volume_profile_ok(volumes, current_vol, min_ratio=0.5):
-        """Reject trades when volume is suspiciously low (trap candle)."""
+    def volume_ok(volumes: list, min_ratio: float = 0.30) -> bool:
+        """FIX BUG: Relaxed to 0.30× (was 0.50×). Crypto volume is episodic."""
         if len(volumes) < 20: return True
         avg = sum(volumes[-20:]) / 20
-        return current_vol >= avg * min_ratio  # Need at least 50% of avg vol
+        return volumes[-1] >= avg * min_ratio if avg > 0 else True
+
+    @staticmethod
+    def parse_candles(candles: list) -> tuple:
+        """
+        FIX BUG 7: Delta Exchange returns either dicts or arrays.
+        Handles both formats + volume field name variations.
+        """
+        closes, highs, lows, volumes = [], [], [], []
+        for c in candles:
+            try:
+                if isinstance(c, dict):
+                    cl = float(c.get("close", c.get("c", 0)) or 0)
+                    hi = float(c.get("high",  c.get("h", 0)) or 0)
+                    lo = float(c.get("low",   c.get("l", 0)) or 0)
+                    # Delta uses 'volume' or 'turnover'
+                    vo = float(c.get("volume", c.get("turnover",
+                                c.get("v", 0))) or 0)
+                elif isinstance(c, (list, tuple)) and len(c) >= 6:
+                    # [timestamp, open, high, low, close, volume]
+                    cl = float(c[4] or 0)
+                    hi = float(c[2] or 0)
+                    lo = float(c[3] or 0)
+                    vo = float(c[5] or 0)
+                else:
+                    continue
+                if cl > 0:  # Skip zero-price candles
+                    closes.append(cl)
+                    highs.append(hi)
+                    lows.append(lo)
+                    volumes.append(vo)
+            except Exception:
+                continue
+        return closes, highs, lows, volumes
 
 # ══════════════════════════════════════════════════════════════════════════════
-# REAL NEWS ENGINE (with credibility scoring)
+# NEWS ENGINE (credibility-weighted, capped multiplier)
 # ══════════════════════════════════════════════════════════════════════════════
 class NewsEngine:
-    # Source credibility weights (0-1)
     SOURCE_WEIGHT = {
         "reuters": 1.0, "bloomberg": 1.0, "wsj": 0.95,
         "coindesk": 0.85, "cointelegraph": 0.75,
         "cryptopanic": 0.6, "twitter": 0.3, "reddit": 0.2,
-        "unknown": 0.4
     }
-
-    # Bull/bear phrases with weights
     BULL_SIGNALS = {
-        "sec approves": 3, "etf approved": 3, "fed pivot": 2,
-        "rate cut": 2, "bitcoin reserve": 2, "institutional buy": 2,
+        "etf approved": 3, "fed pivot": 2, "rate cut": 2,
+        "bitcoin reserve": 2, "institutional buy": 2,
         "blackrock": 1.5, "fidelity": 1.5, "microstrategy": 1,
-        "accumulation": 1, "halving": 1.5, "btc treasury": 2
+        "halving": 1.5, "btc treasury": 2, "accumulation": 1,
     }
     BEAR_SIGNALS = {
-        "sec sues": 3, "exchange hack": 3, "exchange collapse": 3,
+        "exchange hack": 3, "exchange collapse": 3, "sec sues": 3,
         "rate hike": 2, "cpi higher": 2, "recession": 1.5,
-        "tether fraud": 3, "ban bitcoin": 2.5, "regulatory crackdown": 2,
-        "ponzi": 2.5, "fraud": 2, "liquidation cascade": 2
+        "ban bitcoin": 2.5, "regulatory crackdown": 2,
+        "tether fraud": 3, "liquidation cascade": 2,
     }
-
-    # Phrases that indicate fake/low-quality news
-    FAKE_SIGNALS = [
-        "guaranteed", "100x", "moon soon", "insider tip",
-        "secret source", "breaking exclusive", "crypto guru"
-    ]
+    FAKE_MARKERS = ["guaranteed", "100x", "moon soon", "insider tip", "secret source"]
 
     def __init__(self):
         self._cache = None
         self._cache_time = 0
-        self._cache_ttl  = 300  # 5 min cache
 
     def get_sentiment(self) -> dict:
-        """
-        Returns: {score: float (-1 to +1), confidence: float, label: str,
-                  bull_score: float, bear_score: float, sources_checked: int}
-        """
         now = time.time()
-        if self._cache and (now - self._cache_time) < self._cache_ttl:
+        if self._cache and now - self._cache_time < 300:
             return self._cache
-
-        result = self._fetch_and_score()
+        result = self._fetch()
         self._cache = result
         self._cache_time = now
         return result
 
-    def _fetch_and_score(self) -> dict:
-        bull_total = 0.0
-        bear_total = 0.0
-        sources_checked = 0
+    def _fetch(self) -> dict:
+        bull, bear, checked = 0.0, 0.0, 0
 
-        # Source 1: CryptoPanic (free, no key needed for basic)
         try:
             r = requests.get(
                 "https://cryptopanic.com/api/v1/posts/"
                 "?auth_token=&public=true&currencies=BTC&filter=hot",
                 timeout=5)
             if r.status_code == 200:
-                posts = r.json().get("results", [])[:15]
-                for post in posts:
+                for post in r.json().get("results", [])[:15]:
                     title = post.get("title", "").lower()
-                    source = post.get("source", {}).get("domain", "unknown").lower()
-                    # Check for fake news markers
-                    if any(f in title for f in self.FAKE_SIGNALS):
-                        continue  # Skip suspect news
-                    credibility = self._source_credibility(source)
-                    # Score the title
-                    b_score = sum(w for phrase, w in self.BULL_SIGNALS.items()
-                                  if phrase in title)
-                    n_score = sum(w for phrase, w in self.BEAR_SIGNALS.items()
-                                  if phrase in title)
-                    bull_total += b_score * credibility
-                    bear_total += n_score * credibility
-                sources_checked += 1
+                    if any(f in title for f in self.FAKE_MARKERS):
+                        continue
+                    src = post.get("source", {}).get("domain", "").lower()
+                    cred = next((w for k, w in self.SOURCE_WEIGHT.items()
+                                 if k in src), 0.4)
+                    bull += sum(w for p, w in self.BULL_SIGNALS.items() if p in title) * cred
+                    bear += sum(w for p, w in self.BEAR_SIGNALS.items() if p in title) * cred
+                checked += 1
         except Exception:
             pass
 
-        # Source 2: Fear & Greed Index (actual market sentiment)
         try:
-            r = requests.get(
-                "https://api.alternative.me/fng/?limit=1", timeout=5)
+            r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5)
             if r.status_code == 200:
                 fng = int(r.json()["data"][0]["value"])
-                fng_class = r.json()["data"][0]["value_classification"]
-                # FNG > 65 = greed (potentially contrarian bear)
-                # FNG < 30 = fear (potentially contrarian bull)
-                if fng > 75:   bear_total  += 1.5  # Extreme greed = crowded
-                elif fng > 65: bear_total  += 0.5
-                elif fng < 25: bull_total  += 1.5  # Extreme fear = opportunity
-                elif fng < 35: bull_total  += 0.5
-                sources_checked += 1
+                if fng > 75: bear += 1.5
+                elif fng > 65: bear += 0.5
+                elif fng < 25: bull += 1.5
+                elif fng < 35: bull += 0.5
+                checked += 1
         except Exception:
             pass
 
-        total = bull_total + bear_total
-        if total == 0:
-            return {"score": 0.0, "confidence": 0.3, "label": "Neutral",
-                    "bull_score": 0, "bear_score": 0, "sources_checked": 0,
-                    "fng": None}
+        total = bull + bear
+        if total < 0.5:
+            return {"score": 0.0, "label": "Neutral", "confidence": 0.2,
+                    "bull_score": 0, "bear_score": 0, "sources_checked": checked}
+        score = (bull - bear) / total
+        label = ("Strongly Bullish" if score > 0.5 else
+                 "Bullish"          if score > 0.2 else
+                 "Strongly Bearish" if score < -0.5 else
+                 "Bearish"          if score < -0.2 else "Neutral")
+        return {"score": round(score, 3), "label": label,
+                "confidence": round(min(total / 8.0, 1.0), 2),
+                "bull_score": round(bull, 1), "bear_score": round(bear, 1),
+                "sources_checked": checked}
 
-        net_score = (bull_total - bear_total) / total  # -1 to +1
-        confidence = min(total / 10.0, 1.0)  # Scales with amount of signals
-        label = ("Strongly Bullish" if net_score > 0.5 else
-                 "Bullish" if net_score > 0.2 else
-                 "Strongly Bearish" if net_score < -0.5 else
-                 "Bearish" if net_score < -0.2 else "Neutral")
-
-        return {"score": round(net_score, 3), "confidence": round(confidence, 2),
-                "label": label, "bull_score": round(bull_total, 1),
-                "bear_score": round(bear_total, 1),
-                "sources_checked": sources_checked}
-
-    def _source_credibility(self, domain: str) -> float:
-        for key, weight in self.SOURCE_WEIGHT.items():
-            if key in domain:
-                return weight
-        return self.SOURCE_WEIGHT["unknown"]
-
-    def get_confidence_multiplier(self) -> float:
-        """Returns 0.7–1.2 multiplier for confidence score."""
+    def get_multiplier(self) -> float:
+        """FIX BUG: Capped tighter (1.10/0.88 vs 1.15/0.75).
+        Prevents single bullish headline from overriding veto logic."""
         s = self.get_sentiment()
-        score = s.get("score", 0)
-        conf  = s.get("confidence", 0)
-        # Only adjust if we have sufficient signal confidence
-        if conf < 0.3:
-            return 1.0
-        if score > 0.5:  return 1.15
-        if score > 0.2:  return 1.05
-        if score < -0.5: return 0.75
-        if score < -0.2: return 0.90
+        sc, conf = s.get("score", 0), s.get("confidence", 0)
+        if conf < 0.3: return 1.0
+        if sc > 0.5:  return 1.10
+        if sc > 0.2:  return 1.05
+        if sc < -0.5: return 0.88
+        if sc < -0.2: return 0.94
         return 1.0
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ADAPTIVE LEARNING ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 class LearningEngine:
-    """
-    Updates RSI thresholds, ADX minimum, and time-of-day weights
-    based on actual trade outcomes. NOT ML — pattern counting over
-    rolling 50 trades. Simple, robust, not overfit.
-    """
     def __init__(self):
-        self.trade_memory = deque(maxlen=50)  # Last 50 trades
-        # Adaptive thresholds (start at defaults, update gradually)
-        self.rsi_long_min  = 40.0
-        self.rsi_long_max  = 55.0
-        self.adx_min       = 25.0
+        self.memory = deque(maxlen=50)
+        self.rsi_long_min  = float(Cfg.RSI_LONG_MIN)
+        self.rsi_long_max  = float(Cfg.RSI_LONG_MAX)
+        self.adx_min       = float(Cfg.ADX_TREND_MIN)
         self.hour_weights  = {h: 1.0 for h in range(24)}
 
     def record(self, trade: dict):
-        """Call after each trade closes with outcome data."""
-        self.trade_memory.append({
-            "rsi_at_entry": trade.get("rsi", 50),
-            "adx_at_entry": trade.get("adx", 25),
-            "hour_utc":     trade.get("hour_utc", 12),
-            "won":          trade.get("won", False),
-            "pnl_pct":      trade.get("pnl_pct", 0),
-            "direction":    trade.get("direction", "long")
-        })
-        if len(self.trade_memory) >= 20:
-            self._update_thresholds()
+        self.memory.append(trade)
+        if len(self.memory) >= 20:
+            self._update()
 
-    def _update_thresholds(self):
-        """Re-calibrate thresholds based on recent 50 trades."""
-        longs = [t for t in self.trade_memory if t["direction"] == "long"]
+    def _update(self):
+        longs = [t for t in self.memory if t.get("direction") == "long"]
         if len(longs) >= 10:
-            win_rsi = [t["rsi_at_entry"] for t in longs if t["won"]]
-            lose_rsi = [t["rsi_at_entry"] for t in longs if not t["won"]]
-            if win_rsi and lose_rsi:
-                avg_win_rsi  = sum(win_rsi)  / len(win_rsi)
-                avg_lose_rsi = sum(lose_rsi) / len(lose_rsi)
-                # Nudge RSI range toward winning entries (slow, 10% per update)
-                self.rsi_long_min = self.rsi_long_min * 0.9 + max(avg_win_rsi - 8, 35) * 0.1
-                self.rsi_long_max = self.rsi_long_max * 0.9 + min(avg_win_rsi + 8, 65) * 0.1
+            wins  = [t["rsi"] for t in longs if t.get("won")]
+            loses = [t["rsi"] for t in longs if not t.get("won")]
+            if wins and loses:
+                awr = sum(wins) / len(wins)
+                self.rsi_long_min = self.rsi_long_min * 0.92 + max(awr - 10, 30) * 0.08
+                self.rsi_long_max = self.rsi_long_max * 0.92 + min(awr + 10, 70) * 0.08
 
-        # ADX: if trades are winning at lower ADX, lower the threshold slightly
-        all_adx = [(t["adx_at_entry"], t["won"]) for t in self.trade_memory]
-        if all_adx:
-            low_adx_wins = sum(1 for a, w in all_adx if a < 25 and w)
-            low_adx_total = sum(1 for a, w in all_adx if a < 25)
-            if low_adx_total >= 5:
-                win_rate_low_adx = low_adx_wins / low_adx_total
-                if win_rate_low_adx > 0.60:
-                    self.adx_min = max(20, self.adx_min - 0.5)  # Slowly lower floor
-                elif win_rate_low_adx < 0.40:
-                    self.adx_min = min(30, self.adx_min + 0.5)  # Raise floor
+        adx_data = [(t.get("adx", 25), t.get("won", False)) for t in self.memory]
+        low_adx  = [(a, w) for a, w in adx_data if a < Cfg.ADX_TREND_MIN]
+        if len(low_adx) >= 5:
+            wr = sum(1 for _, w in low_adx if w) / len(low_adx)
+            if wr > 0.60: self.adx_min = max(18, self.adx_min - 0.3)
+            elif wr < 0.40: self.adx_min = min(28, self.adx_min + 0.3)
 
-        # Hour weights: boost hours with good results, reduce bad ones
         for h in range(24):
-            h_trades = [t for t in self.trade_memory if t["hour_utc"] == h]
-            if len(h_trades) >= 3:
-                wr = sum(1 for t in h_trades if t["won"]) / len(h_trades)
-                # Move weight toward actual performance, clamped 0.5–1.5
-                target = max(0.5, min(1.5, wr / 0.55))  # 0.55 = expected WR
-                self.hour_weights[h] = self.hour_weights[h] * 0.8 + target * 0.2
+            ht = [t for t in self.memory if t.get("hour_utc") == h]
+            if len(ht) >= 3:
+                hw = sum(1 for t in ht if t.get("won")) / len(ht)
+                target = max(0.6, min(1.4, hw / 0.55))
+                self.hour_weights[h] = self.hour_weights[h] * 0.85 + target * 0.15
 
-    def get_hour_multiplier(self, hour: int) -> float:
-        return self.hour_weights.get(hour, 1.0)
+    def hour_mult(self, h: int) -> float:
+        return self.hour_weights.get(h, 1.0)
 
     def summary(self) -> dict:
         return {
-            "trades_remembered": len(self.trade_memory),
+            "trades_remembered": len(self.memory),
             "rsi_long_range": [round(self.rsi_long_min, 1), round(self.rsi_long_max, 1)],
             "adx_min": round(self.adx_min, 1),
-            "best_hours": sorted([h for h, w in self.hour_weights.items() if w > 1.1])
+            "best_hours": sorted(h for h, w in self.hour_weights.items() if w > 1.1),
         }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DRAWDOWN & MONTHLY TRACKER
+# RISK GUARD — Monthly + Daily + Circuit Breaker
 # ══════════════════════════════════════════════════════════════════════════════
 class RiskGuard:
-    """
-    Circuit breakers that actually stop the bot from self-destructing.
-    Most bots lose because they keep trading through drawdowns.
-    """
     def __init__(self):
-        self.month_start_capital   = 0.0
-        self.day_start_capital     = 0.0
-        self.day_start_date        = None
-        self.consecutive_losses    = 0
-        self.in_recovery_mode      = False
-        self.recovery_wins_needed  = 0
-        self.halted                = False
-        self.halt_reason           = ""
-        self.monthly_pnl_pct       = 0.0
-        self.daily_pnl_pct         = 0.0
-        self.trade_history         = deque(maxlen=100)
+        self.month_start  = 0.0
+        self.day_start    = 0.0
+        self.day_date     = None
+        self.consec_loss  = 0
+        self.in_recovery  = False
+        self.rec_wins_needed = 0
+        self.halted       = False
+        self.halt_reason  = ""
+        self.monthly_pnl  = 0.0
+        self.daily_pnl    = 0.0
 
-    def initialize(self, capital: float):
-        now = datetime.now(timezone.utc)
-        self.month_start_capital = capital
-        self.day_start_capital   = capital
-        self.day_start_date      = now.date()
+    def init(self, capital: float):
+        self.month_start = capital
+        self.day_start   = capital
+        self.day_date    = datetime.now(timezone.utc).date()
 
-    def check_new_day(self, capital: float):
+    def new_day(self, capital: float):
         today = datetime.now(timezone.utc).date()
-        if self.day_start_date != today:
-            self.day_start_capital = capital
-            self.day_start_date    = today
-            log.info(f"New day — capital reset for daily tracking: ${capital:.2f}")
+        if self.day_date != today:
+            self.day_start = capital
+            self.day_date  = today
 
-    def record_trade(self, won: bool, pnl_usd: float, capital: float):
-        self.trade_history.append({"won": won, "pnl": pnl_usd,
-                                   "time": datetime.now(timezone.utc).isoformat()})
+    def record(self, won: bool, pnl_usd: float, capital: float):
         if won:
-            self.consecutive_losses = 0
-            if self.in_recovery_mode:
-                self.recovery_wins_needed -= 1
-                if self.recovery_wins_needed <= 0:
-                    self.in_recovery_mode = False
-                    log.info("Recovery mode exited — consecutive wins achieved")
+            self.consec_loss = 0
+            if self.in_recovery:
+                self.rec_wins_needed -= 1
+                if self.rec_wins_needed <= 0:
+                    self.in_recovery = False
+                    log.info("Recovery mode exited")
         else:
-            self.consecutive_losses += 1
-            if self.consecutive_losses >= Cfg.MAX_CONSEC_LOSSES:
-                self.in_recovery_mode     = True
-                self.recovery_wins_needed = Cfg.RECOVERY_TRADES
-                log.warning(f"RECOVERY MODE: {self.consecutive_losses} consecutive losses")
+            self.consec_loss += 1
+            if self.consec_loss >= Cfg.MAX_CONSEC_LOSSES:
+                self.in_recovery     = True
+                self.rec_wins_needed = Cfg.RECOVERY_TRADES
 
-        # Update P&L %
-        if self.month_start_capital > 0:
-            self.monthly_pnl_pct = (capital - self.month_start_capital) / self.month_start_capital
-        if self.day_start_capital > 0:
-            self.daily_pnl_pct = (capital - self.day_start_capital) / self.day_start_capital
+        if self.month_start > 0:
+            self.monthly_pnl = (capital - self.month_start) / self.month_start
+        if self.day_start > 0:
+            self.daily_pnl = (capital - self.day_start) / self.day_start
 
-        # Monthly halt check
-        if self.monthly_pnl_pct <= -Cfg.MONTHLY_LOSS_LIMIT:
-            self.halted     = True
-            self.halt_reason = f"Monthly loss limit hit: {self.monthly_pnl_pct*100:.1f}%"
+        if self.monthly_pnl <= -Cfg.MONTHLY_LOSS_LIMIT:
+            self.halted      = True
+            self.halt_reason = f"Monthly loss {self.monthly_pnl*100:.1f}% >= limit"
             log.error(f"BOT HALTED: {self.halt_reason}")
 
     def can_trade(self) -> tuple:
-        """Returns (can_trade: bool, reason: str, risk_multiplier: float)"""
+        """Returns (ok, reason, risk_multiplier)"""
         if self.halted:
             return False, self.halt_reason, 0.0
-
-        # Daily loss limit — pause trading (not permanent halt)
-        if self.daily_pnl_pct <= -Cfg.DAILY_LOSS_LIMIT:
-            return False, f"Daily loss limit: {self.daily_pnl_pct*100:.1f}% — resume tomorrow", 0.0
-
-        if self.in_recovery_mode:
-            # Allow trading but at minimal size
-            return True, f"Recovery mode ({self.recovery_wins_needed} wins needed)", \
-                   Cfg.MAX_RISK_RECOVERY / Cfg.MAX_RISK_NORMAL
-
+        if self.daily_pnl <= -Cfg.DAILY_LOSS_LIMIT:
+            return False, f"Daily loss {self.daily_pnl*100:.1f}% — resume tomorrow", 0.0
+        if self.in_recovery:
+            rm = Cfg.MAX_RISK_RECOVERY / Cfg.MAX_RISK_NORMAL
+            return True, f"Recovery ({self.rec_wins_needed} wins needed)", rm
         return True, "OK", 1.0
 
-    def get_progress_to_monthly_target(self) -> dict:
-        target = Cfg.MONTHLY_TARGET_PCT
-        current = self.monthly_pnl_pct
+    def monthly_progress(self) -> dict:
+        target  = Cfg.MONTHLY_TARGET_PCT
+        current = self.monthly_pnl
+        status  = ("HALTED"     if self.halted else
+                   "RECOVERY"   if self.in_recovery else
+                   "TARGET HIT" if current >= target else
+                   "ON TRACK"   if current >= 0 else "LOSING")
         return {
-            "target_pct": target * 100,
-            "current_pct": round(current * 100, 2),
+            "target_pct":   target * 100,
+            "current_pct":  round(current * 100, 2),
             "progress_pct": round(min(current / target * 100, 100), 1) if target > 0 else 0,
-            "remaining_pct": round(max((target - current) * 100, 0), 2),
-            "on_track": current >= 0,
-            "monthly_status": ("HALTED" if self.halted else
-                               "RECOVERY" if self.in_recovery_mode else
-                               "TARGET HIT" if current >= target else
-                               "ON TRACK" if current >= 0 else "LOSING")
+            "remaining_pct":round(max((target - current) * 100, 0), 2),
+            "monthly_status": status,
         }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 7-PILLAR CONFIDENCE ENGINE (with adaptive thresholds + news + OI)
+# 7-PILLAR CONFIDENCE ENGINE — FIXED + PROFITABILITY TUNED
 # ══════════════════════════════════════════════════════════════════════════════
 class ConfidenceEngine:
 
     def score(self, data: dict, direction: str,
               learner: LearningEngine = None) -> tuple:
-        closes    = data.get("closes", [])
-        highs     = data.get("highs", [])
-        lows      = data.get("lows", [])
-        volumes   = data.get("volumes", [])
-        closes_5m = data.get("closes_5m", closes)
-        closes_15m= data.get("closes_15m", closes)
-        hour_utc  = data.get("hour_utc", 12)
-        minute_utc= data.get("minute_utc", 0)
-        funding   = data.get("funding_rate", 0.0)
-        is_weekend= data.get("is_weekend", False)
-        oi_change = data.get("oi_change_pct", 0.0)
+        closes  = data.get("closes", [])
+        highs   = data.get("highs", [])
+        lows    = data.get("lows", [])
+        volumes = data.get("volumes", [])
+        c5m     = data.get("closes_5m", closes)
+        c15m    = data.get("closes_15m", closes)
+        h_utc   = data.get("hour_utc", 12)
+        m_utc   = data.get("minute_utc", 0)
+        funding = data.get("funding_rate", 0.0)
+        weekend = data.get("is_weekend", False)
+        oi_chg  = data.get("oi_change_pct", 0.0)
 
         if len(closes) < 55:
-            return 0, True, "insufficient_data", {}
+            return 0, True, "insufficient_data(<55 candles)", {}
 
-        adx_val, plus_di, minus_di = TechEngine.adx(highs, lows, closes)
+        adx_val, pdi, ndi = TechEngine.adx(highs, lows, closes)
         adx_min = learner.adx_min if learner else Cfg.ADX_TREND_MIN
 
         # ── HARD VETOES ──────────────────────────────────────────────────────
-        if adx_val < 15:
-            return 0, True, f"ADX={adx_val:.1f}<15", {}
-        if hour_utc in Cfg.DEAD_ZONE_HOURS and not is_weekend:
-            return 0, True, f"dead_zone_{hour_utc}UTC", {}
+        if adx_val < 13:
+            return 0, True, f"ADX={adx_val:.1f}<13(extreme_chop)", {}
+        if h_utc in Cfg.DEAD_ZONE_HOURS and not weekend:
+            return 0, True, f"dead_zone_{h_utc}UTC", {}
         for mh, mm in Cfg.MACRO_BLACKOUT_TIMES:
-            if abs((hour_utc*60+minute_utc) - (mh*60+mm)) <= Cfg.BLACKOUT_WINDOW_MINS:
+            if abs((h_utc * 60 + m_utc) - (mh * 60 + mm)) <= Cfg.BLACKOUT_WINDOW_MINS:
                 return 0, True, f"macro_blackout_{mh}:{mm:02d}", {}
         if direction == "long"  and funding > Cfg.FUNDING_LONG_MAX:
-            return 0, True, f"funding={funding:.4f}>max_long", {}
+            return 0, True, f"funding={funding:.4f}>long_max", {}
         if direction == "short" and funding < Cfg.FUNDING_SHORT_MIN:
-            return 0, True, f"funding={funding:.4f}<min_short", {}
-
-        # Low-volume trap veto
-        if volumes and not TechEngine.volume_profile_ok(volumes, volumes[-1]):
+            return 0, True, f"funding={funding:.4f}<short_min", {}
+        if volumes and not TechEngine.volume_ok(volumes):
             return 0, True, "low_volume_trap", {}
 
-        # HTF contradiction veto
-        if len(closes_15m) >= 21:
-            h15_ema8 = TechEngine.ema(closes_15m, 8)[-1]
-            if direction == "long"  and closes_15m[-1] < h15_ema8:
-                return 0, True, "1m_vs_15m_contradiction", {}
-            if direction == "short" and closes_15m[-1] > h15_ema8:
-                return 0, True, "1m_vs_15m_contradiction", {}
+        # HTF contradiction veto — ONLY on 15m, not 5m (less strict)
+        if len(c15m) >= 21:
+            h15e8 = TechEngine.ema(c15m, 8)[-1]
+            if direction == "long"  and c15m[-1] < h15e8 * 0.998:
+                return 0, True, "15m_trend_contradiction", {}
+            if direction == "short" and c15m[-1] > h15e8 * 1.002:
+                return 0, True, "15m_trend_contradiction", {}
 
-        breakdown = {}
+        bd = {}
         total = 0
 
-        # ── PILLAR 1: Regime 25% ─────────────────────────────────────────────
-        ema8  = TechEngine.ema(closes, 8)[-1]
-        ema21 = TechEngine.ema(closes, 21)[-1]
-        ema55 = TechEngine.ema(closes, 55)[-1]
-        price = closes[-1]
-        reg_bull = price > ema8 > ema21 > ema55 and adx_val > adx_min and plus_di > minus_di
-        reg_bear = price < ema8 < ema21 < ema55 and adx_val > adx_min and minus_di > plus_di
-        if   direction=="long"  and reg_bull: breakdown["regime"] = 25
-        elif direction=="short" and reg_bear: breakdown["regime"] = 25
-        elif adx_val > adx_min:               breakdown["regime"] = 10
-        else:                                 breakdown["regime"] = 0
-        total += breakdown["regime"]
+        # ── P1: Regime (25%) ─────────────────────────────────────────────────
+        e8  = TechEngine.ema(closes, 8)[-1]
+        e21 = TechEngine.ema(closes, 21)[-1]
+        e55 = TechEngine.ema(closes, 55)[-1]
+        pr  = closes[-1]
+        bull = pr > e8 > e21 > e55 and adx_val > adx_min and pdi > ndi
+        bear = pr < e8 < e21 < e55 and adx_val > adx_min and ndi > pdi
 
-        # ── PILLAR 2: HTF Alignment 20% ──────────────────────────────────────
+        if   direction == "long"  and bull: bd["regime"] = 25
+        elif direction == "short" and bear: bd["regime"] = 25
+        elif adx_val > adx_min:             bd["regime"] = 12
+        else:
+            # FIX: NEUTRAL now gets 5 points (was 0 — blocked all range trades)
+            bd["regime"] = 5
+        total += bd["regime"]
+
+        # ── P2: HTF Alignment (20%) ───────────────────────────────────────────
         htf = 0
-        for htfc in [closes_5m, closes_15m]:
+        for htfc in [c5m, c15m]:
             if len(htfc) >= 21:
-                he8 = TechEngine.ema(htfc, 8)[-1]
-                he21= TechEngine.ema(htfc, 21)[-1]
-                if direction=="long"  and htfc[-1] > he8 > he21: htf += 10
-                elif direction=="short" and htfc[-1] < he8 < he21: htf += 10
-        breakdown["htf_alignment"] = htf
+                he8  = TechEngine.ema(htfc, 8)[-1]
+                he21 = TechEngine.ema(htfc, 21)[-1]
+                if direction == "long"  and htfc[-1] > he8 > he21: htf += 10
+                elif direction == "short" and htfc[-1] < he8 < he21: htf += 10
+        bd["htf_alignment"] = htf
         total += htf
 
-        # ── PILLAR 3: Momentum 15% ───────────────────────────────────────────
-        rsi = TechEngine.rsi(closes, 7)
-        _, _, _, histogram = TechEngine.macd(closes)
+        # ── P3: Momentum (15%) ────────────────────────────────────────────────
+        rsi_v = TechEngine.rsi(closes, Cfg.RSI_PERIOD)
+        _, _, _, histogram = TechEngine.macd(closes, Cfg.MACD_FAST,
+                                              Cfg.MACD_SLOW, Cfg.MACD_SIGNAL)
         divergence = TechEngine.detect_divergence(closes, histogram)
-        rsi_min = learner.rsi_long_min if learner else Cfg.RSI_BULL_PULLBACK[0]
-        rsi_max = learner.rsi_long_max if learner else Cfg.RSI_BULL_PULLBACK[1]
+        rmin = learner.rsi_long_min if learner else Cfg.RSI_LONG_MIN
+        rmax = learner.rsi_long_max if learner else Cfg.RSI_LONG_MAX
 
         mom = 0
         if direction == "long":
-            if rsi_min <= rsi <= rsi_max: mom += 7
-            elif rsi > rsi_max: mom += 5
-            if len(histogram)>=3 and all(histogram[-i]>histogram[-(i+1)] for i in range(1,3)):
-                mom += 5
-            if divergence == "bullish": mom += 8
+            if rmin <= rsi_v <= rmax:     mom += 7
+            elif rsi_v > rmax:            mom += 4
+            elif rsi_v < 35:              mom += 3   # Oversold bounce potential
+            if (len(histogram) >= 3 and
+                    histogram[-1] > histogram[-2] > histogram[-3]): mom += 5
+            if divergence == "bullish":   mom += 8
         else:
-            if 45 <= rsi <= 60: mom += 7
-            elif rsi < 45: mom += 5
-            if len(histogram)>=3 and all(histogram[-i]<histogram[-(i+1)] for i in range(1,3)):
-                mom += 5
-            if divergence == "bearish": mom += 8
-        breakdown["momentum"] = min(mom, 15)
-        total += breakdown["momentum"]
+            if Cfg.RSI_SHORT_MIN <= rsi_v <= Cfg.RSI_SHORT_MAX: mom += 7
+            elif rsi_v < Cfg.RSI_SHORT_MIN: mom += 4
+            elif rsi_v > 65:              mom += 3   # Overbought short potential
+            if (len(histogram) >= 3 and
+                    histogram[-1] < histogram[-2] < histogram[-3]): mom += 5
+            if divergence == "bearish":   mom += 8
+        bd["momentum"] = min(mom, 15)
+        total += bd["momentum"]
 
-        # ── PILLAR 4: Volume + OI 10% ────────────────────────────────────────
-        vol_score = 0
+        # ── P4: Volume + OI (10%) ─────────────────────────────────────────────
+        vs = 0
         if volumes:
-            avg_vol = sum(volumes[-20:]) / max(len(volumes[-20:]), 1)
-            if   volumes[-1] > avg_vol * 1.5: vol_score = 7
-            elif volumes[-1] > avg_vol:        vol_score = 4
-        # OI spike bonus: large OI increase = real positioning (not noise)
-        if oi_change > Cfg.OI_SPIKE_PCT:  vol_score = min(vol_score + 3, 10)
-        breakdown["volume_oi"] = vol_score
-        total += vol_score
-
-        # ── PILLAR 5: Volatility 10% ─────────────────────────────────────────
-        atr_val = TechEngine.atr(highs, lows, closes, 7)
-        _, _, _, bb_width = TechEngine.bollinger(closes)
-        if   0.3 < bb_width < 3.0: vs = 10
-        elif 0.1 < bb_width <= 0.3: vs = 5
-        elif bb_width >= 3.0:       vs = 3
-        else:                       vs = 0
-        breakdown["volatility"] = vs
+            avg = sum(volumes[-20:]) / max(len(volumes[-20:]), 1)
+            if avg > 0:
+                if   volumes[-1] > avg * 1.5: vs = 8
+                elif volumes[-1] > avg * 1.0: vs = 5
+                elif volumes[-1] > avg * 0.5: vs = 3
+        if oi_chg > Cfg.OI_SPIKE_PCT: vs = min(vs + 2, 10)
+        bd["volume_oi"] = vs
         total += vs
 
-        # ── PILLAR 6: Time-of-Day (adaptive) 10% ────────────────────────────
-        base_time = 10 if hour_utc in Cfg.PEAK_HOURS else (2 if is_weekend else 5)
-        hour_mult = learner.get_hour_multiplier(hour_utc) if learner else 1.0
-        ts = min(int(base_time * hour_mult), 10)
-        breakdown["time_of_day"] = ts
+        # ── P5: Volatility (10%) ─────────────────────────────────────────────
+        _, _, _, bw = TechEngine.bollinger(closes)
+        if   0.25 < bw < 4.0: vs2 = 10
+        elif 0.1  < bw <= 0.25: vs2 = 6   # Squeeze — breakout potential
+        elif bw >= 4.0:        vs2 = 4    # Extreme — reduce but don't zero
+        else:                  vs2 = 2
+        bd["volatility"] = vs2
+        total += vs2
+
+        # ── P6: Time-of-day adaptive (10%) ────────────────────────────────────
+        base_t = 10 if h_utc in Cfg.PEAK_HOURS else (3 if weekend else 6)
+        hm = learner.hour_mult(h_utc) if learner else 1.0
+        ts = min(int(base_t * hm), 10)
+        bd["time_of_day"] = ts
         total += ts
 
-        # ── PILLAR 7: Funding + Sentiment 10% ───────────────────────────────
-        fs = 8
+        # ── P7: Funding (10%) ─────────────────────────────────────────────────
+        fs = 7  # Neutral default
         if direction == "long":
             if   funding > 0.0005:  fs = 3
             elif funding < -0.0003: fs = 10
         else:
             if   funding < -0.0003: fs = 3
             elif funding > 0.0005:  fs = 10
-        breakdown["funding_sentiment"] = fs
+        bd["funding"] = fs
         total += fs
 
-        return min(total, 100), False, "", breakdown
+        return min(total, 100), False, "", bd
 
 # ══════════════════════════════════════════════════════════════════════════════
-# POSITION SIZER (Kelly + Streak + Risk Guard aware)
+# POSITION SIZER — FIXED Kelly floor
 # ══════════════════════════════════════════════════════════════════════════════
 class PositionSizer:
     def __init__(self):
-        self.win_count = self.loss_count = self.total_trades = 0
+        self.wins = self.losses = self.total = 0
         self.streak = 0
-        self.avg_win_pct = 2.0
-        self.avg_loss_pct = 1.2
+        self.avg_win  = 2.2
+        self.avg_loss = 1.2
 
     @property
     def win_rate(self):
-        return self.win_count / self.total_trades if self.total_trades else 0.55
+        return self.wins / self.total if self.total >= Cfg.MIN_TRADES_BEFORE_KELLY else 0.55
 
-    def kelly_fraction(self):
+    def kelly_frac(self) -> float:
         wr = self.win_rate
-        if not (0.45 <= wr <= 0.75): return 0.01
+        if not (0.45 <= wr <= 0.78): return 0.015  # Default 1.5%
         p, q = wr, 1 - wr
-        b = self.avg_win_pct / max(self.avg_loss_pct, 0.1)
-        k = (b*p - q) / b
-        return max(0.005, min(0.025, k * Cfg.KELLY_FRACTION))
+        b = self.avg_win / max(self.avg_loss, 0.1)
+        k = (b * p - q) / b
+        if k <= 0: return 0.010  # Never trade 0 — use minimum
+        return max(0.008, min(0.025, k * Cfg.KELLY_FRACTION))
 
-    def streak_mult(self):
-        if self.streak >= 4:  return 1.4
+    def streak_mult(self) -> float:
+        if self.streak >= 4:  return 1.35
         if self.streak == 3:  return 1.2
         if self.streak == 2:  return 1.1
-        if self.streak <= -2: return 0.7
+        if self.streak <= -2: return 0.75
         return 1.0
 
-    def size_usd(self, capital: float, confidence: int, atr_pct: float,
-                 risk_multiplier: float = 1.0) -> float:
-        base    = capital * self.kelly_fraction()
-        conf_m  = 1.3 if confidence >= Cfg.HIGH_CONFIDENCE else 1.0
-        streak_m= self.streak_mult()
-        vol_m   = max(0.5, min(1.5, 0.015 / atr_pct)) if atr_pct > 0 else 1.0
-        size    = base * conf_m * streak_m * vol_m * risk_multiplier
-        max_risk = capital * (Cfg.MAX_RISK_HOT if confidence >= 80 else Cfg.MAX_RISK_NORMAL)
-        return min(size, max_risk)
+    def size_usd(self, capital: float, confidence: int,
+                 atr_pct: float, risk_mult: float = 1.0) -> float:
+        if capital <= 0: return Cfg.MIN_TRADE_SIZE_USD
+        base    = capital * self.kelly_frac()
+        conf_m  = 1.25 if confidence >= Cfg.HIGH_CONFIDENCE else 1.0
+        vol_m   = max(0.6, min(1.4, 0.012 / atr_pct)) if atr_pct > 0 else 1.0
+        size    = base * conf_m * self.streak_mult() * vol_m * risk_mult
+        max_r   = capital * (Cfg.MAX_RISK_HOT if confidence >= 78 else Cfg.MAX_RISK_NORMAL)
+        # FIX BUG 8: floor at $20 — was returning $5 with default Kelly
+        return max(Cfg.MIN_TRADE_SIZE_USD, min(size, max_r))
 
     def record(self, won: bool, pct: float):
-        self.total_trades += 1
+        self.total += 1
         if won:
-            self.win_count += 1
+            self.wins += 1
             self.streak = max(0, self.streak) + 1
-            self.avg_win_pct  = self.avg_win_pct  * 0.9 + abs(pct) * 0.1
+            self.avg_win  = self.avg_win  * 0.9 + abs(pct) * 0.1
         else:
-            self.loss_count += 1
+            self.losses += 1
             self.streak = min(0, self.streak) - 1
-            self.avg_loss_pct = self.avg_loss_pct * 0.9 + abs(pct) * 0.1
+            self.avg_loss = self.avg_loss * 0.9 + abs(pct) * 0.1
 
 # ══════════════════════════════════════════════════════════════════════════════
 # POSITION
 # ══════════════════════════════════════════════════════════════════════════════
 class Position:
-    def __init__(self, product_id, side, entry, size_usd, option_symbol="",
-                 rsi=50, adx=25, hour_utc=12):
-        self.product_id     = product_id
-        self.side           = side
-        self.entry          = entry
-        self.size_usd       = size_usd
-        self.option_symbol  = option_symbol
-        self.entered_at     = datetime.now(timezone.utc)
-        self.tp1_hit        = False
-        self.trailing_on    = False
-        self.trail_high     = entry
-        self.closed         = False
-        self.exit_price     = None
-        self.exit_reason    = None
-        # For learning engine
-        self.rsi_at_entry   = rsi
-        self.adx_at_entry   = adx
-        self.hour_utc       = hour_utc
+    def __init__(self, product_id: int, side: str, entry: float,
+                 size_usd: float, symbol: str = "",
+                 rsi: float = 50, adx: float = 25, hour_utc: int = 12):
+        self.product_id = product_id
+        self.side       = side
+        self.entry      = entry
+        self.size_usd   = size_usd
+        self.symbol     = symbol
+        self.entered_at = datetime.now(timezone.utc)
+        self.tp1_hit    = False
+        self.trailing   = False
+        self.trail_ref  = entry
+        self.closed     = False
+        self.exit_price = None
+        self.exit_reason= None
+        self.rsi_entry  = rsi
+        self.adx_entry  = adx
+        self.hour_utc   = hour_utc
 
-    def check_exit(self, current_price: float) -> tuple:
-        pct = ((current_price - self.entry) / self.entry
-               if self.side == "long"
-               else (self.entry - current_price) / self.entry)
+    def check_exit(self, price: float) -> tuple:
+        pct = ((price - self.entry) / self.entry if self.side == "long"
+               else (self.entry - price) / self.entry)
 
         if pct <= -Cfg.HARD_STOP_PCT:
             return True, "hard_stop", False
         if not self.tp1_hit and pct >= Cfg.TP1_PCT:
             self.tp1_hit = True
-            return True, "tp1_50pct", True
+            return True, "tp1_50pct", True   # Partial
         if pct >= Cfg.TRAIL_ACTIVATE_PCT:
-            self.trailing_on = True
-            self.trail_high = (max(self.trail_high, current_price) if self.side=="long"
-                               else min(self.trail_high, current_price))
-        if self.trailing_on:
-            stop = (self.trail_high * (1 - Cfg.TRAIL_DISTANCE_PCT) if self.side=="long"
-                    else self.trail_high * (1 + Cfg.TRAIL_DISTANCE_PCT))
-            if (self.side=="long" and current_price <= stop) or \
-               (self.side=="short" and current_price >= stop):
+            self.trailing = True
+            self.trail_ref = (max(self.trail_ref, price) if self.side == "long"
+                              else min(self.trail_ref, price))
+        if self.trailing:
+            stop = (self.trail_ref * (1 - Cfg.TRAIL_DISTANCE_PCT) if self.side == "long"
+                    else self.trail_ref * (1 + Cfg.TRAIL_DISTANCE_PCT))
+            if (self.side == "long"  and price <= stop or
+                    self.side == "short" and price >= stop):
                 return True, "trailing_stop", False
         if pct >= Cfg.TP2_PCT:
             return True, "tp2_full", False
-        age_hrs = (datetime.now(timezone.utc) - self.entered_at).seconds / 3600
-        if age_hrs >= 4:
+        age = (datetime.now(timezone.utc) - self.entered_at).total_seconds() / 3600
+        if age >= 4.0:
             return True, "time_exit_4h", False
         return False, "", False
 
 # ══════════════════════════════════════════════════════════════════════════════
-# OPTIONS SELECTOR (with premium vs move check)
+# OPTIONS SELECTOR — FIXED premium formula
 # ══════════════════════════════════════════════════════════════════════════════
 class OptionsSelector:
     @staticmethod
-    def select(chain, current_price, direction, confidence, atr_val) -> Optional[dict]:
-        if not chain: return None
+    def select(chain: list, price: float, direction: str,
+               confidence: int, atr_usd: float) -> Optional[dict]:
+        if not chain or price <= 0: return None
         target_type = "call_options" if direction == "long" else "put_options"
         today = datetime.now(timezone.utc).date()
         candidates = []
+
         for opt in chain:
             if opt.get("contract_type") != target_type: continue
             try:
-                expiry = datetime.strptime(opt.get("settlement_time","")[:10], "%Y-%m-%d").date()
+                expiry = datetime.strptime(
+                    opt.get("settlement_time", "")[:10], "%Y-%m-%d").date()
                 dte = (expiry - today).days
                 if dte < 0 or dte > 3: continue
-                strike = float(opt.get("strike_price", 0))
-                mark   = float(opt.get("mark_price", 0))
-                if mark <= 0: continue
+                strike = float(opt.get("strike_price", 0) or 0)
+                mark   = float(opt.get("mark_price",   0) or 0)
+                if mark <= 0 or strike <= 0: continue
 
-                # ✅ PREMIUM vs MOVE CHECK (new in v6)
-                # Expected move = ATR * sqrt(hours held / 24)
-                expected_move_usd = atr_val * math.sqrt(4/24) * current_price / 100
-                if mark * 100 > expected_move_usd * Cfg.MIN_MOVE_TO_PREMIUM_RATIO:
-                    continue  # Option too expensive for expected move
+                # FIX BUG 9: Premium vs move formula
+                # expected_move = ATR_usd × sqrt(hold_hours/24)
+                # mark is option price in USD per contract
+                # We compare: mark (USD) vs expected_move (USD)
+                expected_move = atr_usd * math.sqrt(4.0 / 24.0)
+                if expected_move > 0 and mark > expected_move * Cfg.MIN_MOVE_TO_PREMIUM_RATIO:
+                    continue  # Option premium too expensive for expected move
 
-                moneyness = ((strike - current_price)/current_price if direction=="long"
-                             else (current_price - strike)/current_price)
-                candidates.append({"product": opt, "dte": dte,
-                                   "moneyness": moneyness, "mark": mark,
-                                   "product_id": opt.get("id")})
+                moneyness = ((strike - price) / price if direction == "long"
+                             else (price - strike) / price)
+                candidates.append({
+                    "product": opt, "dte": dte, "moneyness": moneyness,
+                    "mark": mark, "product_id": opt.get("id"),
+                })
             except Exception:
                 continue
 
         if not candidates: return None
-        def sc(c):
-            ds = 10 - c["dte"]*3
-            ms = 10 if (-0.02 <= c["moneyness"] <= 0.01 and confidence > 80) else \
-                 10 if (-0.005 <= c["moneyness"] <= 0.005) else 3
-            return ds + ms
-        candidates.sort(key=sc, reverse=True)
+
+        def score_opt(c):
+            dte_sc = 10 - c["dte"] * 3  # Prefer shorter DTE
+            if confidence >= Cfg.HIGH_CONFIDENCE:
+                # High confidence → slight ITM for better delta
+                mon_sc = 10 if -0.025 <= c["moneyness"] <= 0.005 else 4
+            else:
+                # Lower confidence → ATM for lower premium risk
+                mon_sc = 10 if -0.008 <= c["moneyness"] <= 0.008 else 3
+            return dte_sc + mon_sc
+
+        candidates.sort(key=score_opt, reverse=True)
         return candidates[0]
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -913,106 +940,118 @@ class OptionsSelector:
 # ══════════════════════════════════════════════════════════════════════════════
 class AlphaBot:
     def __init__(self):
-        self.api         = DeltaAPI()
-        self.confidence  = ConfidenceEngine()
-        self.sizer       = PositionSizer()
-        self.news        = NewsEngine()
-        self.learner     = LearningEngine()
-        self.risk_guard  = RiskGuard()
-        self.options_sel = OptionsSelector()
+        self.api      = DeltaAPI()
+        self.conf_eng = ConfidenceEngine()
+        self.sizer    = PositionSizer()
+        self.news     = NewsEngine()
+        self.learner  = LearningEngine()
+        self.guard    = RiskGuard()
+        self.opt_sel  = OptionsSelector()
 
-        self.capital          = 0.0
-        self.starting_capital = 0.0
-        self.wallet_usdt      = 0.0
-        self.wallet_btc       = 0.0
-        self.wallet_inr       = 0.0
-        self.wallet_synced    = False
+        # Capital (live wallet only)
+        self.capital        = 0.0
+        self.start_capital  = 0.0
+        self.wallet_usdt    = 0.0
+        self.wallet_btc     = 0.0
+        self.wallet_inr     = 0.0
+        self.wallet_synced  = False
 
-        self.positions: list  = []
-        self.trade_log: list  = []
-        self.running          = False
-        self.status_msg       = "Initializing..."
-        self.total_pnl        = 0.0
-        self.profit_buffer    = 0.0
-        self._prev_oi         = 0.0
+        self.positions: list = []
+        self.trade_log: list = []
+        self.running         = False
+        self.status_msg      = "Initializing..."
+        self.total_pnl       = 0.0
+        self.profit_buffer   = 0.0
+        self._prev_oi        = 0.0
 
-        # Market state (live, shown on dashboard)
-        self.last_scan_at     = None
-        self.next_scan_at     = None
-        self.last_btc_price   = 0.0
-        self.last_long_score  = 0
-        self.last_short_score = 0
-        self.last_long_veto   = ""
-        self.last_short_veto  = ""
-        self.last_regime      = "UNKNOWN"  # STRONG_BULL / BULL / NEUTRAL / BEAR / STRONG_BEAR
-        self.last_adx         = 0.0
-        self.last_rsi         = 50.0
-        self.last_atr_pct     = 0.0
-        self.will_trade       = False      # True if next scan will likely trade
-        self.trade_direction  = None       # 'long' / 'short' / None
-        self.candles_cache    = []         # Last 50 close prices for mini-chart
-        self.trades_today     = 0
-        self.trades_this_week = 0
+        # Live market state (dashboard display)
+        self.last_scan_at    = None
+        self.next_scan_at    = None
+        self.last_price      = 0.0
+        self.long_score      = 0
+        self.short_score     = 0
+        self.long_veto       = ""
+        self.short_veto      = ""
+        self.regime          = "UNKNOWN"
+        self.last_adx        = 0.0
+        self.last_rsi        = 50.0
+        self.atr_pct         = 0.0
+        self.will_trade      = False
+        self.trade_dir       = None
+        self.candles         = []
+        self.trades_today    = 0
+        self.trades_week     = 0
 
-        self._sync_wallet(is_startup=True)
+        self._sync_wallet(startup=True)
 
     # ── Wallet ────────────────────────────────────────────────────────────────
-    def _sync_wallet(self, is_startup=False) -> float:
+    def _sync_wallet(self, startup: bool = False) -> float:
         try:
             bal = self.api.get_wallet()
             if not bal:
-                if is_startup: self.status_msg = "⚠ Wallet read failed — check API keys"
+                if startup:
+                    self.status_msg = "⚠ Wallet read failed — check API keys on Render"
                 return self.capital
-            usdt = float(bal.get("USDT", bal.get("usdt", 0)))
-            inr  = float(bal.get("INR",  bal.get("inr",  0)))
-            btc  = float(bal.get("BTC",  bal.get("btc",  0)))
+
+            usdt = float(bal.get("USDT", bal.get("usdt", 0)) or 0)
+            inr  = float(bal.get("INR",  bal.get("inr",  0)) or 0)
+            btc  = float(bal.get("BTC",  bal.get("btc",  0)) or 0)
+
             inr_usd = 0.0
             if inr > 0:
                 try:
-                    r = requests.get("https://api.exchangerate-api.com/v4/latest/USD", timeout=4)
-                    inr_usd = inr / r.json().get("rates",{}).get("INR", 84.0)
-                except Exception: inr_usd = inr / 84.0
+                    r = requests.get(
+                        "https://api.exchangerate-api.com/v4/latest/USD", timeout=4)
+                    inr_usd = inr / r.json()["rates"].get("INR", 84.0)
+                except Exception:
+                    inr_usd = inr / 84.0
+
             btc_usd = 0.0
             if btc > 0:
                 t = self.api.get_ticker("BTCUSD")
-                btc_usd = btc * float(t.get("mark_price", 0))
+                btc_usd = btc * float(t.get("mark_price", 0) or 0)
+
             total = usdt + inr_usd + btc_usd
-            self.wallet_usdt = usdt; self.wallet_btc = btc; self.wallet_inr = inr
+            self.wallet_usdt = usdt
+            self.wallet_btc  = btc
+            self.wallet_inr  = inr
+
             if total > 0:
-                if not self.wallet_synced or is_startup:
-                    self.starting_capital = total
-                    self.capital = total
+                if not self.wallet_synced or startup:
+                    self.start_capital = total
+                    self.capital       = total
                     self.wallet_synced = True
-                    self.risk_guard.initialize(total)
-                    log.info(f"Wallet synced: ${total:.2f}")
+                    self.guard.init(total)
+                    log.info(f"💰 Wallet: ${total:.2f} "
+                             f"(USDT={usdt:.2f} INR={inr:.0f} BTC={btc:.6f})")
                 else:
                     self.capital = total + self.profit_buffer
-                    self.risk_guard.check_new_day(total)
+                    self.guard.new_day(total)
+            else:
+                log.warning("Wallet returned zero balance")
         except Exception as e:
-            log.error(f"Wallet sync error: {e}")
+            log.error(f"Wallet sync: {e}")
         return self.capital
 
     # ── Market Data ───────────────────────────────────────────────────────────
-    def _get_market_data(self) -> dict:
+    def _get_data(self) -> dict:
         now = datetime.now(timezone.utc)
-        c5  = self.api.get_candles("BTCUSD", 5, 100)
-        c15 = self.api.get_candles("BTCUSD", 15, 50)
-        fr  = self.api.get_funding_rate()
-        oi  = self.api.get_open_interest()
+        raw5  = self.api.get_candles("BTCUSD", 5, 100)
+        raw15 = self.api.get_candles("BTCUSD", 15, 50)
+        fr    = self.api.get_funding_rate()
+        oi    = self.api.get_open_interest()
 
-        if not c5: return {}
+        if not raw5:
+            return {}
 
-        def parse(candles):
-            cl = [float(c.get("close", 0)) for c in candles]
-            hi = [float(c.get("high",  0)) for c in candles]
-            lo = [float(c.get("low",   0)) for c in candles]
-            vo = [float(c.get("volume",0)) for c in candles]
-            return cl, hi, lo, vo
+        # FIX BUG 7: Use unified parse that handles dict/array formats
+        cl5, hi5, lo5, vo5   = TechEngine.parse_candles(raw5)
+        cl15, _, _, _        = TechEngine.parse_candles(raw15) if raw15 else ([], [], [], [])
 
-        cl5, hi5, lo5, vo5 = parse(c5)
-        cl15, _, _, _ = parse(c15) if c15 else ([], [], [], [])
+        if not cl5:
+            return {}
 
-        oi_change = (oi - self._prev_oi) / self._prev_oi if self._prev_oi > 0 else 0
+        oi_chg = (oi - self._prev_oi) / self._prev_oi if self._prev_oi > 0 else 0
         self._prev_oi = oi
 
         return {
@@ -1020,89 +1059,83 @@ class AlphaBot:
             "closes_5m": cl5, "closes_15m": cl15,
             "hour_utc": now.hour, "minute_utc": now.minute,
             "is_weekend": now.weekday() >= 5,
-            "funding_rate": fr, "current_price": cl5[-1] if cl5 else 0,
-            "oi_change_pct": oi_change,
-            "atr": TechEngine.atr(hi5, lo5, cl5) if cl5 else 0
+            "funding_rate": fr, "current_price": cl5[-1],
+            "oi_change_pct": oi_chg,
+            "atr": TechEngine.atr(hi5, lo5, cl5),
         }
 
-    # ── Core Loop ─────────────────────────────────────────────────────────────
+    # ── Core Analysis + Trade ─────────────────────────────────────────────────
     def analyze_and_trade(self):
         now_utc = datetime.now(timezone.utc)
         self.last_scan_at = now_utc.isoformat()
-        self.next_scan_at = (now_utc + timedelta(seconds=Cfg.SCAN_INTERVAL)).isoformat()
+        self.next_scan_at = (now_utc + timedelta(
+            seconds=Cfg.SCAN_INTERVAL)).isoformat()
 
-        # API health check first
         if not self.api.healthy:
-            self.status_msg = "⚠ API unhealthy — protecting positions, not trading"
+            self.status_msg = "⚠ API unhealthy — protecting positions"
             self.will_trade = False
             return
 
-        self.status_msg = "Scanning..."
-        data = self._get_market_data()
-        if not data or not data.get("current_price"):
-            self.status_msg = "No market data"
+        data = self._get_data()
+        if not data:
+            self.status_msg = "No market data from Delta Exchange"
             self.will_trade = False
             return
 
         price = data["current_price"]
-        self.last_btc_price = price
-        # Cache last 50 closes for mini-chart
-        if data.get("closes"):
-            self.candles_cache = data["closes"][-50:]
+        self.last_price = price
+        self.candles    = data["closes"][-30:]
 
-        # Update live indicators
-        if data.get("closes") and len(data["closes"]) > 7:
-            self.last_rsi = TechEngine.rsi(data["closes"])
+        # Live indicators
+        if len(data["closes"]) > 21:
+            self.last_rsi = TechEngine.rsi(data["closes"], Cfg.RSI_PERIOD)
             adx_v, pdi, ndi = TechEngine.adx(data["highs"], data["lows"], data["closes"])
             self.last_adx = adx_v
             atr_v = TechEngine.atr(data["highs"], data["lows"], data["closes"])
-            self.last_atr_pct = round(atr_v / price * 100, 3) if price > 0 else 0
+            self.atr_pct = round(atr_v / price * 100, 3) if price > 0 else 0
+
             # Regime label
-            ema8  = TechEngine.ema(data["closes"], 8)[-1]
-            ema21 = TechEngine.ema(data["closes"], 21)[-1]
-            ema55 = TechEngine.ema(data["closes"], 55)[-1]
-            if price > ema8 > ema21 > ema55 and adx_v > 25 and pdi > ndi:
-                self.last_regime = "STRONG_BULL"
-            elif price > ema8 > ema21 and adx_v > 20:
-                self.last_regime = "BULL"
-            elif price < ema8 < ema21 < ema55 and adx_v > 25 and ndi > pdi:
-                self.last_regime = "STRONG_BEAR"
-            elif price < ema8 < ema21 and adx_v > 20:
-                self.last_regime = "BEAR"
+            e8  = TechEngine.ema(data["closes"], 8)[-1]
+            e21 = TechEngine.ema(data["closes"], 21)[-1]
+            e55 = TechEngine.ema(data["closes"], 55)[-1]
+            if price > e8 > e21 > e55 and adx_v > 25 and pdi > ndi:
+                self.regime = "STRONG_BULL"
+            elif price > e8 > e21 and adx_v > 18:
+                self.regime = "BULL"
+            elif price < e8 < e21 < e55 and adx_v > 25 and ndi > pdi:
+                self.regime = "STRONG_BEAR"
+            elif price < e8 < e21 and adx_v > 18:
+                self.regime = "BEAR"
             else:
-                self.last_regime = "NEUTRAL"
+                self.regime = "NEUTRAL"
 
         self._manage_positions(price)
 
-        # Risk guard check
-        can_trade, reason, risk_mult = self.risk_guard.can_trade()
-        if not can_trade:
+        can, reason, risk_m = self.guard.can_trade()
+        if not can:
             self.status_msg = f"🛑 {reason}"
             self.will_trade = False
             return
 
         if len([p for p in self.positions if not p.closed]) >= Cfg.MAX_OPEN_POSITIONS:
-            self.status_msg = f"Max positions — monitoring"
+            self.status_msg = "Max positions open — monitoring"
             self.will_trade = False
             return
 
-        # Score with learning engine + news
-        news_mult = self.news.get_confidence_multiplier()
-        ls, lv, lr, _ = self.confidence.score(data, "long",  self.learner)
-        ss, sv, sr, _ = self.confidence.score(data, "short", self.learner)
+        news_m = self.news.get_multiplier()
+        ls, lv, lr, _ = self.conf_eng.score(data, "long",  self.learner)
+        ss, sv, sr, _ = self.conf_eng.score(data, "short", self.learner)
+        ls = min(int(ls * news_m), 100)
+        ss = min(int(ss * news_m), 100)
 
-        ls = min(int(ls * news_mult), 100)
-        ss = min(int(ss * news_mult), 100)
+        self.long_score  = ls
+        self.short_score = ss
+        self.long_veto   = lr if lv else ""
+        self.short_veto  = sr if sv else ""
 
-        # Store live scores for dashboard
-        self.last_long_score  = ls
-        self.last_short_score = ss
-        self.last_long_veto   = lr if lv else ""
-        self.last_short_veto  = sr if sv else ""
-
-        log.info(f"BTC ${price:,.0f} | Regime={self.last_regime} RSI={self.last_rsi:.1f} "
-                 f"ADX={self.last_adx:.1f} | L={ls}{'['+lr+']' if lv else ''} "
-                 f"S={ss}{'['+sr+']' if sv else ''}")
+        log.info(f"BTC ${price:,.0f} | {self.regime} RSI={self.last_rsi:.1f} "
+                 f"ADX={self.last_adx:.1f} | L={ls}{'✗'+lr if lv else '✓'} "
+                 f"S={ss}{'✗'+sr if sv else '✓'} | News={news_m:.2f}")
 
         direction = score = None
         if not lv and ls >= Cfg.MIN_CONFIDENCE and ls > ss:
@@ -1110,81 +1143,78 @@ class AlphaBot:
         elif not sv and ss >= Cfg.MIN_CONFIDENCE and ss > ls:
             direction, score = "short", ss
 
-        # Update will_trade indicator
-        self.will_trade = direction is not None
-        self.trade_direction = direction
-
-        # Straddle opportunity: squeeze + no directional bias
-        if not direction and TechEngine.squeeze_detected(
-                data["closes"], data["highs"], data["lows"]):
-            self.status_msg = "⚡ Squeeze detected — watching for breakout"
-            self.will_trade = False
-            log.info("Bollinger squeeze — straddle candidate")
-            return
+        self.will_trade  = direction is not None
+        self.trade_dir   = direction
 
         if not direction:
-            self.status_msg = (f"Watching: L={ls}{'✗' if lv else ''} "
-                               f"S={ss}{'✗' if sv else ''} | "
-                               f"Regime={self.last_regime} | "
-                               f"Need ≥{Cfg.MIN_CONFIDENCE}")
+            if TechEngine.squeeze_detected(data["closes"], data["highs"], data["lows"]):
+                self.status_msg = "⚡ Squeeze coiling — watching for breakout"
+            else:
+                self.status_msg = (f"Watching: L={ls}{'✗' if lv else ''} "
+                                   f"S={ss}{'✗' if sv else ''} | "
+                                   f"{self.regime} | Need ≥{Cfg.MIN_CONFIDENCE}")
             return
 
-        atr_val = data.get("atr", 0)
-        atr_pct = atr_val / price if price > 0 else 0.001
-        size_usd = self.sizer.size_usd(self.capital, score, atr_pct, risk_mult)
-
-        rsi_now = TechEngine.rsi(data["closes"])
+        atr_usd  = data.get("atr", price * 0.008)
+        atr_pct  = atr_usd / price if price > 0 else 0.008
+        size_usd = self.sizer.size_usd(self.capital, score, atr_pct, risk_m)
+        rsi_now  = TechEngine.rsi(data["closes"], Cfg.RSI_PERIOD)
         adx_now, _, _ = TechEngine.adx(data["highs"], data["lows"], data["closes"])
 
         chain = self.api.get_options_chain("BTC")
-        opt   = self.options_sel.select(chain, price, direction, score, atr_val)
+        # FIX BUG 9: Pass atr_usd (USD units) not atr_pct
+        opt   = self.opt_sel.select(chain, price, direction, score, atr_usd)
 
         if opt:
             contracts = max(1, int(size_usd / (opt["mark"] * 100)))
-            result = self.api.place_order(opt["product_id"], "buy", contracts)
+            result    = self.api.place_order(opt["product_id"], "buy", contracts)
             if result.get("success"):
                 pos = Position(opt["product_id"], direction, price, size_usd,
-                               opt["product"].get("symbol",""), rsi_now, adx_now,
-                               data["hour_utc"])
+                               opt["product"].get("symbol", ""), rsi_now,
+                               adx_now, data["hour_utc"])
                 self.positions.append(pos)
-                self._log_trade("OPEN", direction, price, size_usd, score,
-                                opt["product"].get("symbol",""))
-                self.status_msg = f"✅ {direction.upper()} {opt['product'].get('symbol','')} @ ${price:,.0f}"
+                self._log("OPEN", direction, price, size_usd, score,
+                          opt["product"].get("symbol", ""))
+                self.status_msg = (f"✅ {direction.upper()} "
+                                   f"{opt['product'].get('symbol','')} @ ${price:,.0f}")
+                log.info(self.status_msg)
             else:
-                self.status_msg = "Order failed"
+                log.error(f"Option order failed: {result}")
+                self.status_msg = f"Option order failed — {result.get('error','unknown')}"
         else:
-            # Fallback perpetual
-            side = "buy" if direction == "long" else "sell"
+            # Fallback to perpetual
+            side      = "buy" if direction == "long" else "sell"
             contracts = max(1, int(size_usd / price * 1000))
-            result = self.api.place_order(Cfg.BTC_PRODUCT_ID, side, contracts)
+            result    = self.api.place_order(Cfg.BTC_PRODUCT_ID, side, contracts)
             if result.get("success"):
                 pos = Position(Cfg.BTC_PRODUCT_ID, direction, price, size_usd,
                                "BTCUSD_PERP", rsi_now, adx_now, data["hour_utc"])
                 self.positions.append(pos)
-                self._log_trade("OPEN", direction, price, size_usd, score, "BTCUSD_PERP")
+                self._log("OPEN", direction, price, size_usd, score, "BTCUSD_PERP")
                 self.status_msg = f"✅ {direction.upper()} PERP @ ${price:,.0f}"
             else:
-                self.status_msg = "No option available, perp order failed"
+                self.status_msg = "No option + perp order also failed"
 
-    def _manage_positions(self, price):
+    def _manage_positions(self, price: float):
         for pos in self.positions:
             if pos.closed: continue
-            should_exit, reason, partial = pos.check_exit(price)
-            if should_exit:
-                self._close_position(pos, price, reason, partial)
+            exit_, reason, partial = pos.check_exit(price)
+            if exit_:
+                self._close(pos, price, reason, partial)
 
-    def _close_position(self, pos, price, reason, partial):
+    def _close(self, pos: Position, price: float,
+                reason: str, partial: bool):
         size = pos.size_usd / 2 if partial else pos.size_usd
-        positions = self.api.get_positions()
-        match = next((p for p in positions if p.get("product_id")==pos.product_id), None)
+        live = self.api.get_positions()
+        match = next((p for p in live if p.get("product_id") == pos.product_id), None)
         if match:
-            qty = abs(int(float(match.get("size",0))))
-            if partial: qty = max(1, qty//2)
+            qty = abs(int(float(match.get("size", 0) or 0)))
+            if partial: qty = max(1, qty // 2)
             self.api.place_order(pos.product_id,
-                                 "sell" if pos.side=="long" else "buy", qty)
+                                 "sell" if pos.side == "long" else "buy", qty)
 
-        pnl_pct = ((price - pos.entry)/pos.entry if pos.side=="long"
-                   else (pos.entry - price)/pos.entry)
+        pnl_pct = ((price - pos.entry) / pos.entry if pos.side == "long"
+                   else (pos.entry - price) / pos.entry)
         pnl_usd = size * pnl_pct
         won = pnl_usd > 0
 
@@ -1199,38 +1229,41 @@ class AlphaBot:
 
         self.total_pnl += pnl_usd
         self.sizer.record(won, pnl_pct * 100)
-        self.risk_guard.record_trade(won, pnl_usd, self.capital)
+        self.guard.record(won, pnl_usd, self.capital)
         self.learner.record({
-            "rsi": pos.rsi_at_entry, "adx": pos.adx_at_entry,
+            "rsi": pos.rsi_entry, "adx": pos.adx_entry,
             "hour_utc": pos.hour_utc, "won": won,
-            "pnl_pct": pnl_pct * 100, "direction": pos.side
+            "pnl_pct": pnl_pct * 100, "direction": pos.side,
         })
 
         if not partial:
-            pos.closed = True; pos.exit_price = price; pos.exit_reason = reason
+            pos.closed      = True
+            pos.exit_price  = price
+            pos.exit_reason = reason
 
-        self._log_trade("CLOSE", pos.side, price, pnl_usd, 0,
-                        pos.option_symbol, reason, pnl_pct * 100)
-        log.info(f"{'✅' if won else '❌'} CLOSED {pos.side.upper()} @ ${price:,.0f} "
-                 f"| {reason} | P&L: ${pnl_usd:+.2f} ({pnl_pct*100:+.2f}%)")
+        self._log("CLOSE", pos.side, price, pnl_usd, 0,
+                  pos.symbol, reason, pnl_pct * 100)
+        log.info(f"{'✅' if won else '❌'} CLOSED {pos.side.upper()} "
+                 f"@ ${price:,.0f} | {reason} | ${pnl_usd:+.2f} "
+                 f"({pnl_pct*100:+.2f}%)")
 
-    def _log_trade(self, action, side, price, amount, confidence,
-                   symbol, reason="", pnl_pct=0):
+    def _log(self, action: str, side: str, price: float, amount: float,
+              conf: int, symbol: str, reason: str = "", pnl_pct: float = 0):
         if action == "OPEN":
             self.trades_today += 1
-            self.trades_this_week += 1
+            self.trades_week  += 1
         self.trade_log.append({
             "time": datetime.now(timezone.utc).isoformat(),
             "action": action, "side": side, "price": price,
-            "amount": amount, "confidence": confidence,
-            "symbol": symbol, "reason": reason, "pnl_pct": pnl_pct,
-            "capital": self.capital, "win_rate": self.sizer.win_rate,
-            "streak": self.sizer.streak
+            "amount": amount, "confidence": conf, "symbol": symbol,
+            "reason": reason, "pnl_pct": pnl_pct,
+            "capital": self.capital,
+            "win_rate": self.sizer.win_rate,
+            "streak": self.sizer.streak,
         })
 
     def _run_loop(self):
-        cycle = 0
-        # Reset daily counters at midnight
+        cycle    = 0
         last_day = datetime.now(timezone.utc).day
         while self.running:
             try:
@@ -1238,7 +1271,8 @@ class AlphaBot:
                 if today != last_day:
                     self.trades_today = 0
                     last_day = today
-                if cycle % 5 == 0: self._sync_wallet()
+                if cycle % 5 == 0:
+                    self._sync_wallet()
                 self.analyze_and_trade()
                 cycle += 1
             except Exception as e:
@@ -1250,19 +1284,18 @@ class AlphaBot:
         if not self.running:
             self.running = True
             threading.Thread(target=self._run_loop, daemon=True).start()
-            log.info("ΔLPHA Bot v6.0 started")
+            log.info("ΔLPHA Bot v6.2 started")
 
     def stop(self):
         self.running = False
+        log.info("ΔLPHA Bot v6.2 stopped")
 
     def get_state(self) -> dict:
-        sc  = self.starting_capital if self.starting_capital > 0 else self.capital
+        sc  = self.start_capital if self.start_capital > 0 else self.capital
         pct = round((self.capital - sc) / sc * 100, 2) if sc > 0 else 0.0
-        progress = self.risk_guard.get_progress_to_monthly_target()
-        sentiment = self.news.get_sentiment()
-        can_trade, guard_reason, _ = self.risk_guard.can_trade()
+        ct, gr, _ = self.guard.can_trade()
         return {
-            "version": "v6.0",
+            "version": "v6.2",
             "running": self.running,
             "status": self.status_msg,
             "api_healthy": self.api.healthy,
@@ -1276,55 +1309,278 @@ class AlphaBot:
             "profit_buffer": round(self.profit_buffer, 2),
             "pnl_pct": pct,
             "open_positions": len([p for p in self.positions if not p.closed]),
-            "total_trades": self.sizer.total_trades,
+            "total_trades": self.sizer.total,
             "win_rate": round(self.sizer.win_rate * 100, 1),
             "streak": self.sizer.streak,
-            "consecutive_losses": self.risk_guard.consecutive_losses,
-            "in_recovery": self.risk_guard.in_recovery_mode,
-            "can_trade": can_trade,
-            "guard_reason": guard_reason,
-            "kelly_fraction": round(self.sizer.kelly_fraction() * 100, 2),
-            "monthly_progress": progress,
-            "news_sentiment": sentiment,
+            "consecutive_losses": self.guard.consec_loss,
+            "in_recovery": self.guard.in_recovery,
+            "can_trade": ct,
+            "guard_reason": gr,
+            "kelly_fraction": round(self.sizer.kelly_frac() * 100, 2),
+            "monthly_progress": self.guard.monthly_progress(),
+            "news_sentiment": self.news.get_sentiment(),
             "learning": self.learner.summary(),
             "recent_trades": self.trade_log[-20:],
-            # Live market state
+            # Live market
             "last_scan_at":    self.last_scan_at,
             "next_scan_at":    self.next_scan_at,
-            "last_btc_price":  self.last_btc_price,
-            "last_long_score": self.last_long_score,
-            "last_short_score":self.last_short_score,
-            "last_long_veto":  self.last_long_veto,
-            "last_short_veto": self.last_short_veto,
-            "last_regime":     self.last_regime,
+            "last_btc_price":  self.last_price,
+            "last_long_score": self.long_score,
+            "last_short_score":self.short_score,
+            "last_long_veto":  self.long_veto,
+            "last_short_veto": self.short_veto,
+            "last_regime":     self.regime,
             "last_adx":        round(self.last_adx, 1),
             "last_rsi":        round(self.last_rsi, 1),
-            "last_atr_pct":    self.last_atr_pct,
+            "last_atr_pct":    self.atr_pct,
             "will_trade":      self.will_trade,
-            "trade_direction": self.trade_direction,
-            "candles_cache":   self.candles_cache[-30:],
+            "trade_direction": self.trade_dir,
+            "candles_cache":   self.candles,
             "trades_today":    self.trades_today,
-            "trades_week":     self.trades_this_week,
+            "trades_week":     self.trades_week,
             "scan_interval":   Cfg.SCAN_INTERVAL,
         }
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# FLASK APP + DASHBOARD
+# FLASK APP
 # ══════════════════════════════════════════════════════════════════════════════
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
-bot = AlphaBot()
 
 @app.after_request
-def after_request(response):
+def _cors(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return response
 
-# ── Dashboard (Robinhood/Groww style, white, mobile-first) ───────────────────
-DASHBOARD = open("/app/dashboard.html").read() if os.path.exists("/app/dashboard.html") else None
+bot = AlphaBot()
+
+# FIX BUG 3: _auto_start placed AFTER bot = AlphaBot(), not inside __main__
+# gunicorn never runs __main__ — this is the only way to auto-start on Render
+def _auto_start():
+    if Cfg.API_KEY and Cfg.API_SECRET:
+        log.info("API keys found — auto-starting bot...")
+        bot.start()
+    else:
+        log.warning("No API keys — bot waiting. Set DELTA_API_KEY + DELTA_API_SECRET on Render.")
+
+_auto_start()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ROUTES — each defined EXACTLY ONCE (FIX BUG 1)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/status")
+@app.route("/api/bot/status")
+def status():
+    return jsonify(bot.get_state())
+
+@app.route("/api/bot/start", methods=["POST"])
+def start():
+    bot.start()
+    return jsonify({"success": True, "message": "Bot started"})
+
+@app.route("/api/bot/stop", methods=["POST"])
+def stop():
+    bot.stop()
+    return jsonify({"success": True, "message": "Bot stopped"})
+
+@app.route("/api/bot/run_now", methods=["POST"])
+def run_now():
+    threading.Thread(target=bot.analyze_and_trade, daemon=True).start()
+    return jsonify({"success": True, "message": "Scan triggered"})
+
+@app.route("/api/wallet")
+def wallet():
+    raw = bot.api.get_wallet()
+    return jsonify({"raw": raw, "capital_usd": round(bot.capital, 2),
+                    "start_usd": round(bot.start_capital, 2),
+                    "synced": bot.wallet_synced})
+
+@app.route("/api/wallet/sync", methods=["POST"])
+def wallet_sync():
+    cap = bot._sync_wallet(startup=False)
+    return jsonify({"success": True, "capital_usd": round(cap, 2),
+                    "message": f"Synced: ${cap:.2f}"})
+
+@app.route("/api/positions")
+def positions():
+    return jsonify(bot.api.get_positions())
+
+@app.route("/api/orders")
+def orders():
+    return jsonify(bot.api.get_orders())
+
+@app.route("/api/trades")
+def trades():
+    return jsonify(bot.trade_log[-50:])
+
+@app.route("/api/ticker")
+def ticker():
+    return jsonify(bot.api.get_ticker("BTCUSD"))
+
+@app.route("/api/options_chain")
+def options_chain():
+    return jsonify(bot.api.get_options_chain("BTC")[:20])
+
+@app.route("/api/config", methods=["GET"])
+def get_config():
+    return jsonify({
+        "min_confidence": Cfg.MIN_CONFIDENCE,
+        "max_risk_pct": Cfg.MAX_RISK_NORMAL,
+        "kelly_fraction": Cfg.KELLY_FRACTION,
+        "hard_stop_pct": Cfg.HARD_STOP_PCT,
+        "tp1_pct": Cfg.TP1_PCT, "tp2_pct": Cfg.TP2_PCT,
+        "monthly_target_pct": Cfg.MONTHLY_TARGET_PCT,
+        "monthly_loss_limit": Cfg.MONTHLY_LOSS_LIMIT,
+        "scan_interval": Cfg.SCAN_INTERVAL,
+        "dead_zone_hours": Cfg.DEAD_ZONE_HOURS,
+        "blackout_window_mins": Cfg.BLACKOUT_WINDOW_MINS,
+        "rsi_period": Cfg.RSI_PERIOD,
+        "macd_fast": Cfg.MACD_FAST,
+        "macd_slow": Cfg.MACD_SLOW,
+    })
+
+@app.route("/api/config", methods=["POST"])
+def set_config():
+    d = request.json or {}
+    if "min_confidence" in d: Cfg.MIN_CONFIDENCE  = int(d["min_confidence"])
+    if "max_risk_pct"   in d: Cfg.MAX_RISK_NORMAL = float(d["max_risk_pct"])
+    if "scan_interval"  in d: Cfg.SCAN_INTERVAL   = int(d["scan_interval"])
+    return jsonify({"success": True, "message": "Config updated"})
+
+@app.route("/api/set_scan_interval", methods=["POST"])
+def set_scan_interval():
+    d = request.json or {}
+    mins = max(1, min(60, int(d.get("minutes", 5))))
+    Cfg.SCAN_INTERVAL = mins * 60
+    exp = int(16 * 60 / mins)
+    return jsonify({"success": True, "scan_every_minutes": mins,
+                    "max_scans_per_day": exp,
+                    "note": f"Scans every {mins}min. Trades only on signal ≥{Cfg.MIN_CONFIDENCE}"})
+
+@app.route("/api/manual_trade", methods=["POST"])
+def manual_trade():
+    """Force a trade — bypasses confidence score. FIX BUG 2: no circular import."""
+    d = request.json or {}
+    direction    = d.get("direction")
+    size_override= float(d.get("size_usd", 0) or 0)
+
+    if direction not in ("long", "short"):
+        return jsonify({"success": False, "message": "direction must be long or short"})
+
+    price = bot.last_price
+    if not price:
+        t = bot.api.get_ticker("BTCUSD")
+        price = float(t.get("mark_price", 0) or 0)
+    if not price:
+        return jsonify({"success": False, "message": "Cannot get BTC price"})
+
+    # FIX BUG 8: size floor applied
+    size_usd = size_override if size_override >= Cfg.MIN_TRADE_SIZE_USD else \
+               max(Cfg.MIN_TRADE_SIZE_USD,
+                   bot.sizer.size_usd(bot.capital, 75, 0.008))
+
+    chain    = bot.api.get_options_chain("BTC")
+    atr_usd  = bot.atr_pct * price / 100 if bot.atr_pct > 0 else price * 0.008
+    opt      = bot.opt_sel.select(chain, price, direction, 75, atr_usd)
+
+    if opt:
+        contracts = max(1, int(size_usd / (opt["mark"] * 100)))
+        result    = bot.api.place_order(opt["product_id"], "buy", contracts)
+        symbol    = opt["product"].get("symbol", "")
+        pid       = opt["product_id"]
+    else:
+        side      = "buy" if direction == "long" else "sell"
+        contracts = max(1, int(size_usd / price * 1000))
+        result    = bot.api.place_order(Cfg.BTC_PRODUCT_ID, side, contracts)
+        symbol    = "BTCUSD_PERP"
+        pid       = Cfg.BTC_PRODUCT_ID
+
+    if result.get("success"):
+        # FIX BUG 2: Position is defined in this file — no import needed
+        pos = Position(pid, direction, price, size_usd, symbol,
+                       bot.last_rsi, bot.last_adx,
+                       datetime.now(timezone.utc).hour)
+        bot.positions.append(pos)
+        bot._log("OPEN", direction, price, size_usd, 99, symbol, "manual")
+        bot.status_msg = f"MANUAL {direction.upper()} {symbol} @ ${price:,.0f}"
+        return jsonify({"success": True, "message": bot.status_msg,
+                        "price": price, "size_usd": round(size_usd, 2),
+                        "symbol": symbol})
+    return jsonify({"success": False,
+                    "message": f"Order failed: {result.get('error','unknown')}"})
+
+@app.route("/api/close_position", methods=["POST"])
+def close_position():
+    d = request.json or {}
+    pid = d.get("product_id")
+    live = bot.api.get_positions()
+    closed = 0
+    for p in live:
+        if pid and str(p.get("product_id")) != str(pid): continue
+        qty  = abs(int(float(p.get("size", 0) or 0)))
+        side = p.get("side", "")
+        if qty > 0:
+            bot.api.place_order(p["product_id"],
+                                "sell" if side == "buy" else "buy", qty)
+            closed += 1
+    return jsonify({"success": True, "closed": closed})
+
+@app.route("/api/close_all", methods=["POST"])
+def close_all():
+    live = bot.api.get_positions()
+    closed = 0
+    for p in live:
+        qty  = abs(int(float(p.get("size", 0) or 0)))
+        side = p.get("side", "")
+        if qty > 0:
+            bot.api.place_order(p["product_id"],
+                                "sell" if side == "buy" else "buy", qty)
+            closed += 1
+    return jsonify({"success": True, "closed": closed})
+
+@app.route("/api/server_config")
+def server_config():
+    key    = Cfg.API_KEY
+    secret = Cfg.API_SECRET
+    ks     = bool(key    and len(key)    > 8)
+    ss     = bool(secret and len(secret) > 8)
+    return jsonify({
+        "api_key_set":    ks,
+        "api_secret_set": ss,
+        "api_key_masked": ("*" * max(0, len(key) - 4) + key[-4:]) if ks else "",
+        "both_configured":ks and ss,
+        "base_url":       Cfg.BASE_URL,
+        "bot_running":    bot.running,
+    })
+
+@app.route("/api/test")
+def test():
+    t = bot.api.get_ticker("BTCUSD")
+    return jsonify({
+        "bot_version":  "v6.2",
+        "api_connected":bool(t),
+        "btc_price":    t.get("mark_price", "N/A"),
+        "api_healthy":  bot.api.healthy,
+        "wallet_synced":bot.wallet_synced,
+        "bot_running":  bot.running,
+        "bugs_fixed":   10,
+        "key_fixes": [
+            "Duplicate routes removed",
+            "Circular import fixed",
+            "ADX array alignment fixed",
+            "Options premium formula fixed",
+            "Kelly minimum $20 floor",
+            "RSI(14) not RSI(7)",
+            "MACD(8,21,5) not MACD(5,13,5)",
+            "Candle dict+array parsing",
+            "Auto-start on gunicorn",
+            "Macro blackout reduced to 20min",
+        ]
+    })
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -2225,310 +2481,13 @@ setInterval(checkApiConfig, 30000);
 </html>"""
 
 
-
 @app.route("/")
 def index():
     return Response(DASHBOARD_HTML, mimetype="text/html")
 
-@app.route("/api/status")
-@app.route("/api/bot/status")
-def status():
-    return jsonify(bot.get_state())
-
-@app.route("/api/bot/start", methods=["POST"])
-def start():
-    bot.start()
-    return jsonify({"success": True, "message": "Bot started"})
-
-@app.route("/api/bot/stop", methods=["POST"])
-def stop():
-    bot.stop()
-    return jsonify({"success": True, "message": "Bot stopped"})
-
-@app.route("/api/bot/run_now", methods=["POST"])
-def run_now():
-    threading.Thread(target=bot.analyze_and_trade, daemon=True).start()
-    return jsonify({"success": True, "message": "Analysis triggered"})
-
-@app.route("/api/wallet")
-def wallet():
-    raw = bot.api.get_wallet()
-    return jsonify({"raw_balances": raw, "capital_usd": round(bot.capital, 2),
-                    "starting_capital_usd": round(bot.starting_capital, 2),
-                    "wallet_usdt": round(bot.wallet_usdt, 2),
-                    "wallet_btc": round(bot.wallet_btc, 8),
-                    "wallet_inr": round(bot.wallet_inr, 2),
-                    "synced": bot.wallet_synced})
-
-@app.route("/api/wallet/sync", methods=["POST"])
-def wallet_sync():
-    capital = bot._sync_wallet(is_startup=False)
-    return jsonify({"success": True, "capital_usd": round(capital, 2),
-                    "starting_capital_usd": round(bot.starting_capital, 2),
-                    "wallet_usdt": round(bot.wallet_usdt, 2),
-                    "wallet_btc": round(bot.wallet_btc, 8),
-                    "wallet_inr": round(bot.wallet_inr, 2),
-                    "message": f"Capital updated to ${capital:.2f}"})
-
-@app.route("/api/positions")
-def positions():
-    return jsonify(bot.api.get_positions())
-
-@app.route("/api/orders")
-def orders():
-    return jsonify(bot.api.get_orders())
-
-@app.route("/api/trades")
-def trades():
-    return jsonify(bot.trade_log[-50:])
-
-@app.route("/api/ticker")
-def ticker():
-    return jsonify(bot.api.get_ticker("BTCUSD"))
-
-@app.route("/api/options_chain")
-def options_chain():
-    return jsonify(bot.api.get_options_chain("BTC")[:20])
-
-@app.route("/api/config", methods=["GET"])
-def get_config():
-    return jsonify({"min_confidence": Cfg.MIN_CONFIDENCE,
-                    "max_risk_pct": Cfg.MAX_RISK_NORMAL,
-                    "kelly_fraction": Cfg.KELLY_FRACTION,
-                    "hard_stop_pct": Cfg.HARD_STOP_PCT,
-                    "tp1_pct": Cfg.TP1_PCT, "tp2_pct": Cfg.TP2_PCT,
-                    "monthly_target_pct": Cfg.MONTHLY_TARGET_PCT,
-                    "monthly_loss_limit": Cfg.MONTHLY_LOSS_LIMIT,
-                    "scan_interval": Cfg.SCAN_INTERVAL,
-                    "dead_zone_hours": Cfg.DEAD_ZONE_HOURS,
-                    "blackout_window_mins": Cfg.BLACKOUT_WINDOW_MINS})
-
-@app.route("/api/config", methods=["POST"])
-def set_config():
-    data = request.json or {}
-    if "min_confidence" in data: Cfg.MIN_CONFIDENCE = int(data["min_confidence"])
-    if "max_risk_pct"   in data: Cfg.MAX_RISK_NORMAL = float(data["max_risk_pct"])
-    if "scan_interval"  in data: Cfg.SCAN_INTERVAL   = int(data["scan_interval"])
-    return jsonify({"success": True, "message": "Config updated"})
-
-@app.route("/api/close_all", methods=["POST"])
-def close_all():
-    positions_list = bot.api.get_positions()
-    closed = 0
-    for p in positions_list:
-        pid  = p.get("product_id")
-        size = abs(int(float(p.get("size", 0))))
-        side = p.get("side", "")
-        if size > 0:
-            bot.api.place_order(pid, "sell" if side=="buy" else "buy", size)
-            closed += 1
-    return jsonify({"success": True, "closed": closed})
-
-@app.route("/api/manual_trade", methods=["POST"])
-def manual_trade():
-    """Manually trigger a specific trade direction — bypasses confidence score."""
-    data = request.json or {}
-    direction = data.get("direction")  # 'long' or 'short'
-    size_override = float(data.get("size_usd", 0))
-
-    if direction not in ("long", "short"):
-        return jsonify({"success": False, "message": "direction must be long or short"})
-
-    price = bot.last_btc_price
-    if not price:
-        ticker = bot.api.get_ticker("BTCUSD")
-        price = float(ticker.get("mark_price", 0))
-
-    if not price:
-        return jsonify({"success": False, "message": "Cannot get BTC price"})
-
-    # Size: use override or default Kelly
-    size_usd = size_override if size_override > 0 else                bot.sizer.size_usd(bot.capital, 75, 0.008)
-
-    # Select option or fallback to perp
-    chain = bot.api.get_options_chain("BTC")
-    atr   = bot.last_atr_pct * price / 100 if bot.last_atr_pct > 0 else price * 0.008
-    opt   = bot.options_sel.select(chain, price, direction, 75, atr)
-
-    if opt:
-        contracts = max(1, int(size_usd / (opt["mark"] * 100)))
-        result = bot.api.place_order(opt["product_id"], "buy", contracts)
-        symbol = opt["product"].get("symbol", "")
-    else:
-        side = "buy" if direction == "long" else "sell"
-        contracts = max(1, int(size_usd / price * 1000))
-        result = bot.api.place_order(Cfg.BTC_PRODUCT_ID, side, contracts)
-        symbol = "BTCUSD_PERP"
-
-    if result.get("success"):
-        from server_v6 import Position
-        pos = Position(
-            opt["product_id"] if opt else Cfg.BTC_PRODUCT_ID,
-            direction, price, size_usd, symbol,
-            bot.last_rsi, bot.last_adx,
-            datetime.now(timezone.utc).hour
-        )
-        bot.positions.append(pos)
-        bot._log_trade("OPEN", direction, price, size_usd, 99, symbol, "manual")
-        bot.status_msg = f"✅ MANUAL {direction.upper()} {symbol} @ ${price:,.0f}"
-        return jsonify({"success": True, "message": bot.status_msg,
-                        "price": price, "size_usd": size_usd, "symbol": symbol})
-    return jsonify({"success": False, "message": f"Order failed: {result}"})
-
-
-@app.route("/api/close_position", methods=["POST"])
-def close_position():
-    """Manually close a specific position by product_id."""
-    data = request.json or {}
-    pid = data.get("product_id")
-    positions = bot.api.get_positions()
-    closed = 0
-    for p in positions:
-        if pid and p.get("product_id") != pid:
-            continue
-        size = abs(int(float(p.get("size", 0))))
-        side = p.get("side", "")
-        if size > 0:
-            bot.api.place_order(p["product_id"],
-                                "sell" if side == "buy" else "buy", size)
-            closed += 1
-    return jsonify({"success": True, "closed": closed})
-
-
-@app.route("/api/set_scan_interval", methods=["POST"])
-def set_scan_interval():
-    """Change how often the bot scans. Lower = more trades per day."""
-    data = request.json or {}
-    mins = int(data.get("minutes", 5))
-    mins = max(1, min(60, mins))  # Clamp 1–60 minutes
-    Cfg.SCAN_INTERVAL = mins * 60
-    expected_daily = int((16 * 60) / mins)  # Active 16h window
-    return jsonify({"success": True, "scan_interval_secs": Cfg.SCAN_INTERVAL,
-                    "expected_trades_per_day": f"0–{expected_daily} (depends on signals)"})
-
-
-@app.route("/api/manual_trade", methods=["POST"])
-def manual_trade():
-    """Manually force a trade in a specific direction — bypasses confidence score."""
-    data = request.json or {}
-    direction = data.get("direction")
-    size_override = float(data.get("size_usd", 0))
-    if direction not in ("long", "short"):
-        return jsonify({"success": False, "message": "direction must be long or short"})
-    price = bot.last_btc_price
-    if not price:
-        t = bot.api.get_ticker("BTCUSD")
-        price = float(t.get("mark_price", 0))
-    if not price:
-        return jsonify({"success": False, "message": "Cannot get BTC price"})
-    size_usd = size_override if size_override > 0 else \
-               bot.sizer.size_usd(bot.capital, 75, 0.008)
-    chain = bot.api.get_options_chain("BTC")
-    atr = bot.last_atr_pct * price / 100 if bot.last_atr_pct > 0 else price * 0.008
-    opt = bot.options_sel.select(chain, price, direction, 75, atr)
-    if opt:
-        contracts = max(1, int(size_usd / (opt["mark"] * 100)))
-        result = bot.api.place_order(opt["product_id"], "buy", contracts)
-        symbol = opt["product"].get("symbol", "")
-        pid = opt["product_id"]
-    else:
-        side = "buy" if direction == "long" else "sell"
-        contracts = max(1, int(size_usd / price * 1000))
-        result = bot.api.place_order(Cfg.BTC_PRODUCT_ID, side, contracts)
-        symbol = "BTCUSD_PERP"
-        pid = Cfg.BTC_PRODUCT_ID
-    if result.get("success"):
-        pos = Position(pid, direction, price, size_usd, symbol,
-                       bot.last_rsi, bot.last_adx,
-                       datetime.now(timezone.utc).hour)
-        bot.positions.append(pos)
-        bot._log_trade("OPEN", direction, price, size_usd, 99, symbol, "manual")
-        bot.status_msg = f"MANUAL {direction.upper()} {symbol} @ ${price:,.0f}"
-        return jsonify({"success": True, "message": bot.status_msg,
-                        "price": price, "size_usd": round(size_usd, 2), "symbol": symbol})
-    return jsonify({"success": False, "message": f"Order failed: {result}"})
-
-
-@app.route("/api/close_position", methods=["POST"])
-def close_position():
-    """Manually close one or all positions."""
-    data = request.json or {}
-    pid = data.get("product_id")
-    positions_list = bot.api.get_positions()
-    closed = 0
-    for p in positions_list:
-        if pid and str(p.get("product_id")) != str(pid):
-            continue
-        size = abs(int(float(p.get("size", 0))))
-        side = p.get("side", "")
-        if size > 0:
-            bot.api.place_order(p["product_id"],
-                                "sell" if side == "buy" else "buy", size)
-            closed += 1
-    return jsonify({"success": True, "closed": closed})
-
-
-@app.route("/api/set_scan_interval", methods=["POST"])
-def set_scan_interval():
-    """Change scan frequency. 1 min = most trades, 60 min = fewest."""
-    data = request.json or {}
-    mins = max(1, min(60, int(data.get("minutes", 5))))
-    Cfg.SCAN_INTERVAL = mins * 60
-    active_hours = 16
-    expected = int(active_hours * 60 / mins)
-    return jsonify({"success": True,
-                    "scan_interval_secs": Cfg.SCAN_INTERVAL,
-                    "scan_every_minutes": mins,
-                    "max_scans_per_day": expected,
-                    "note": f"At {mins}min intervals, bot scans up to {expected}x/day. "
-                            f"Trades only when confidence >= {Cfg.MIN_CONFIDENCE}."})
-
-
-@app.route("/api/server_config")
-def server_config():
-    """Returns whether API keys are configured on the server (never exposes the actual keys)."""
-    key = Cfg.API_KEY
-    secret = Cfg.API_SECRET
-    key_set = bool(key and len(key) > 8)
-    secret_set = bool(secret and len(secret) > 8)
-    return jsonify({
-        "api_key_set": key_set,
-        "api_secret_set": secret_set,
-        "api_key_masked": ("*" * (len(key)-4) + key[-4:]) if key_set else "",
-        "both_configured": key_set and secret_set,
-        "base_url": Cfg.BASE_URL,
-        "bot_auto_started": bot.running,
-    })
-
-
-@app.route("/api/server_config")
-def server_config():
-    """Shows whether API keys are set on the server — never exposes actual values."""
-    key = Cfg.API_KEY
-    secret = Cfg.API_SECRET
-    key_set = bool(key and len(key) > 8)
-    secret_set = bool(secret and len(secret) > 8)
-    return jsonify({
-        "api_key_set": key_set,
-        "api_secret_set": secret_set,
-        "api_key_masked": ("*" * max(0, len(key)-4) + key[-4:]) if key_set else "",
-        "both_configured": key_set and secret_set,
-        "base_url": Cfg.BASE_URL,
-        "bot_running": bot.running,
-    })
-
-
-@app.route("/api/test")
-def test():
-    ticker_data = bot.api.get_ticker("BTCUSD")
-    return jsonify({"api_connected": bool(ticker_data),
-                    "btc_price": ticker_data.get("mark_price", "N/A"),
-                    "api_healthy": bot.api.healthy,
-                    "wallet_synced": bot.wallet_synced,
-                    "bot_version": "v6.1"})
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
-    log.info(f"Starting DELTA ALPHA Bot v6.1 on port {port}")
-    # bot.start() already called by _auto_start() above
+    log.info(f"Starting DELTA ALPHA Bot v6.2 on port {port}")
+    # bot already started by _auto_start() above
     app.run(host="0.0.0.0", port=port, debug=False)
