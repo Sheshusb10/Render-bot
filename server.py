@@ -351,6 +351,79 @@ def status():
         "timestamp": datetime.utcnow().isoformat()
     })
 
+@app.route('/api/bot/status', methods=['GET'])
+def bot_status():
+    """Get detailed bot status (for index.py compatibility)"""
+    dash = bot.get_dashboard()
+    return jsonify({
+        "status": "ACTIVE" if not bot.kill_switch_active else "PAUSED",
+        "balance": bot.current_balance,
+        "starting": bot.starting_balance,
+        "gain": dash.get("gain", 0),
+        "gain_pct": dash.get("gain_pct", 0),
+        "trades_open": len(bot.open_trades),
+        "trades_closed": len(bot.closed_trades),
+        "win_rate": dash.get("win_rate", 0),
+        "streak": bot.position_sizer.current_streak,
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+@app.route('/api/positions', methods=['GET'])
+def positions():
+    """Get open positions"""
+    positions_list = []
+    for trade_id, trade in bot.open_trades.items():
+        positions_list.append({
+            "trade_id": trade_id,
+            "direction": trade["direction"],
+            "entry_price": trade["entry_price"],
+            "position_size": trade["position_size"],
+            "entry_time": trade["entry_time"].isoformat() if isinstance(trade["entry_time"], datetime) else trade["entry_time"]
+        })
+    
+    return jsonify({
+        "positions": positions_list,
+        "count": len(positions_list),
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+@app.route('/api/orders', methods=['GET'])
+def orders():
+    """Get recent closed orders (trades)"""
+    orders_list = []
+    # Return last 10 closed trades
+    for trade in bot.closed_trades[-10:]:
+        orders_list.append({
+            "trade_id": trade.get("trade_id"),
+            "entry_price": trade.get("entry_price"),
+            "exit_price": trade.get("exit_price"),
+            "pnl_pct": trade.get("pnl_pct"),
+            "pnl_dollars": trade.get("pnl_dollars"),
+            "reason": trade.get("reason"),
+            "balance_after": trade.get("balance_after")
+        })
+    
+    return jsonify({
+        "orders": orders_list,
+        "count": len(orders_list),
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+@app.route('/', methods=['GET', 'HEAD'])
+def home():
+    """Home endpoint"""
+    return jsonify({
+        "bot": "Wealth Builder v1",
+        "status": "running",
+        "api": {
+            "dashboard": "/api/dashboard",
+            "bot_status": "/api/bot/status",
+            "positions": "/api/positions",
+            "orders": "/api/orders",
+            "health": "/api/health"
+        }
+    })
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # 5. RENDER DEPLOYMENT
