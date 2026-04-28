@@ -42,7 +42,11 @@ log = logging.getLogger("ALPHA")
 # ══════════════════════════════════════════════════════════════════════════════
 class Cfg:
     API_KEY    = os.getenv("DELTA_API_KEY", "")
-    API_SECRET = os.getenv("DELTA_API_SECRET", "")
+    # Read secret from Render Secret File OR env var (supports both)
+    _secret_file = "/etc/secrets/DELTA_API_SECRET"
+    API_SECRET = (os.getenv("DELTA_API_SECRET", "") or
+                  (open(_secret_file).read().strip()
+                   if os.path.exists(_secret_file) else ""))
     BASE_URL   = "https://api.india.delta.exchange"
 
     # Risk
