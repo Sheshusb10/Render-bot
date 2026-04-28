@@ -1079,7 +1079,9 @@ class AlphaBot:
                     self.capital = total + self.profit_buffer
                     self.guard.new_day(total)
             else:
-                log.warning("Wallet returned zero balance")
+                # Log what was actually returned to help debug
+                log.warning(f"Wallet $0 — raw keys: {list(bal.keys()) if bal else 'empty'}")
+                self._emit("WARN", f"Wallet $0.00 — check API key permissions on Delta Exchange")
         except Exception as e:
             log.error(f"Wallet sync: {e}")
         return self.capital
@@ -2489,7 +2491,7 @@ function renderState(s){
   // Status
   const ico=document.getElementById('sIco');
   ico.className='sico '+(s.running?'si-run':s.in_recovery?'si-warn':'si-stop');
-  ico.innerHTML=s.running?'&#9654;':s.in_recovery?'⚠':'&#9208;';
+  ico.innerHTML=s.running?'▶':s.in_recovery?'⚠':'⏸';
   document.getElementById('sTxt').textContent=s.status||'Bot stopped — connect in Settings';
   document.getElementById('sTime').textContent=new Date().toISOString().substr(0,19).replace('T',' ')+' UTC';
 
