@@ -41,12 +41,11 @@ log = logging.getLogger("ALPHA")
 # CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 class Cfg:
+    # Keys loaded from env/file OR set at runtime via /api/connect
     API_KEY    = os.getenv("DELTA_API_KEY", "")
-    # Read secret from Render Secret File OR env var (supports both)
-    _secret_file = "/etc/secrets/DELTA_API_SECRET"
+    _sf = "/etc/secrets/DELTA_API_SECRET"
     API_SECRET = (os.getenv("DELTA_API_SECRET", "") or
-                  (open(_secret_file).read().strip()
-                   if os.path.exists(_secret_file) else ""))
+                  (open(_sf).read().strip() if os.path.exists(_sf) else ""))
     BASE_URL   = "https://api.india.delta.exchange"
 
     # Risk
@@ -124,6 +123,17 @@ class DeltaAPI:
         self.consecutive_failures = 0
         self.healthy = True
         self.last_success = time.time()
+        self.connected = False  # True after successful /api/connect
+
+    def set_credentials(self, api_key: str, api_secret: str, region: str = "india"):
+        """Update credentials at runtime — called from /api/connect endpoint."""
+        self.key    = api_key.strip()
+        self.secret = api_secret.strip()
+        self.base   = ("https://api.india.delta.exchange" if region == "india"
+                       else "https://api.delta.exchange")
+        self.consecutive_failures = 0
+        self.healthy = True
+        self.connected = False  # Will be set True after wallet test
 
     def _sign(self, method, path, qs="", body=""):
         ts  = str(int(time.time()))
@@ -1408,6 +1418,51 @@ _auto_start()
 def status():
     return jsonify(bot.get_state())
 
+@app.route("/api/connect", methods=["POST"])
+def connect():
+    """
+    Accept API key + secret from dashboard login form.
+    This is how the original bot worked — no Render env vars needed.
+    """
+    d = request.json or {}
+    api_key    = d.get("api_key",    "").strip()
+    api_secret = d.get("api_secret", "").strip()
+    region     = d.get("region",     "india").strip()
+
+    if not api_key or not api_secret:
+        return jsonify({"success": False,
+                        "message": "API key and secret are required"})
+
+    # Update credentials at runtime
+    bot.api.set_credentials(api_key, api_secret, region)
+    bot.capital       = 0.0
+    bot.wallet_synced = False
+
+    # Test connection by fetching wallet
+    bal = bot.api.get_wallet()
+    if not bal:
+        return jsonify({"success": False,
+                        "message": "Connection failed — check your API key, "
+                                   "secret and IP whitelist on Delta Exchange"})
+
+    bot.api.connected = True
+    capital = bot._sync_wallet(startup=True)
+    ip      = d.get("ip", "unknown")
+    bot._emit("INFO", f"Connected {region} | Balance:{capital:.2f} | IP:{ip}")
+    log.info(f"Connected via dashboard | region={region} | balance=${capital:.2f}")
+
+    # Auto-start bot after successful connect
+    bot.start()
+
+    return jsonify({
+        "success":  True,
+        "message":  f"Connected to Delta Exchange {region.title()}",
+        "balance":  round(capital, 2),
+        "region":   region,
+        "running":  bot.running,
+    })
+
+
 @app.route("/api/bot/start", methods=["POST"])
 def start():
     bot.start()
@@ -1579,13 +1634,15 @@ def server_config():
     secret = Cfg.API_SECRET
     ks     = bool(key    and len(key)    > 8)
     ss     = bool(secret and len(secret) > 8)
+    connected = bot.api.connected or (ks and ss)
     return jsonify({
         "api_key_set":    ks,
         "api_secret_set": ss,
         "api_key_masked": ("*" * max(0, len(key) - 4) + key[-4:]) if ks else "",
-        "both_configured":ks and ss,
-        "base_url":       Cfg.BASE_URL,
+        "both_configured": connected,
+        "base_url":       bot.api.base,
         "bot_running":    bot.running,
+        "connected":      connected,
     })
 
 @app.route("/api/logs")
@@ -2133,37 +2190,28 @@ canvas#miniChart{width:100%;height:44px}
 <!-- ═══════════ SETTINGS TAB ═══════════ -->
 <div id="tab-settings" class="tab">
 
-  <!-- API STATUS (reads from server — keys already set on Render) -->
+  <!-- API LOGIN FORM — enter keys here, no Render env vars needed -->
   <div class="keys-card" style="margin-top:4px">
     <div class="chd">
-      <span class="ct">API Connection</span>
-      <span id="apiStatusBadge" class="badge bo2">Checking...</span>
+      <span class="ct">Delta Exchange Login</span>
+      <span id="apiStatusBadge" class="badge bo2">Not connected</span>
     </div>
     <div id="apiStatusMsg" style="font-size:12px;color:var(--t2);margin-bottom:12px;line-height:1.5">
-      Checking server API configuration...
+      Enter your Delta Exchange API credentials below.
     </div>
-    <div style="display:flex;flex-direction:column;gap:8px;font-size:12px">
-      <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--bdr)">
-        <span style="color:var(--t2)">API Key</span>
-        <span id="apiKeyStatus" style="font-family:'DM Mono';font-weight:600;color:var(--t3)">—</span>
-      </div>
-      <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--bdr)">
-        <span style="color:var(--t2)">API Secret</span>
-        <span id="apiSecretStatus" style="font-family:'DM Mono';font-weight:600;color:var(--t3)">—</span>
-      </div>
-      <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--bdr)">
-        <span style="color:var(--t2)">Endpoint</span>
-        <span id="apiEndpoint" style="font-family:'DM Mono';font-size:10px;color:var(--t3)">api.india.delta.exchange</span>
-      </div>
-      <div style="display:flex;justify-content:space-between;padding:8px 0">
-        <span style="color:var(--t2)">Bot status</span>
-        <span id="apiRunning" style="font-weight:600;color:var(--t3)">—</span>
-      </div>
+    <!-- Region selector -->
+    <div style="display:flex;gap:8px;margin-bottom:10px">
+      <button id="btnIndia" onclick="setRegion('india')" style="flex:1;padding:9px;border-radius:var(--rx);border:2px solid var(--t);background:var(--t);color:#fff;font-weight:700;font-size:12px;cursor:pointer;font-family:'DM Sans'">India</button>
+      <button id="btnGlobal" onclick="setRegion('global')" style="flex:1;padding:9px;border-radius:var(--rx);border:1.5px solid var(--bdr);background:none;color:var(--t2);font-weight:600;font-size:12px;cursor:pointer;font-family:'DM Sans'">Global</button>
     </div>
-    <div style="background:var(--bg);border-radius:var(--rx);padding:10px;margin-top:10px;font-size:11px;color:var(--t3);line-height:1.6">
-      &#128274; API keys are set as <b>environment variables on Render</b> and loaded automatically when the bot starts. They are never stored in the browser or shown in full.
-      <br><br>
-      To update keys: Render Dashboard &#8594; Your Service &#8594; Environment &#8594; Edit <code>DELTA_API_KEY</code> and <code>DELTA_API_SECRET</code>.
+    <input type="text" id="inputApiKey" class="key-input" placeholder="API Key" autocomplete="off" spellcheck="false">
+    <input type="password" id="inputApiSecret" class="key-input" placeholder="API Secret" autocomplete="off" spellcheck="false">
+    <button id="connectBtn" onclick="connectBot()" style="width:100%;padding:13px;border-radius:var(--rs);border:none;background:var(--t);color:#fff;font-family:'DM Sans';font-size:14px;font-weight:700;cursor:pointer;margin-bottom:8px">
+      Connect to Delta Exchange
+    </button>
+    <div id="connectResult" style="font-size:11px;text-align:center;min-height:16px;color:var(--t3)"></div>
+    <div style="background:var(--bg);border-radius:var(--rx);padding:10px;margin-top:8px;font-size:11px;color:var(--t3);line-height:1.6">
+      &#128274; Keys are sent directly to the running server and stored in memory only. They are never saved to disk or Render environment. You will need to reconnect if the server restarts.
     </div>
   </div>
 
