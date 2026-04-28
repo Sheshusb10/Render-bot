@@ -981,8 +981,31 @@ class AlphaBot:
         self.candles         = []
         self.trades_today    = 0
         self.trades_week     = 0
+        # Real-time log buffer (shown on dashboard)
+        self.log_buffer      = []   # list of {time, level, msg}
+        self._log_max        = 200  # keep last 200 log lines
 
         self._sync_wallet(startup=True)
+
+    # ── Real log emitter ─────────────────────────────────────────────────────
+    def _emit(self, level: str, msg: str):
+        """Emit a timestamped log to buffer AND Python logger."""
+        entry = {
+            "time": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            "level": level,  # INFO / WARN / ERROR / TRADE
+            "msg": msg
+        }
+        self.log_buffer.append(entry)
+        if len(self.log_buffer) > self._log_max:
+            self.log_buffer.pop(0)
+        if level == "ERROR":
+            log.error(msg)
+        elif level == "WARN":
+            log.warning(msg)
+        elif level == "TRADE":
+            log.info(f"[TRADE] {msg}")
+        else:
+            log.info(msg)
 
     # ── Wallet ────────────────────────────────────────────────────────────────
     def _sync_wallet(self, startup: bool = False) -> float:
@@ -1022,7 +1045,7 @@ class AlphaBot:
                     self.capital       = total
                     self.wallet_synced = True
                     self.guard.init(total)
-                    log.info(f"💰 Wallet: ${total:.2f} "
+                    self._emit("INFO", f"💰 Wallet synced: ${total:.2f} "
                              f"(USDT={usdt:.2f} INR={inr:.0f} BTC={btc:.6f})")
                 else:
                     self.capital = total + self.profit_buffer
@@ -1133,9 +1156,9 @@ class AlphaBot:
         self.long_veto   = lr if lv else ""
         self.short_veto  = sr if sv else ""
 
-        log.info(f"BTC ${price:,.0f} | {self.regime} RSI={self.last_rsi:.1f} "
-                 f"ADX={self.last_adx:.1f} | L={ls}{'✗'+lr if lv else '✓'} "
-                 f"S={ss}{'✗'+sr if sv else '✓'} | News={news_m:.2f}")
+        self._emit("INFO", f"BTC ${price:,.0f} | {self.regime} | "
+                 f"RSI={self.last_rsi:.1f} ADX={self.last_adx:.1f} | "
+                 f"L={ls}{'✗'+lr if lv else '✓'} S={ss}{'✗'+sr if sv else '✓'} | News={news_m:.2f}")
 
         direction = score = None
         if not lv and ls >= Cfg.MIN_CONFIDENCE and ls > ss:
@@ -1153,6 +1176,7 @@ class AlphaBot:
                 self.status_msg = (f"Watching: L={ls}{'✗' if lv else ''} "
                                    f"S={ss}{'✗' if sv else ''} | "
                                    f"{self.regime} | Need ≥{Cfg.MIN_CONFIDENCE}")
+                self._emit("INFO", self.status_msg)
             return
 
         atr_usd  = data.get("atr", price * 0.008)
@@ -1177,7 +1201,7 @@ class AlphaBot:
                           opt["product"].get("symbol", ""))
                 self.status_msg = (f"✅ {direction.upper()} "
                                    f"{opt['product'].get('symbol','')} @ ${price:,.0f}")
-                log.info(self.status_msg)
+                self._emit("TRADE", self.status_msg)
             else:
                 log.error(f"Option order failed: {result}")
                 self.status_msg = f"Option order failed — {result.get('error','unknown')}"
@@ -1192,6 +1216,7 @@ class AlphaBot:
                 self.positions.append(pos)
                 self._log("OPEN", direction, price, size_usd, score, "BTCUSD_PERP")
                 self.status_msg = f"✅ {direction.upper()} PERP @ ${price:,.0f}"
+                self._emit("TRADE", self.status_msg)
             else:
                 self.status_msg = "No option + perp order also failed"
 
@@ -1243,9 +1268,9 @@ class AlphaBot:
 
         self._log("CLOSE", pos.side, price, pnl_usd, 0,
                   pos.symbol, reason, pnl_pct * 100)
-        log.info(f"{'✅' if won else '❌'} CLOSED {pos.side.upper()} "
-                 f"@ ${price:,.0f} | {reason} | ${pnl_usd:+.2f} "
-                 f"({pnl_pct*100:+.2f}%)")
+        self._emit("TRADE", f"{'✅ WIN' if won else '❌ LOSS'} "
+                 f"CLOSED {pos.side.upper()} @ ${price:,.0f} | "
+                 f"{reason} | ${pnl_usd:+.2f} ({pnl_pct*100:+.2f}%)")
 
     def _log(self, action: str, side: str, price: float, amount: float,
               conf: int, symbol: str, reason: str = "", pnl_pct: float = 0):
@@ -1339,6 +1364,8 @@ class AlphaBot:
             "trades_today":    self.trades_today,
             "trades_week":     self.trades_week,
             "scan_interval":   Cfg.SCAN_INTERVAL,
+            # Real logs
+            "logs":            self.log_buffer[-50:],
         }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1556,6 +1583,18 @@ def server_config():
         "base_url":       Cfg.BASE_URL,
         "bot_running":    bot.running,
     })
+
+@app.route("/api/logs")
+def get_logs():
+    """Real-time bot log stream — no dummy data."""
+    limit = int(request.args.get("limit", 100))
+    return jsonify({
+        "logs": bot.log_buffer[-limit:],
+        "total": len(bot.log_buffer),
+        "bot_running": bot.running,
+        "wallet_synced": bot.wallet_synced,
+    })
+
 
 @app.route("/api/test")
 def test():
@@ -1791,6 +1830,25 @@ canvas#miniChart{width:100%;height:44px}
 .nb.active .ni{color:var(--t)}.nb.active .nl{color:var(--t);font-weight:700}
 .ni{font-size:19px;color:var(--t3)}.nl{font-size:9px;color:var(--t3);font-weight:500;text-transform:uppercase;letter-spacing:.4px}
 
+/* LOGS PANEL */
+.logs-wrap{background:#0f1923;border-radius:var(--rs);padding:12px;margin-bottom:10px;max-height:300px;overflow-y:auto;font-family:"DM Mono",monospace;font-size:10px}
+.log-row{display:flex;gap:8px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,.04);line-height:1.4}
+.log-row:last-child{border-bottom:none}
+.log-time{color:rgba(255,255,255,.3);flex-shrink:0;width:52px}
+.log-lbl{flex-shrink:0;width:42px;font-weight:700;border-radius:3px;padding:0 3px;text-align:center}
+.log-INFO{color:#60a5fa}.log-WARN{color:#fbbf24}.log-ERROR{color:#f87171}.log-TRADE{color:#34d399}
+.ll-INFO{background:rgba(96,165,250,.1);color:#60a5fa}
+.ll-WARN{background:rgba(251,191,36,.1);color:#fbbf24}
+.ll-ERROR{background:rgba(248,113,113,.1);color:#f87171}
+.ll-TRADE{background:rgba(52,211,153,.15);color:#34d399}
+.log-msg{color:rgba(255,255,255,.7);word-break:break-word}
+.log-empty{color:rgba(255,255,255,.2);text-align:center;padding:20px 0}
+/* STATUS INDICATORS */
+.status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+.sd-live{background:#34d399;box-shadow:0 0 6px #34d399;animation:pulse 2s infinite}
+.sd-stopped{background:#f87171}
+.sd-syncing{background:#fbbf24;animation:pulse 1s infinite}
+
 /* TOAST */
 .toast{position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:var(--t);color:#fff;padding:10px 20px;border-radius:20px;font-size:12px;font-weight:500;z-index:200;opacity:0;transition:opacity .25s;white-space:nowrap;pointer-events:none}
 .toast.show{opacity:1}
@@ -2010,6 +2068,64 @@ canvas#miniChart{width:100%;height:44px}
   </div>
 </div>
 
+<!-- ═══════════ LOGS TAB ═══════════ -->
+<div id="tab-logs" class="tab">
+  <div class="card" style="margin-top:4px">
+    <div class="chd">
+      <span class="ct">Live Bot Logs</span>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span id="logCount" style="font-size:10px;color:var(--t3);font-family:'DM Mono'">0 entries</span>
+        <button onclick="clearLogs()" class="sbtn" style="padding:3px 8px;font-size:10px">Clear</button>
+        <button onclick="refreshLogs()" class="sbtn" style="padding:3px 8px;font-size:10px">&#8635; Refresh</button>
+      </div>
+    </div>
+    <!-- Running status -->
+    <div id="botRunStatus" style="display:flex;align-items:center;padding:8px 0;border-bottom:1px solid var(--bdr);margin-bottom:8px;font-size:12px;font-weight:500">
+      <span class="status-dot sd-stopped" id="runDot"></span>
+      <span id="runLabel">Checking bot status...</span>
+    </div>
+    <!-- Log filter buttons -->
+    <div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap">
+      <button onclick="filterLogs('ALL')" id="fALL" class="sbtn" style="padding:3px 9px;font-size:10px;background:var(--t);color:#fff">All</button>
+      <button onclick="filterLogs('TRADE')" id="fTRADE" class="sbtn" style="padding:3px 9px;font-size:10px">Trades</button>
+      <button onclick="filterLogs('WARN')" id="fWARN" class="sbtn" style="padding:3px 9px;font-size:10px">Warnings</button>
+      <button onclick="filterLogs('ERROR')" id="fERROR" class="sbtn" style="padding:3px 9px;font-size:10px">Errors</button>
+    </div>
+    <div class="logs-wrap" id="logsPanel">
+      <div class="log-empty">No logs yet — start the bot to see activity</div>
+    </div>
+  </div>
+  <!-- Is data real? -->
+  <div class="card">
+    <div class="chd"><span class="ct">Data Reality Check</span></div>
+    <div style="display:flex;flex-direction:column;gap:8px;font-size:12px">
+      <div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--bdr)">
+        <span style="color:var(--t2)">BTC Price</span>
+        <span id="realPrice" style="font-family:'DM Mono';color:var(--t3)">Checking...</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--bdr)">
+        <span style="color:var(--t2)">Wallet Balance</span>
+        <span id="realWallet" style="font-family:'DM Mono';color:var(--t3)">Checking...</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--bdr)">
+        <span style="color:var(--t2)">Win Rate</span>
+        <span id="realWR" style="font-family:'DM Mono';color:var(--t3)">Checking...</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--bdr)">
+        <span style="color:var(--t2)">Price Prediction</span>
+        <span style="font-family:'DM Mono';color:var(--g);font-size:10px">Real — based on live regime + ATR</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;padding:6px 0">
+        <span style="color:var(--t2)">API Connection</span>
+        <span id="realApi" style="font-family:'DM Mono';color:var(--t3)">Checking...</span>
+      </div>
+    </div>
+    <div style="background:var(--gb);border-radius:var(--rx);padding:10px;margin-top:10px;font-size:11px;color:#059669;line-height:1.5">
+      &#9432; This bot shows REAL data only. Win rate shows "—" until 3+ trades complete. Predictions use live regime + actual ATR — no random values.
+    </div>
+  </div>
+</div>
+
 <!-- ═══════════ SETTINGS TAB ═══════════ -->
 <div id="tab-settings" class="tab">
 
@@ -2096,6 +2212,7 @@ canvas#miniChart{width:100%;height:44px}
   <button class="nb active" onclick="showTab('home',this)"><span class="ni">&#127968;</span><span class="nl">Home</span></button>
   <button class="nb" onclick="showTab('trades',this)"><span class="ni">&#128203;</span><span class="nl">Trades</span></button>
   <button class="nb" onclick="showTab('signals',this)"><span class="ni">&#128200;</span><span class="nl">Signals</span></button>
+  <button class="nb" onclick="showTab('logs',this)"><span class="ni">&#128220;</span><span class="nl">Logs</span></button>
   <button class="nb" onclick="showTab('settings',this)"><span class="ni">&#9881;&#65039;</span><span class="nl">Settings</span></button>
 </nav>
 
@@ -2173,12 +2290,27 @@ function updateCountdown(){
 setInterval(updateCountdown,1000);
 
 // ── PREDICTION ────────────────────────────────────────────────────────────────
-function computePred(regime){
+function computePred(regime, lastState){
   if(!btcPrice) return;
   const now=new Date();
   document.getElementById('predUpd').textContent='Updated '+now.toISOString().substr(11,5)+' UTC';
-  const atr=btcPrice*0.008;
-  const bull=regime==='STRONG_BULL'||regime==='BULL'||(regime==='NEUTRAL'&&Math.random()>0.5);
+  // Use REAL ATR from bot (not hardcoded 0.8%)
+  const atrPct=(lastState&&lastState.last_atr_pct>0)?lastState.last_atr_pct/100:0.008;
+  const atr=btcPrice*atrPct;
+  // Use REAL regime — no random fallback
+  const bull=regime==='STRONG_BULL'||regime==='BULL';
+  const bear=regime==='STRONG_BEAR'||regime==='BEAR';
+  if(regime==='NEUTRAL'||regime==='UNKNOWN'){
+    // Neutral: show range, not directional prediction
+    document.getElementById('predPrice').textContent='Range';
+    document.getElementById('predPrice').className='bpv bpvn';
+    document.getElementById('predSig').textContent='Sideways — no directional bias';
+    document.getElementById('predSig').className='bsig s-neu';
+    ['p1h','p4h','p24h'].forEach(id=>{document.getElementById(id).textContent='Range';});
+    ['d1h','d4h','d24h'].forEach(id=>{document.getElementById(id).textContent='No trend signal';document.getElementById(id).className='pd2';});
+    return;
+  }
+  const dir=bull?1:-1;
   const p1=btcPrice+(bull?1:-1)*atr*0.6;
   const p4=btcPrice+(bull?1:-1)*atr*1.2;
   const p24=btcPrice+(bull?1:-1)*atr*2.1;
@@ -2203,7 +2335,7 @@ function computePred(regime){
 async function refresh(){
   const [s,trades,ticker]=await Promise.all([api('/api/status'),api('/api/trades'),api('/api/ticker')]);
   if(ticker) renderTicker(ticker);
-  if(s){ renderState(s); computePred(s.last_regime||'NEUTRAL'); }
+  if(s){ renderState(s); computePred(s.last_regime||'UNKNOWN', s); }
   if(trades) renderTrades(trades);
 }
 
@@ -2319,7 +2451,8 @@ function renderState(s){
 
   // Stats
   const wr=s.win_rate||0;
-  document.getElementById('stWR').textContent=wr.toFixed(1)+'%';
+  const totalT=s.total_trades||0;
+  document.getElementById('stWR').textContent=totalT>=3?wr.toFixed(1)+'%':'— (need 3+ trades)';
   document.getElementById('stTr').textContent=(s.total_trades||0)+' total';
   document.getElementById('stToday').textContent=s.trades_today||0;
   document.getElementById('stWeek').textContent=(s.trades_week||0)+' this week';
@@ -2471,9 +2604,105 @@ document.getElementById('scanS').addEventListener('input',function(){
 document.getElementById('confS2').addEventListener('input',function(){document.getElementById('confDisp2').textContent=this.value});
 document.getElementById('riskS2').addEventListener('input',function(){document.getElementById('riskDisp2').textContent=this.value+'%'});
 
+// ── LOGS ─────────────────────────────────────────────────────────────────────
+let allLogs=[], logFilter='ALL';
+
+async function refreshLogs(){
+  const r=await api('/api/logs?limit=100');
+  if(!r) return;
+  allLogs=r.logs||[];
+  document.getElementById('logCount').textContent=allLogs.length+' entries';
+  renderLogs();
+  // Update reality check
+  updateRealityCheck();
+}
+
+function filterLogs(f){
+  logFilter=f;
+  document.querySelectorAll('[id^="f"]').forEach(b=>{
+    b.style.background=b.id==='f'+f?'var(--t)':'';
+    b.style.color=b.id==='f'+f?'#fff':'';
+  });
+  renderLogs();
+}
+
+function renderLogs(){
+  const panel=document.getElementById('logsPanel');
+  const filtered=logFilter==='ALL'?allLogs:allLogs.filter(l=>l.level===logFilter);
+  if(!filtered.length){
+    panel.innerHTML='<div class="log-empty">No '+(logFilter==='ALL'?'':logFilter.toLowerCase()+' ')+'logs yet</div>';
+    return;
+  }
+  // Show newest first
+  panel.innerHTML=[...filtered].reverse().map(l=>`
+    <div class="log-row">
+      <span class="log-time">${l.time||'--:--:--'}</span>
+      <span class="log-lbl ll-${l.level}">${l.level}</span>
+      <span class="log-msg">${l.msg||''}</span>
+    </div>`).join('');
+  panel.scrollTop=0;
+}
+
+function clearLogs(){
+  allLogs=[];
+  renderLogs();
+}
+
+function updateRealityCheck(){
+  const s=window._lastState||{};
+  // BTC Price
+  const prEl=document.getElementById('realPrice');
+  if(btcPrice>0){prEl.textContent='$'+btcPrice.toLocaleString()+' ✓ LIVE';prEl.style.color='var(--g)';}
+  else{prEl.textContent='Not loaded yet';prEl.style.color='var(--o)';}
+  // Wallet
+  const wEl=document.getElementById('realWallet');
+  if(s.wallet_synced){wEl.textContent='$'+(s.capital||0).toFixed(2)+' ✓ REAL';wEl.style.color='var(--g)';}
+  else{wEl.textContent='Not synced — check API keys';wEl.style.color='var(--r)';}
+  // Win Rate
+  const wrEl=document.getElementById('realWR');
+  const tt=s.total_trades||0;
+  if(tt>=3){wrEl.textContent=(s.win_rate||0).toFixed(1)+'% from '+tt+' real trades';wrEl.style.color='var(--g)';}
+  else{wrEl.textContent='— (need '+Math.max(0,3-tt)+' more trades)';wrEl.style.color='var(--o)';}
+  // API
+  const aEl=document.getElementById('realApi');
+  if(s.api_healthy){aEl.textContent='Connected ✓';aEl.style.color='var(--g)';}
+  else{aEl.textContent='Not connected';aEl.style.color='var(--r)';}
+  // Running status in logs tab
+  const dot=document.getElementById('runDot');
+  const lbl=document.getElementById('runLabel');
+  if(s.running&&s.wallet_synced){
+    dot.className='status-dot sd-live';
+    lbl.textContent='Bot is RUNNING — receiving live data from Delta Exchange';
+    lbl.style.color='var(--g)';
+  } else if(s.running&&!s.wallet_synced){
+    dot.className='status-dot sd-syncing';
+    lbl.textContent='Bot starting — syncing wallet...';
+    lbl.style.color='var(--y)';
+  } else {
+    dot.className='status-dot sd-stopped';
+    lbl.textContent='Bot is STOPPED — click Start on Home tab';
+    lbl.style.color='var(--r)';
+  }
+}
+
+// Store last state globally for reality check
+const _origRenderState=renderState;
+function renderState(s){
+  window._lastState=s;
+  _origRenderState(s);
+}
+
+// Auto-refresh logs every 3 seconds when on logs tab
+setInterval(()=>{
+  if(document.getElementById('tab-logs').classList.contains('active')){
+    refreshLogs();
+  }
+},3000);
+
 // ── INIT ──────────────────────────────────────────────────────────────────────
 checkApiConfig();
 refresh();
+refreshLogs();
 setInterval(refresh, 5000);
 setInterval(checkApiConfig, 30000);
 </script>
