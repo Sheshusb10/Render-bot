@@ -213,10 +213,17 @@ class DeltaAPI:
             return None
 
     def get_candles(self, symbol="BTCUSD", resolution=5, limit=100):
-        """Signed request — Delta India requires auth for history/candles endpoint."""
+        """
+        Signed request. Delta India requires resolution as STRING: "1m","5m","15m" etc.
+        NOT integers. Every request was failing HTTP 400 until this fix.
+        """
+        # Convert integer minutes to Delta's string format
+        res_map = {1:"1m", 3:"3m", 5:"5m", 15:"15m", 30:"30m",
+                   60:"1h", 240:"4h", 1440:"1d"}
+        res_str = res_map.get(resolution, f"{resolution}m")
         end   = int(time.time())
         start = end - (resolution * 60 * limit)
-        params = {"symbol": symbol, "resolution": resolution,
+        params = {"symbol": symbol, "resolution": res_str,
                   "start": start, "end": end}
         d = self._get("/v2/history/candles", params)
         if d and d.get("success"):
@@ -1379,6 +1386,9 @@ class AlphaBot:
         self.trade_dir       = None
         self.candles         = []
         self.last_breakdown  = {}   # Last confidence pillar scores
+        # Price buffer: accumulates ticker prices as fallback when candles fail
+        self._price_buffer   = []   # [(price, timestamp)]
+        self._price_buf_max  = 120  # Keep 120 ticks = 10h at 5min intervals
         self.trades_today    = 0
         self.trades_week     = 0
         # Real-time log buffer (shown on dashboard)
@@ -1481,19 +1491,51 @@ class AlphaBot:
     # ── Market Data ───────────────────────────────────────────────────────────
     def _get_data(self) -> dict:
         now = datetime.now(timezone.utc)
-        raw5  = self.api.get_candles("BTCUSD", 5, 100)
-        raw15 = self.api.get_candles("BTCUSD", 15, 50)
-        fr    = self.api.get_funding_rate()
-        oi    = self.api.get_open_interest()
+        fr  = self.api.get_funding_rate()
+        oi  = self.api.get_open_interest()
 
-        if not raw5:
-            return {}
+        # ── Try primary candles endpoint ──────────────────────────────────
+        raw5  = self.api.get_candles("BTCUSD", 5,  100)   # "5m" candles
+        raw15 = self.api.get_candles("BTCUSD", 15, 50)    # "15m" candles
 
-        # FIX BUG 7: Use unified parse that handles dict/array formats
-        cl5, hi5, lo5, vo5   = TechEngine.parse_candles(raw5)
-        cl15, _, _, _        = TechEngine.parse_candles(raw15) if raw15 else ([], [], [], [])
+        cl5, hi5, lo5, vo5   = TechEngine.parse_candles(raw5)  if raw5  else ([], [], [], [])
+        cl15, h15, l15, _    = TechEngine.parse_candles(raw15) if raw15 else ([], [], [], [])
 
-        if not cl5:
+        # ── Accumulate ticker into price buffer (always runs) ─────────────
+        ticker = self.api.get_ticker("BTCUSD")
+        if ticker:
+            p = float(ticker.get("mark_price", 0) or 0)
+            if p > 0:
+                self._price_buffer.append(p)
+                if len(self._price_buffer) > self._price_buf_max:
+                    self._price_buffer.pop(0)
+
+        # ── Fallback: use price buffer if candles failed ──────────────────
+        if len(cl5) < 55 and len(self._price_buffer) >= 22:
+            log.warning(f"Candles returned {len(cl5)} (<55) — using price buffer "
+                        f"({len(self._price_buffer)} ticks) for indicators")
+            pb = self._price_buffer
+            # Synthetic OHLC from price buffer (close=price, high≈price*1.001, low≈price*0.999)
+            cl5  = pb
+            hi5  = [p * 1.001 for p in pb]
+            lo5  = [p * 0.999 for p in pb]
+            vo5  = [1.0] * len(pb)   # Unit volume — volume-based signals unreliable
+            cl15 = pb[::3]           # Downsample 5min→15min (every 3rd tick)
+            h15  = [p * 1.001 for p in cl15]
+            l15  = [p * 0.999 for p in cl15]
+            self._emit("WARN", f"Using price buffer ({len(pb)} ticks) — "
+                       "candle endpoint failing, volume signals disabled")
+        elif len(cl5) < 55:
+            self._emit("WARN", f"Candles: {len(cl5)} returned, need 55+. "
+                       f"Buffer: {len(self._price_buffer)} ticks. "
+                       "Visit /api/candles/debug to diagnose")
+            if self._price_buffer:
+                p = self._price_buffer[-1]
+                return {"current_price": p, "closes": [], "highs": [],
+                        "lows": [], "volumes": [],
+                        "hour_utc": now.hour, "minute_utc": now.minute,
+                        "is_weekend": now.weekday() >= 5,
+                        "funding_rate": fr, "oi_change_pct": 0, "atr": 0}
             return {}
 
         oi_chg = (oi - self._prev_oi) / self._prev_oi if self._prev_oi > 0 else 0
@@ -1502,6 +1544,7 @@ class AlphaBot:
         return {
             "closes": cl5, "highs": hi5, "lows": lo5, "volumes": vo5,
             "closes_5m": cl5, "closes_15m": cl15,
+            "highs_15m": h15, "lows_15m": l15,
             "hour_utc": now.hour, "minute_utc": now.minute,
             "is_weekend": now.weekday() >= 5,
             "funding_rate": fr, "current_price": cl5[-1],
@@ -3149,10 +3192,10 @@ function renderState(s){
   // Pillar definitions with actual score keys
   // 4-pillar institutional confidence engine
   const pillars=[
-    {n:'Regime (ADX+Structure)',key:'regime',   max:40, c:'#0066ff'},
-    {n:'Momentum Quality',      key:'momentum', max:30, c:'#00c896'},
-    {n:'Volatility Regime',     key:'volatility',max:20,c:'#ff9f00'},
-    {n:'Execution Quality',     key:'execution',max:10, c:'#ff6b6b'}
+    {n:'Regime (Structure+ADX)', key:'regime',    max:40, c:'#0066ff'},
+    {n:'Momentum Quality',       key:'momentum',  max:30, c:'#00c896'},
+    {n:'Volatility Regime',      key:'volatility',max:20, c:'#ff9f00'},
+    {n:'Execution Quality',      key:'execution', max:10, c:'#ff6b6b'}
   ];
   document.getElementById('pilRows').innerHTML=pillars.map(p=>{
     const actual=bd[p.key]!==undefined?bd[p.key]:null;
