@@ -119,57 +119,75 @@ class DeltaAPI:
         self.key     = Cfg.API_KEY
         self.secret  = Cfg.API_SECRET
         self.session = requests.Session()
-        self.session.headers.update({"Content-Type": "application/json"})
         self.consecutive_failures = 0
         self.healthy = True
         self.last_success = time.time()
-        self.connected = False  # True after successful /api/connect
+        self.connected = False
 
     def set_credentials(self, api_key: str, api_secret: str, region: str = "india"):
-        """Update credentials at runtime — called from /api/connect endpoint."""
         self.key    = api_key.strip()
         self.secret = api_secret.strip()
         self.base   = ("https://api.india.delta.exchange" if region == "india"
                        else "https://api.delta.exchange")
         self.consecutive_failures = 0
         self.healthy = True
-        self.connected = False  # Will be set True after wallet test
+        self.connected = False
 
-    def _sign(self, method, path, qs="", body=""):
+    def _sign(self, method: str, path: str, query_string: str = "", body: str = "") -> dict:
+        """
+        Official Delta Exchange signature format (from docs):
+        signature = HMAC-SHA256(secret, method + timestamp + path + query_string + body)
+        query_string includes the leading '?' e.g. '?product_id=1&state=open'
+        """
         ts  = str(int(time.time()))
-        msg = method + ts + path + qs + body
-        # FIX: hmac.new is correct Python API
+        msg = method + ts + path + query_string + body
         sig = hmac.new(self.secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
-        return {"api-key": self.key, "timestamp": ts, "signature": sig,
-                "User-Agent": "alpha-bot-v6.2"}
+        return {
+            "api-key":      self.key,
+            "timestamp":    ts,
+            "signature":    sig,
+            "Content-Type": "application/json",
+            "User-Agent":   "alpha-bot-v6.2",
+        }
 
-    def _get(self, path, params=None):
-        qs = ("?" + "&".join(f"{k}={v}" for k, v in params.items())) if params else ""
+    def _get(self, path: str, params: dict = None):
+        """Signed GET request. Builds query string for signature manually."""
+        query_string = ""
+        if params:
+            query_string = "?" + "&".join(f"{k}={v}" for k, v in params.items())
+        url = f"{self.base}{path}{query_string}"
         try:
-            r = self.session.get(f"{self.base}{path}{qs}",
-                                 headers=self._sign("GET", path, qs), timeout=10)
-            r.raise_for_status()
-            self.consecutive_failures = 0
-            self.healthy = True
-            self.last_success = time.time()
-            return r.json()
+            r = self.session.get(url,
+                                 headers=self._sign("GET", path, query_string),
+                                 timeout=10)
+            data = r.json()
+            if r.status_code == 200:
+                self.consecutive_failures = 0
+                self.healthy = True
+                self.last_success = time.time()
+            else:
+                log.warning(f"API GET {path} → {r.status_code}: {data.get('error','?')} {data.get('message','')}")
+                self.consecutive_failures += 1
+            return data
         except Exception as e:
             self.consecutive_failures += 1
             if self.consecutive_failures >= 3:
                 self.healthy = False
-                log.error(f"API unhealthy ({self.consecutive_failures} failures): {e}")
+                log.error(f"API unhealthy ({self.consecutive_failures}x): {e}")
             return None
 
-    def _post(self, path, body):
+    def _post(self, path: str, body: dict):
         body_str = json.dumps(body)
         try:
             r = self.session.post(f"{self.base}{path}",
                                   headers=self._sign("POST", path, "", body_str),
                                   data=body_str, timeout=10)
-            r.raise_for_status()
+            data = r.json()
+            if r.status_code not in (200, 201):
+                log.warning(f"API POST {path} → {r.status_code}: {data.get('error','?')}")
             self.consecutive_failures = 0
             self.healthy = True
-            return r.json()
+            return data
         except Exception as e:
             self.consecutive_failures += 1
             return None
@@ -198,13 +216,28 @@ class DeltaAPI:
             return {}
 
     def get_wallet(self):
+        """
+        Delta Exchange India wallet. Handles all field name variants.
+        Returns dict: {"USDT": 50.0, "INR": 1000.0, "BTC": 0.001}
+        """
         d = self._get("/v2/wallet/balances")
         if d and d.get("success"):
-            return {b["asset_symbol"]: float(b.get("available_balance") or 0)
-                    for b in d.get("result", [])}
-        # Log what went wrong for debugging
+            balances = {}
+            for b in d.get("result", []):
+                symbol = (b.get("asset_symbol") or b.get("currency") or
+                          b.get("asset") or "?")
+                avail  = float(b.get("available_balance") or
+                               b.get("available") or b.get("balance") or 0)
+                if symbol and symbol != "?":
+                    balances[symbol.upper()] = avail
+                    balances[symbol.lower()] = avail
+            log.info(f"Wallet assets with balance: {[k for k in balances if balances[k]>0 and k==k.upper()]}")
+            return balances
         if d:
-            log.warning(f"Wallet API response: success={d.get('success')} error={d.get('error','none')} meta={d.get('meta','')}")
+            err = d.get("error", d.get("message", "unknown"))
+            log.warning(f"Wallet failed: {err}")
+        else:
+            log.warning("Wallet returned None — IP likely not whitelisted")
         return {}
 
     def get_positions(self):
@@ -1015,6 +1048,19 @@ class AlphaBot:
 
         self._sync_wallet(startup=True)
 
+    # ── Server IP helper ─────────────────────────────────────────────────────
+    def _get_server_ip(self) -> str:
+        """Get the outbound IP of this server — needed for Delta Exchange whitelist."""
+        try:
+            import socket
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "unknown"
+
     # ── Real log emitter ─────────────────────────────────────────────────────
     def _emit(self, level: str, msg: str):
         """Emit a timestamped log to buffer AND Python logger."""
@@ -1045,8 +1091,11 @@ class AlphaBot:
                 return self.capital
 
             usdt = float(bal.get("USDT", bal.get("usdt", 0)) or 0)
-            inr  = float(bal.get("INR",  bal.get("inr",  0)) or 0)
-            btc  = float(bal.get("BTC",  bal.get("btc",  0)) or 0)
+            inr  = float(bal.get("INR",  bal.get("inr",
+                         bal.get("USDINR", bal.get("usdinr", 0)))) or 0)
+            btc  = float(bal.get("BTC",  bal.get("btc",
+                         bal.get("XBT",   bal.get("xbt",   0)))) or 0)
+            log.info(f"Wallet values — USDT:{usdt} INR:{inr} BTC:{btc} | all keys: {list(bal.keys())[:10]}")
 
             inr_usd = 0.0
             if inr > 0:
@@ -1396,6 +1445,8 @@ class AlphaBot:
             "scan_interval":   Cfg.SCAN_INTERVAL,
             # Real logs
             "logs":            self.log_buffer[-50:],
+            # Server IP (for Delta Exchange whitelist)
+            "server_ip":       self._get_server_ip(),
         }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1454,17 +1505,26 @@ def connect():
     bot.capital       = 0.0
     bot.wallet_synced = False
 
-    # Test connection by fetching wallet
-    bal = bot.api.get_wallet()
-    if not bal:
+    # Test connection — first check ticker (public, always works)
+    ticker = bot.api.get_ticker("BTCUSD")
+    if not ticker:
         return jsonify({"success": False,
-                        "message": "Connection failed — check your API key, "
-                                   "secret and IP whitelist on Delta Exchange"})
+                        "message": "Cannot reach Delta Exchange API — check your internet"})
+
+    # Now test wallet (needs correct IP whitelist + read permission)
+    bal = bot.api.get_wallet()
+    if bal is None:
+        server_ip = bot._get_server_ip()
+        return jsonify({"success": False,
+                        "message": f"API keys invalid or IP not whitelisted. "
+                                   f"Add {server_ip} to your Delta Exchange API key whitelist."})
 
     bot.api.connected = True
     capital = bot._sync_wallet(startup=True)
     ip      = d.get("ip", "unknown")
-    bot._emit("INFO", f"Connected {region} | Balance:{capital:.2f} | IP:{ip}")
+    server_ip = bot._get_server_ip()
+    bot._emit("INFO", f"Connected {region} | Balance:{capital:.2f} | User-IP:{ip} | Server-IP:{server_ip}")
+    bot._emit("INFO", f"⚠ Add {server_ip} to Delta Exchange API whitelist if wallet shows $0")
     log.info(f"Connected via dashboard | region={region} | balance=${capital:.2f}")
 
     # Auto-start bot after successful connect
@@ -1693,6 +1753,36 @@ def get_logs():
         "total": len(bot.log_buffer),
         "bot_running": bot.running,
         "wallet_synced": bot.wallet_synced,
+    })
+
+
+@app.route("/api/ip")
+def get_ip():
+    """Returns the current outbound IP of this Render server.
+    Bookmark this URL and check it whenever the bot stops working.
+    Add the returned IP to your Delta Exchange API key whitelist.
+    """
+    import socket
+    outbound_ip = "unknown"
+    try:
+        # Connect to a public DNS server to discover outbound IP
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        outbound_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        pass
+    # Also try requests-based method as backup
+    try:
+        r = requests.get("https://api.ipify.org?format=json", timeout=5)
+        outbound_ip = r.json().get("ip", outbound_ip)
+    except Exception:
+        pass
+    return jsonify({
+        "render_outbound_ip": outbound_ip,
+        "add_to_delta_whitelist": outbound_ip,
+        "instructions": "Go to india.delta.exchange → API Keys → Edit → add this IP to whitelist",
+        "note": "This IP can change on Render free tier after each redeploy"
     })
 
 
@@ -2200,6 +2290,29 @@ canvas#miniChart{width:100%;height:44px}
     </div>
   </div>
 
+  <!-- SERVER IP CARD -->
+  <div class="card">
+    <div class="chd">
+      <span class="ct">Render Server IP</span>
+      <span class="badge bb2">Whitelist this</span>
+    </div>
+    <div style="background:var(--bg);border-radius:var(--rx);padding:12px;margin-bottom:10px;text-align:center">
+      <div style="font-size:11px;color:var(--t3);margin-bottom:6px">Current outbound IP</div>
+      <div id="serverIpDisplay" style="font-family:'DM Mono';font-size:20px;font-weight:700;color:var(--t);letter-spacing:1px">Loading...</div>
+    </div>
+    <div style="font-size:11px;color:var(--t2);line-height:1.7">
+      1. Copy the IP above<br>
+      2. Go to <b>india.delta.exchange</b> → Account → API Keys<br>
+      3. Click <b>Edit</b> on your API key<br>
+      4. Paste IP into the <b>IP Whitelist</b> field<br>
+      5. Save → Come back and Connect<br><br>
+      <span style="color:var(--o)">⚠ This IP can change on Render free tier after redeploys. Re-check whenever wallet shows $0.</span>
+    </div>
+    <button onclick="checkServerIp()" class="sbtn" style="width:100%;padding:10px;margin-top:8px;font-size:12px">
+      ↻ Refresh IP
+    </button>
+  </div>
+
   <!-- SCAN FREQUENCY -->
   <div class="card">
     <div class="chd"><span class="ct">Scan Frequency</span></div>
@@ -2595,6 +2708,17 @@ function clearLogs(){ allLogs=[]; renderLogs(); }
 setInterval(()=>{ if(document.getElementById('tab-logs').classList.contains('active')) refreshLogs(); }, 3000);
 
 // ── LOGIN ─────────────────────────────────────────────────────────────────────
+async function checkServerIp(){
+  const el=document.getElementById('serverIpDisplay');
+  if(el) el.textContent='Fetching...';
+  const r=await apiCall('/api/ip');
+  if(r&&r.render_outbound_ip){
+    if(el) el.textContent=r.render_outbound_ip;
+  } else {
+    if(el) el.textContent='Failed — check logs';
+  }
+}
+
 function setRegion(r){
   selectedRegion=r;
   document.getElementById('btnIndia').className='rbtn '+(r==='india'?'rbtn-on':'rbtn-off');
@@ -2669,7 +2793,9 @@ async function saveConfig(){
 // ── INIT ──────────────────────────────────────────────────────────────────────
 refresh();
 refreshLogs();
+checkServerIp();  // Load server IP immediately on page load
 setInterval(refresh, 5000);
+setInterval(checkServerIp, 60000); // Refresh IP every 60s
 // Show connect banner after first status check
 setTimeout(async()=>{
   const s=await apiCall('/api/status');
