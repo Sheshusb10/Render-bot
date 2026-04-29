@@ -1125,8 +1125,10 @@ class PositionSizer:
                            else Cfg.MAX_RISK_NORMAL)
 
         if self.total < Cfg.MIN_TRADES_BEFORE_KELLY:
-            # Phase 1: Fixed 1.5% — no compounding error from unknown edge
-            base = capital * 0.015 * risk_mult
+            # Phase 1: Fixed 1.5% — conservative until edge is proven
+            # Scale with capital: larger capital → smaller % to protect drawdown
+            pct = 0.015 if capital < 200 else (0.010 if capital < 1000 else 0.008)
+            base = capital * pct * risk_mult
         else:
             # Phase 2: Kelly with proven statistics
             base = capital * self.kelly_frac()
@@ -1169,6 +1171,7 @@ class Position:
         self.rsi_entry  = rsi
         self.adx_entry  = adx
         self.hour_utc   = hour_utc
+        self.leverage   = 1.0   # Set after creation
         # ── Position Analytics (MAE/MFE) ─────────────────────────────────────
         self.mae        = 0.0   # Max Adverse Excursion (worst % against us)
         self.mfe        = 0.0   # Max Favorable Excursion (best % for us)
@@ -1420,7 +1423,8 @@ class AlphaBot:
             if d and d.get("success"):
                 for p in d.get("result", []):
                     sym = str(p.get("symbol","")).upper()
-                    if sym in ("BTCUSD", "BTC_USDT", "BTCUSDT", "BTC-USDT"):
+                    # Delta India uses BTCUSDT for the perp
+                    if any(x in sym for x in ("BTCUSDT", "BTCUSD", "BTC_USDT")):
                         old_id = Cfg.BTC_PRODUCT_ID
                         Cfg.BTC_PRODUCT_ID = p.get("id", Cfg.BTC_PRODUCT_ID)
                         self._emit("INFO",
@@ -1768,49 +1772,65 @@ class AlphaBot:
         rsi_now  = TechEngine.rsi(data["closes"], Cfg.RSI_PERIOD)
         adx_now, _, _ = TechEngine.adx(data["highs"], data["lows"], data["closes"])
 
-        chain = self.api.get_options_chain("BTC")
-        # FIX BUG 9: Pass atr_usd (USD units) not atr_pct
-        opt   = self.opt_sel.select(chain, price, direction, score, atr_usd)
+        # ── CAPITAL-AWARE EXECUTION ───────────────────────────────────────────
+        # Auto-selects instrument and leverage based on current wallet balance
+        cap = self.capital
 
-        if opt:
-            contracts = max(1, int(size_usd / (opt["mark"] * 100)))
-            result    = self.api.place_order(opt["product_id"], "buy", contracts)
-            if result.get("success"):
-                pos = Position(opt["product_id"], direction, price, size_usd,
-                               opt["product"].get("symbol", ""), rsi_now,
-                               adx_now, data["hour_utc"])
-                self.positions.append(pos)
-                self._log("OPEN", direction, price, size_usd, score,
-                          opt["product"].get("symbol", ""))
-                self.status_msg = (f"✅ {direction.upper()} "
-                                   f"{opt['product'].get('symbol','')} @ ${price:,.0f}")
-                self._emit("TRADE", self.status_msg)
-            else:
-                log.error(f"Option order failed: {result}")
-                self.status_msg = f"Option order failed — {result.get('error','unknown')}"
+        # Tier 1: < $50   → Perp with leverage (options not viable)
+        # Tier 2: $50-200 → Perp at 1-2x (no leverage needed, focus on fill quality)
+        # Tier 3: > $200  → Options viable — use for high-confidence signals only
+
+        use_options = (cap >= 200 and score >= Cfg.HIGH_CONFIDENCE
+                       and not Cfg.ENABLE_RANGE_MODE)
+        side = "buy" if direction == "long" else "sell"
+
+        if use_options:
+            # Options: defined risk, best for high-confidence trend signals
+            chain = self.api.get_options_chain("BTC")
+            opt   = self.opt_sel.select(chain, price, direction, score, atr_usd)
+            if opt:
+                contracts = max(1, int(size_usd / (opt["mark"] * 100)))
+                result    = self.api.place_order(opt["product_id"], "buy", contracts)
+                sym = opt["product"].get("symbol", "")
+                if result.get("success"):
+                    pos = Position(opt["product_id"], direction, price, size_usd,
+                                   sym, rsi_now, adx_now, data["hour_utc"])
+                    pos.leverage = 1.0
+                    self.positions.append(pos)
+                    self._log("OPEN", direction, price, size_usd, score, sym)
+                    self.status_msg = f"✅ {direction.upper()} OPTION {sym} @ ${price:,.0f}"
+                    self._emit("TRADE", self.status_msg)
+                    return
+                # Options failed → fall through to perp
+                self._emit("WARN", f"Option order failed ({sym}) → using perp")
+
+        # Perpetual: always works, no expiry, tight spreads
+        if   cap < 50:   leverage = min(10, max(3, int(50 / max(cap, 1))))
+        elif cap < 200:  leverage = 2
+        elif cap < 1000: leverage = 1
+        else:            leverage = 1   # Large capital: full size, no leverage needed
+
+        contracts = max(1, round(size_usd * leverage))
+        self._emit("INFO",
+            f"Order: {side.upper()} {contracts}c BTCUSDT_PERP "
+            f"cap=${cap:.0f} risk=${size_usd:.2f} {leverage}x "
+            f"pid={Cfg.BTC_PRODUCT_ID}")
+        result = self.api.place_order(Cfg.BTC_PRODUCT_ID, side, contracts)
+        if result.get("success"):
+            pos = Position(Cfg.BTC_PRODUCT_ID, direction, price, size_usd,
+                           "BTCUSDT_PERP", rsi_now, adx_now, data["hour_utc"])
+            pos.leverage = leverage
+            self.positions.append(pos)
+            self._log("OPEN", direction, price, size_usd, score, "BTCUSDT_PERP")
+            self.status_msg = (f"✅ {direction.upper()} {contracts}c PERP "
+                               f"@ ${price:,.0f} ({leverage}x)")
+            self._emit("TRADE", self.status_msg)
         else:
-            # Fallback to perpetual
-            side      = "buy" if direction == "long" else "sell"
-            # Delta India BTCUSD perp: 1 contract = $1 USD value
-            # Min order is typically 1 contract. size_usd/price*1000 can be < 1
-            contracts = max(1, round(size_usd))  # $1 per contract, min 1
-            self._emit("INFO",
-                f"Placing {side} {contracts} contracts BTCUSD_PERP "
-                f"product_id={Cfg.BTC_PRODUCT_ID} size_usd=${size_usd:.2f}")
-            result    = self.api.place_order(Cfg.BTC_PRODUCT_ID, side, contracts)
-            if result.get("success"):
-                pos = Position(Cfg.BTC_PRODUCT_ID, direction, price, size_usd,
-                               "BTCUSD_PERP", rsi_now, adx_now, data["hour_utc"])
-                self.positions.append(pos)
-                self._log("OPEN", direction, price, size_usd, score, "BTCUSD_PERP")
-                self.status_msg = f"✅ {direction.upper()} PERP @ ${price:,.0f}"
-                self._emit("TRADE", self.status_msg)
-            else:
-                self.status_msg = f"Order failed — check /api/products/debug for correct product IDs"
-                self._emit("ERROR", f"Perp order failed for product_id={Cfg.BTC_PRODUCT_ID} "
-                           f"size={contracts} side={'buy' if direction=='long' else 'sell'} "
-                           f"result={result}")
-
+            err = result.get("error", result.get("message", str(result)[:80]))
+            self.status_msg = f"❌ Order failed: {err}"
+            self._emit("ERROR",
+                f"Order FAILED pid={Cfg.BTC_PRODUCT_ID} side={side} "
+                f"contracts={contracts} cap=${cap:.0f} → {err}")
     def _manage_positions(self, price: float):
         for pos in self.positions:
             if pos.closed: continue
