@@ -1550,6 +1550,8 @@ class AlphaBot:
                     self.guard.init(total)
                     self._emit("INFO", f"💰 Wallet synced: ${total:.2f} "
                              f"(USDT={usdt:.2f} INR={inr:.0f} BTC={btc:.6f})")
+                    # Sync any open positions from Delta into bot state
+                    self._sync_positions_from_delta()
                 else:
                     self.capital = total + self.profit_buffer
                     self.guard.new_day(total)
@@ -1986,6 +1988,17 @@ class AlphaBot:
             "profit_buffer": round(self.profit_buffer, 2),
             "pnl_pct": pct,
             "open_positions": len([p for p in self.positions if not p.closed]),
+            "positions_detail": [
+                {"symbol": p.symbol, "side": p.side,
+                 "entry": round(p.entry, 2),
+                 "size_usd": round(p.size_usd, 2),
+                 "leverage": getattr(p, "leverage", 5),
+                 "mae_pct": round(p.mae * 100, 3),
+                 "mfe_pct": round(p.mfe * 100, 3),
+                 "age_min": round((datetime.now(timezone.utc) -
+                             p.entered_at).total_seconds() / 60, 1)}
+                for p in self.positions if not p.closed
+            ],
             "total_trades": self.sizer.total,
             "win_rate": round(self.sizer.win_rate * 100, 1),
             "streak": self.sizer.streak,
@@ -2963,6 +2976,15 @@ canvas#miniChart{width:100%;height:44px}
     </div>
   </div>
 
+  <!-- OPEN POSITIONS -->
+  <div class="card" id="openPosCard" style="display:none">
+    <div class="chd">
+      <span class="ct">Open Positions</span>
+      <span id="openPosCount" class="badge br2">0</span>
+    </div>
+    <div id="openPosList"></div>
+  </div>
+
   <!-- RECENT TRADES -->
   <div class="card">
     <div class="chd">
@@ -3261,7 +3283,7 @@ async function refresh(){
     apiCall('/api/ticker')
   ]);
   if(ticker) renderTicker(ticker);
-  if(state)  renderState(state);
+  if(state){ renderState(state); renderPositions(state); }
   if(trades) renderTrades(trades);
 }
 
@@ -3479,6 +3501,40 @@ function renderState(s){
 }
 
 // ── TRADES ────────────────────────────────────────────────────────────────────
+function renderPositions(s){
+  const pds = s.positions_detail || [];
+  const card = document.getElementById('openPosCard');
+  const list = document.getElementById('openPosList');
+  const cnt  = document.getElementById('openPosCount');
+  if(!pds.length){ card.style.display='none'; return; }
+  card.style.display='block';
+  cnt.textContent = pds.length + ' open';
+  cnt.className   = 'badge br2';
+  list.innerHTML  = pds.map(p=>{
+    const pnlCls = p.mae_pct < -0.5 ? 'style="color:var(--r)"' :
+                   p.mfe_pct > 0.5  ? 'style="color:var(--g)"' : '';
+    return `<div style="display:flex;justify-content:space-between;
+      padding:8px 0;border-bottom:1px solid var(--bdr);font-size:12px">
+      <div>
+        <b>${p.symbol}</b>
+        <span style="background:${p.side==='long'?'var(--gb)':'var(--rb)'};
+          color:${p.side==='long'?'var(--g)':'var(--r)'};
+          padding:1px 6px;border-radius:4px;font-size:10px;
+          font-weight:700;margin-left:6px">
+          ${p.side.toUpperCase()}</span>
+        <span style="font-size:10px;color:var(--t3);margin-left:4px">
+          ${p.leverage}x</span>
+      </div>
+      <div style="text-align:right">
+        <div style="font-family:'DM Mono';font-weight:600">
+          entry $${p.entry.toLocaleString()}</div>
+        <div style="font-size:10px;color:var(--t3)">
+          MAE ${p.mae_pct.toFixed(2)}% | ${p.age_min.toFixed(0)}min</div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
 function renderTrades(trades){
   if(!trades||!trades.length){
     document.getElementById('recTrades').innerHTML='<div class="empty">No trades yet</div>';
