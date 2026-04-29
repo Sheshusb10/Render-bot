@@ -33,8 +33,12 @@ class C:
     CONF_STRADDLE= 55   # moderate both ways → straddle
 
     # ── Perpetual guards ──────────────────────────────────────────
-    STOP_PCT     = 0.025   # 2.5% hard stop
-    TP_PCT       = 0.030   # 3.0% take profit
+    STOP_PCT     = 0.025   # 2.5% hard stop (base, scaled by ATR)
+    TP_PCT       = 0.030   # 3.0% take profit (base, scaled by ATR)
+    # Dynamic TP/SL: scaled by ATR regime
+    # Low vol  (ATR<0.3%): TP = 1.5×ATR, SL = 1.0×ATR  (tight, realistic)
+    # Normal   (0.3-0.8%): TP = 2.0×ATR, SL = 1.0×ATR
+    # High vol (ATR>0.8%): TP = 3.0×ATR, SL = 1.5×ATR  (wider, room to breathe)
     RISK_PCT     = 0.015   # 1.5% capital per trade
 
     # ── Options guards ────────────────────────────────────────────
@@ -42,7 +46,7 @@ class C:
     OPT_FLOOR    = 0.60    # trail from peak: if peak was +60%, hold
     OPT_STOP_PCT = 0.50    # -50% premium = stop loss
     OPT_MAX_PREM = 0.15    # max 15% of capital on one option trade
-    OPT_EXPIRY_BUFFER = 60 # close options 60min before Friday expiry
+    OPT_EXPIRY_BUFFER = 180 # close options 3hr before Friday expiry (liquidity cliff)
 
     # ── Account guards ────────────────────────────────────────────
     HALT_PCT     = 0.08    # halt if down 8% from start
@@ -57,18 +61,26 @@ class C:
 # ═══════════════════════════════════════════════════════════════════
 #  DELTA API
 # ═══════════════════════════════════════════════════════════════════
+def pid_int(v):
+    """Normalise product_id to int — Delta returns int or str inconsistently."""
+    try: return int(v)
+    except (TypeError, ValueError): return 0
+
+
 class DeltaAPI:
     def __init__(self):
         self.key  = C.KEY
         self.sec  = C.SECRET
         self.sess = requests.Session()
+        self._lock = threading.Lock()  # prevent signature race condition
 
     def set(self, k, s):
         self.key = k.strip()
         self.sec  = s.strip()
 
     def _sign(self, method, path, qs="", body=""):
-        ts  = str(int(time.time()))
+        with self._lock:
+            ts = str(int(time.time()))
         sig = hmac.new(self.sec.encode(),
             (method+ts+path+qs+body).encode(), hashlib.sha256).hexdigest()
         return {"api-key":self.key,"timestamp":ts,"signature":sig,
@@ -128,8 +140,8 @@ class DeltaAPI:
         d = self.get("/v2/positions/margined")
         if not d or not d.get("success"): return []
         return [p for p in d.get("result",[])
-                if int(p.get("product_id",0) or 0)==C.PID
-                and abs(float(p.get("size",0) or 0))>0]
+                if pid_int(p.get("product_id",0)) == C.PID
+                and abs(float(p.get("size",0) or 0)) > 0]
 
     def option_positions(self):
         d = self.get("/v2/positions/margined")
@@ -229,27 +241,44 @@ class MarketData:
 
     def get_all(self) -> dict:
         """
-        Returns dict of candle arrays keyed by timeframe.
-        Merges Delta + Binance, uses longest valid source.
+        Returns merged candle dict.
+        Binance 1m used as LEAD INDICATOR: Binance often moves seconds
+        before Delta India reacts. If Binance RSI diverges from Delta RSI,
+        front-run the expected Delta move.
         """
-        # Fetch in parallel-ish (sequential but fast)
         d1m  = self._parse_delta(self.delta.candles("1m", 100))
         d5m  = self._parse_delta(self.delta.candles("5m", 100))
         d15m = self._parse_delta(self.delta.candles("15m", 60))
         b1m  = self._binance_candles("1m", 100)
         b5m  = self._binance_candles("5m", 100)
 
-        # Use whichever source has more data for each timeframe
-        c1m  = d1m  if len(d1m)  >= len(b1m)  else b1m
-        c5m  = d5m  if len(d5m)  >= len(b5m)  else b5m
-        c15m = d15m  # only Delta has 15m
+        # Primary: use Delta (same exchange = exact prices for orders)
+        # Fallback: Binance if Delta returns insufficient data
+        c1m  = d1m if len(d1m)  >= 20 else b1m
+        c5m  = d5m if len(d5m)  >= 55 else b5m
+        c15m = d15m
+
+        # ── Binance Lead Signal ──────────────────────────────────────
+        # Compute RSI on Binance 1m vs Delta 1m.
+        # Divergence = Binance already moved, Delta hasn't caught up yet.
+        bnc_lead = "neutral"
+        if len(b1m) >= 16 and len(d1m) >= 16:
+            bc = [x["close"] for x in b1m]
+            dc = [x["close"] for x in d1m]
+            b_rsi = rsi(bc)
+            d_rsi = rsi(dc)
+            diff  = b_rsi - d_rsi
+            # Binance RSI significantly higher → Delta likely to rise soon
+            if   diff > 8:  bnc_lead = "binance_leading_bull"
+            elif diff < -8: bnc_lead = "binance_leading_bear"
 
         return {
             "1m":  c1m,
             "5m":  c5m,
             "15m": c15m,
-            "source_1m":  "delta" if d1m else "binance",
-            "source_5m":  "delta" if d5m else "binance",
+            "binance_lead": bnc_lead,
+            "source_1m":   "delta" if d1m else "binance",
+            "source_5m":   "delta" if d5m else "binance",
         }
 
     def arrays(self, candles: list):
@@ -300,6 +329,26 @@ def atr_val(hi, lo, cl, n=14):
     trs=[max(hi[i]-lo[i],abs(hi[i]-cl[i-1]),abs(lo[i]-cl[i-1]))
          for i in range(1,len(cl))]
     return sum(trs[-n:])/n
+
+def atr_tp_sl(atr_pct: float) -> tuple:
+    """
+    Dynamic TP and SL percentages based on ATR regime.
+    Returns (tp_pct, sl_pct).
+    Low vol → tight targets (realistic). High vol → wider (avoid noise).
+    """
+    if atr_pct <= 0:
+        return C.TP_PCT, C.STOP_PCT
+    if atr_pct < 0.30:          # Low volatility
+        tp = max(atr_pct * 1.5 / 100, 0.010)
+        sl = max(atr_pct * 1.0 / 100, 0.008)
+    elif atr_pct < 0.80:        # Normal volatility
+        tp = atr_pct * 2.0 / 100
+        sl = atr_pct * 1.0 / 100
+    else:                        # High volatility
+        tp = min(atr_pct * 3.0 / 100, 0.08)
+        sl = min(atr_pct * 1.5 / 100, 0.04)
+    return round(tp, 4), round(sl, 4)
+
 
 def bollinger(cl, n=20):
     if len(cl) < n: m=cl[-1]; return m,m,m,0.0
@@ -382,7 +431,7 @@ class ConfidenceEngine:
         p7 = self._pillar_session(hour)
         pillars["Session"] = p7
 
-        total = sum(v["score"] for v in pillars.values())
+        total = sum(v["score"] for v in pillars.values()) + lead_bonus
         total = min(total, 100)
 
         # ── Detect volatility regime for options strategy ─────────
@@ -590,19 +639,39 @@ class OptionsEngine:
                 mark = float(res.get("mark_price",0) or 0)
                 bid  = float(res.get("best_bid",0)  or 0)
                 ask  = float(res.get("best_ask",0)  or 0)
-                if mark > 0:
-                    return {
-                        "found":    True,
-                        "symbol":   sym,
-                        "strike":   strike,
-                        "expiry":   expiry,
-                        "type":     opt_type,
-                        "mark":     mark,
-                        "bid":      bid,
-                        "ask":      ask,
-                        "moneyness":"ITM" if use_itm else "ATM",
-                        "premium_usd": mark * self.LOT_BTC,
-                    }
+                iv   = float(res.get("mark_iv",0)   or 0)  # implied vol %
+                if mark <= 0:
+                    continue
+
+                # ── IV FILTER ────────────────────────────────────────
+                # If implied volatility > 150%, premium is too expensive.
+                # "IV Crush" will destroy value even if price moves correctly.
+                # 80-120% is normal for BTC weekly options. >150% = avoid.
+                iv_too_high = iv > 150.0 and iv > 0
+                if iv_too_high:
+                    log.info(f"IV filter: {sym} IV={iv:.1f}% > 150% — skip")
+                    continue
+
+                # Spread check: bid/ask spread > 20% of mark = illiquid
+                spread_pct = (ask - bid) / mark * 100 if (mark > 0 and ask > bid) else 0
+                if spread_pct > 20 and bid > 0:
+                    log.info(f"Spread filter: {sym} spread={spread_pct:.1f}% > 20% — skip")
+                    continue
+
+                return {
+                    "found":       True,
+                    "symbol":      sym,
+                    "strike":      strike,
+                    "expiry":      expiry,
+                    "type":        opt_type,
+                    "mark":        mark,
+                    "bid":         bid,
+                    "ask":         ask,
+                    "iv":          round(iv, 1),
+                    "spread_pct":  round(spread_pct, 1),
+                    "moneyness":   "ITM" if use_itm else "ATM",
+                    "premium_usd": round(mark * self.LOT_BTC, 3),
+                }
         return {"found":False,"tried":candidates,"expiry":expiry}
 
     def should_exit(self, sym, current_mark, entry_mark, opened_at) -> dict:
@@ -628,10 +697,16 @@ class OptionsEngine:
         expiry_str = sym[-6:] if len(sym) >= 6 else ""
         if expiry_str:
             try:
+                # Delta settles at 12:00 UTC Friday. We exit OPT_EXPIRY_BUFFER
+                # minutes early to avoid the liquidity cliff (empty order book).
                 exp_dt = datetime.strptime(expiry_str, "%d%m%y").replace(
-                    hour=11, minute=0, tzinfo=timezone.utc)
-                if now >= exp_dt:
-                    return {"exit":True,"reason":f"expiry","pct":pct}
+                    hour=12, minute=0, tzinfo=timezone.utc)
+                buffer_dt = exp_dt - timedelta(minutes=C.OPT_EXPIRY_BUFFER)
+                if now >= buffer_dt:
+                    mins_left = int((exp_dt - now).total_seconds() / 60)
+                    return {"exit":True,
+                            "reason":f"expiry_buffer {mins_left}m to settle",
+                            "pct":pct}
             except: pass
 
         if pct >= C.OPT_TP_PCT:
@@ -659,6 +734,42 @@ class OptionsEngine:
 
     def opened_at(self, sym):
         return self._entry_time.get(sym)
+
+    def buy_option_limit(self, symbol, mark_price, pid=None, lots=1, max_tries=3):
+        """
+        Limit order with chase: avoids the 2-5% market order spread on options.
+        Retries up to max_tries with price widening 0.5% each attempt.
+        Falls back to market if all limit attempts timeout.
+        """
+        if not pid:
+            pid = self.get_pid(symbol)
+        if not pid:
+            return {"success": False, "error": f"No pid for {symbol}"}
+        for attempt in range(max_tries):
+            limit = round(mark_price * (1 + attempt * 0.005), 2)
+            r = self.delta.post("/v2/orders", {
+                "product_id":    pid, "size": lots, "side": "buy",
+                "order_type":    "limit_order", "limit_price": str(limit),
+                "time_in_force": "gtc",
+            })
+            if r.get("success"):
+                order_id = (r.get("result") or {}).get("id")
+                if order_id:
+                    for _ in range(5):
+                        time.sleep(1)
+                        od = self.delta.get(f"/v2/orders/{order_id}")
+                        state = ((od or {}).get("result") or {}).get("state","")
+                        if state in ("filled","closed"):
+                            log.info(f"Limit fill: {symbol} @ ${limit:.2f} try={attempt+1}")
+                            return {"success": True, "fill_price": limit}
+                    self.delta.post(f"/v2/orders/{order_id}/cancel", {"product_id": pid})
+            if attempt < max_tries - 1:
+                time.sleep(2)
+        # Fallback to market
+        log.warning(f"Limit chase failed {symbol} — using market order")
+        return self.delta.post("/v2/orders", {
+            "product_id": pid, "size": lots, "side": "buy",
+            "order_type": "market_order", "time_in_force": "ioc"})
 
     def straddle_find(self, btc_price) -> dict:
         """Find matched call+put for straddle at ATM."""
@@ -722,16 +833,26 @@ class Bot:
 
     def save(self):
         try:
+            # Persist peak_premium so floor-trail survives restarts
+            peak = {}
+            if self.opts_eng:
+                peak = {str(k):v for k,v in self.opts_eng._peak_premium.items()}
             json.dump({
-                "start_cap":self.start_cap,"day_start":self.day_start,
-                "halted":self.halted,"halt_msg":self.halt_msg,
-                "total_tr":self.total_tr,"wins":self.wins,
-                "trades":self.trades[-100:],"stops":list(self._stops),
-                "consec":self._consec_loss,
-                "circuit":self._circuit_until.isoformat() if self._circuit_until else None,
-                "last_close":self._last_close.isoformat() if self._last_close else None,
+                "start_cap":  self.start_cap,
+                "day_start":  self.day_start,
+                "halted":     self.halted,
+                "halt_msg":   self.halt_msg,
+                "total_tr":   self.total_tr,
+                "wins":       self.wins,
+                "trades":     self.trades[-100:],
+                "stops":      [int(x) for x in self._stops],   # int list
+                "consec":     self._consec_loss,
+                "circuit":    self._circuit_until.isoformat() if self._circuit_until else None,
+                "last_close": self._last_close.isoformat() if self._last_close else None,
+                "peak_premium": peak,
             }, open(C.STATE,"w"))
-        except: pass
+        except Exception as e:
+            log.warning(f"save failed: {e}")
 
     def load(self):
         try:
@@ -744,7 +865,7 @@ class Bot:
             self.total_tr      = int(s.get("total_tr",0))
             self.wins          = int(s.get("wins",0))
             self.trades        = s.get("trades",[])
-            self._stops        = set(s.get("stops",[]))
+            self._stops        = set(int(x) for x in s.get("stops",[]))  # int set
             self._consec_loss  = int(s.get("consec",0))
             cu = s.get("circuit"); self._circuit_until = datetime.fromisoformat(cu) if cu else None
             lc = s.get("last_close"); self._last_close = datetime.fromisoformat(lc) if lc else None
@@ -764,10 +885,21 @@ class Bot:
             return {"success":False,"message":err,"server_ip":srv}
         self.capital   = bal
         self.connected = True
-        self.mdata     = MarketData(self.delta)
-        self.opts_eng  = OptionsEngine(self.delta)
-        if not self.load() or self.start_cap <= 0:
+        self.mdata    = MarketData(self.delta)
+        self.opts_eng = OptionsEngine(self.delta)
+        loaded = self.load()
+        if not loaded or self.start_cap <= 0:
             self.start_cap = bal; self.day_start = bal; self.save()
+        # Restore peak_premium from saved state
+        try:
+            import json as _j
+            if os.path.exists(C.STATE):
+                _s = _j.load(open(C.STATE))
+                for sym, peak in _s.get("peak_premium", {}).items():
+                    self.opts_eng._peak_premium[sym] = float(peak)
+                if _s.get("peak_premium"):
+                    self.emit("INFO", f"Restored {len(_s['peak_premium'])} option peaks")
+        except Exception: pass
         self.emit("INFO",
             f"Connected | ${bal:.2f} | Start ${self.start_cap:.2f} | "
             f"Halt <${self.start_cap*(1-C.HALT_PCT):.2f}")
@@ -792,15 +924,15 @@ class Bot:
             sz    = float(p.get("size",0) or 0)
             entry = float(p.get("entry_price") or p.get("avg_entry_price") or 0)
             if sz==0 or entry==0: continue
-            pid  = str(p.get("product_id",C.PID))
+            pid  = pid_int(p.get("product_id", C.PID))   # always int
             side = "long" if sz>0 else "short"
             lots = abs(int(sz))
-            if not any(str(t.get("pid",""))==pid and t.get("exit") is None for t in self.trades):
+            if not any(pid_int(t.get("pid",0))==pid and t.get("exit") is None for t in self.trades):
                 now = datetime.now(timezone.utc)
                 self.trades.append({"time":now.isoformat(),"side":side,
                     "entry":round(entry,1),"exit":None,"lots":lots,"pnl":None,
                     "pct":None,"reason":"synced","won":None,"pid":pid,"sym":C.SYMBOL})
-                self._pos_opened[pid] = now
+                self._pos_opened[pid] = now   # int key
                 self.emit("INFO",f"Synced: {side.upper()} {lots}L @ ${entry:.0f}")
             if pid not in self._stops and entry>0:
                 sp=entry*(1-C.STOP_PCT if side=="long" else 1+C.STOP_PCT)
@@ -818,9 +950,10 @@ class Bot:
             if sz==0 or entry==0: continue
             side = "long" if sz>0 else "short"
             pct  = (self.btc_price-entry)/entry if side=="long" else (entry-self.btc_price)/entry
-            lots = abs(int(sz)); pid = p.get("product_id",C.PID)
+            lots = abs(int(sz))
+            pid  = pid_int(p.get("product_id", C.PID))   # int key
             now  = datetime.now(timezone.utc)
-            opened_at = self._pos_opened.get(str(pid))
+            opened_at = self._pos_opened.get(pid)   # dict keyed by int
             hold_min = (now-opened_at).seconds//60 if opened_at else C.MIN_HOLD_MIN+1
             if hold_min < C.MIN_HOLD_MIN: continue
             reason = None
@@ -1007,10 +1140,15 @@ class Bot:
         if not r.get("success"):
             self.emit("ERROR",f"Order failed: {r.get('error',r.get('message','?'))}")
             return
-        sp = self.btc_price*(1-C.STOP_PCT if direction=="long" else 1+C.STOP_PCT)
-        tp = self.btc_price*(1+C.TP_PCT   if direction=="long" else 1-C.TP_PCT)
+        # Dynamic TP/SL based on current ATR regime
+        dyn_tp, dyn_sl = atr_tp_sl(self.last_conf.get("atr_pct", 0))
+        sp = self.btc_price*(1-dyn_sl if direction=="long" else 1+dyn_sl)
+        tp = self.btc_price*(1+dyn_tp if direction=="long" else 1-dyn_tp)
+        self.emit("INFO",
+            f"ATR={self.last_conf.get('atr_pct',0):.3f}% → "
+            f"dynamic TP={dyn_tp*100:.2f}% SL={dyn_sl*100:.2f}%")
         self.delta.bracket("sell" if direction=="long" else "buy", lots, sp, tp)
-        self._pos_opened[str(C.PID)] = now
+        self._pos_opened[pid_int(C.PID)] = now
         self.status=f"{direction.upper()} {lots}L @ ${self.btc_price:,.0f} conf={best['total']}"
         self.emit("TRADE",f"{self.status} | {strat}")
         self.total_tr += 1
@@ -1033,6 +1171,12 @@ class Bot:
 
         # STRADDLE: low volatility compression
         if strat == "STRADDLE" and (total_l >= C.CONF_STRADDLE or total_s >= C.CONF_STRADDLE):
+            # Only enter straddle on confirmed BB squeeze (multi-candle low BW)
+            bw_now = self.last_conf.get("bw", 99)
+            # Require BW below 1.5% (tight compression) to enter straddle
+            if bw_now > 1.5:
+                self.status = f"Straddle skipped: BW={bw_now:.2f}% not compressed enough (<1.5%)"
+                return
             st = self.opts_eng.straddle_find(self.btc_price)
             if st.get("found"):
                 total_prem = st["total_premium_usd"]
@@ -1088,7 +1232,7 @@ class Bot:
         if not pid:
             self.emit("WARN",f"No pid for {opt['symbol']}"); return
 
-        r = self.delta.order("buy",1,pid)
+        r = self.opts_eng.buy_option_limit(opt["symbol"], opt["mark"], pid=pid, lots=1)
         if r.get("success"):
             self.opts_eng.record_open(opt["symbol"])
             mon = opt["moneyness"]
