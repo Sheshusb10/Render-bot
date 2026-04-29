@@ -1050,16 +1050,18 @@ class AlphaBot:
 
     # ── Server IP helper ─────────────────────────────────────────────────────
     def _get_server_ip(self) -> str:
-        """Get the outbound IP of this server — needed for Delta Exchange whitelist."""
+        """Get the PUBLIC outbound IP — this is what Delta Exchange sees.
+        Socket method returns internal/private IP (10.x.x.x) — useless for whitelisting.
+        Must use external service to get real public IP."""
         try:
-            import socket
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
+            r = requests.get("https://api.ipify.org?format=json", timeout=5)
+            return r.json().get("ip", "unknown")
         except Exception:
-            return "unknown"
+            try:
+                r = requests.get("https://api4.my-ip.io/ip.json", timeout=5)
+                return r.json().get("ip", "unknown")
+            except Exception:
+                return "unknown"
 
     # ── Real log emitter ─────────────────────────────────────────────────────
     def _emit(self, level: str, msg: str):
@@ -1513,11 +1515,11 @@ def connect():
 
     # Now test wallet (needs correct IP whitelist + read permission)
     bal = bot.api.get_wallet()
-    if bal is None:
+    if not bal:
         server_ip = bot._get_server_ip()
         return jsonify({"success": False,
-                        "message": f"API keys invalid or IP not whitelisted. "
-                                   f"Add {server_ip} to your Delta Exchange API key whitelist."})
+                        "message": f"Connected but wallet returned empty. "
+                                   f"Check: 1) IP {server_ip} is whitelisted 2) API key has Read permission 3) Visit /api/wallet/debug to see raw response"})
 
     bot.api.connected = True
     capital = bot._sync_wallet(startup=True)
@@ -1560,6 +1562,55 @@ def wallet():
     return jsonify({"raw": raw, "capital_usd": round(bot.capital, 2),
                     "start_usd": round(bot.start_capital, 2),
                     "synced": bot.wallet_synced})
+
+
+@app.route("/api/wallet/debug")
+def wallet_debug():
+    """
+    Shows the RAW response from Delta Exchange wallet API.
+    Visit this URL to diagnose $0 balance issues.
+    """
+    # Call the raw endpoint directly without processing
+    path = "/v2/wallet/balances"
+    ts   = str(int(time.time()))
+    msg  = "GET" + ts + path
+    sig  = hmac.new(
+        bot.api.secret.encode(),
+        msg.encode(),
+        hashlib.sha256
+    ).hexdigest()
+    headers = {
+        "api-key":      bot.api.key,
+        "timestamp":    ts,
+        "signature":    sig,
+        "Content-Type": "application/json",
+    }
+    try:
+        r = requests.get(
+            f"{bot.api.base}{path}",
+            headers=headers,
+            timeout=10
+        )
+        raw_json = r.json()
+        return jsonify({
+            "status_code":   r.status_code,
+            "url_called":    f"{bot.api.base}{path}",
+            "api_key_set":   bool(bot.api.key),
+            "api_key_len":   len(bot.api.key),
+            "secret_len":    len(bot.api.secret),
+            "raw_response":  raw_json,
+            "diagnosis": (
+                "✅ Auth OK — check asset field names in raw_response"
+                if r.status_code == 200 else
+                "❌ IP not whitelisted — add server IP to Delta API key"
+                if r.status_code == 403 else
+                "❌ Invalid API key or secret"
+                if r.status_code == 401 else
+                f"❌ HTTP {r.status_code}"
+            )
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "api_key_set": bool(bot.api.key)})
 
 @app.route("/api/wallet/sync", methods=["POST"])
 def wallet_sync():
@@ -1762,22 +1813,18 @@ def get_ip():
     Bookmark this URL and check it whenever the bot stops working.
     Add the returned IP to your Delta Exchange API key whitelist.
     """
-    import socket
     outbound_ip = "unknown"
-    try:
-        # Connect to a public DNS server to discover outbound IP
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        outbound_ip = s.getsockname()[0]
-        s.close()
-    except Exception:
-        pass
-    # Also try requests-based method as backup
+    # Use ipify — returns the PUBLIC outbound IP that Delta Exchange sees
+    # Do NOT use socket.getsockname() — returns internal Render container IP (10.x.x.x)
     try:
         r = requests.get("https://api.ipify.org?format=json", timeout=5)
-        outbound_ip = r.json().get("ip", outbound_ip)
+        outbound_ip = r.json().get("ip", "unknown")
     except Exception:
-        pass
+        try:
+            r = requests.get("https://api4.my-ip.io/ip.json", timeout=5)
+            outbound_ip = r.json().get("ip", "unknown")
+        except Exception:
+            pass
     return jsonify({
         "render_outbound_ip": outbound_ip,
         "add_to_delta_whitelist": outbound_ip,
@@ -2501,7 +2548,7 @@ function renderState(s){
   const pill=document.getElementById('statusPill');
   pill.className='pill '+(s.running?'p-on':'p-off');
   document.getElementById('pillTxt').textContent=s.running?'Live':'Stopped';
-  document.getElementById('hdrsub').textContent='Delta Exchange '+(s.wallet_synced?'&#10003; Connected':'&#8226; Not connected');
+  document.getElementById('hdrsub').textContent='Delta Exchange '+(s.wallet_synced?'✓ Connected':'• Not connected');
 
   // Chart
   if(s.candles_cache&&s.candles_cache.length>1) drawChart(s.candles_cache);
