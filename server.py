@@ -325,6 +325,45 @@ class DeltaAPI:
         return self._post(f"/v2/orders/{order_id}/cancel",
                           {"product_id": product_id}) or {}
 
+    def place_stop_order(self, product_id: int, side: str, size: int,
+                         stop_price: float) -> dict:
+        """
+        Place a stop-market order on Delta Exchange.
+        For a LONG: side='sell', stop_price = entry × 0.975 (2.5% below)
+        For a SHORT: side='buy', stop_price = entry × 1.025 (2.5% above)
+        This order lives on Delta's servers — survives bot restarts.
+        """
+        body = {
+            "product_id": product_id,
+            "size":        size,
+            "side":        side,
+            "order_type":  "stop_market_order",
+            "stop_price":  str(round(stop_price, 1)),
+            "time_in_force": "gtc",
+            "stop_trigger_method": "mark_price",
+            "bracket_stop_loss_price": str(round(stop_price, 1)),
+        }
+        result = self._post("/v2/orders", body)
+        log.info(f"Stop order: {side} {size} lots @ ${stop_price:.1f} → {result}")
+        return result or {}
+
+    def place_bracket_stop(self, product_id: int, side: str,
+                           size: int, stop_price: float,
+                           take_profit: float = 0) -> dict:
+        """Place stop loss (and optionally take-profit) as bracket order."""
+        body = {
+            "product_id":   product_id,
+            "size":         size,
+            "side":         side,
+            "order_type":   "stop_market_order",
+            "stop_price":   str(round(stop_price, 1)),
+            "time_in_force":"gtc",
+            "stop_trigger_method": "mark_price",
+        }
+        if take_profit > 0:
+            body["bracket_take_profit_price"] = str(round(take_profit, 1))
+        return self._post("/v2/orders", body) or {}
+
 # ══════════════════════════════════════════════════════════════════════════════
 # TECHNICAL ENGINE — ALL BUGS FIXED
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2401,6 +2440,20 @@ def set_product_id():
                     "new_product_id": Cfg.BTC_PRODUCT_ID})
 
 
+@app.route("/api/force_sync", methods=["POST", "GET"])
+def force_sync():
+    """Force position sync + wallet sync. Call after bot restart."""
+    bot._sync_wallet(startup=False)
+    bot._sync_positions_from_delta()
+    return jsonify({
+        "success":    True,
+        "capital":    round(bot.capital, 2),
+        "positions":  len([p for p in bot.positions if not p.closed]),
+        "logs":       bot.log_buffer[-10:],
+        "message":    "Sync complete — check Logs tab for position details"
+    })
+
+
 @app.route("/api/positions/raw")
 def positions_raw():
     """Show EXACT raw response from Delta positions endpoint — diagnose sync."""
@@ -2558,13 +2611,59 @@ def close_all():
     live = bot.api.get_positions()
     closed = 0
     for p in live:
-        qty  = abs(int(float(p.get("size", 0) or 0)))
-        side = p.get("side", "")
+        size = float(p.get("size", 0) or 0)
+        qty  = abs(int(size))
         if qty > 0:
-            bot.api.place_order(p["product_id"],
-                                "sell" if side == "buy" else "buy", qty)
+            # Positive size = long → close with sell
+            # Negative size = short → close with buy
+            close_side = "sell" if size > 0 else "buy"
+            bot.api.place_order(p["product_id"], close_side, qty)
+            bot._emit("TRADE",
+                f"🔴 CLOSED ALL: {close_side.upper()} {qty}L "
+                f"{p.get('product_symbol','BTCUSD')}")
             closed += 1
     return jsonify({"success": True, "closed": closed})
+
+
+@app.route("/api/set_stop", methods=["POST"])
+def set_stop():
+    """
+    Manually place a stop-loss order on any open position.
+    POST: {product_id: 27, direction: "short", entry: 77032.5, lots: 1}
+    """
+    d = request.json or {}
+    pid       = int(d.get("product_id", Cfg.BTC_PRODUCT_ID))
+    direction = d.get("direction", "short")
+    entry     = float(d.get("entry", bot.last_price or 77000))
+    lots      = int(d.get("lots", 1))
+    stop_pct  = float(d.get("stop_pct", 0.025))  # default 2.5%
+    tp_pct    = float(d.get("tp_pct",   0.030))  # default 3.0%
+
+    if direction == "long":
+        stop_price = entry * (1 - stop_pct)
+        tp_price   = entry * (1 + tp_pct)
+        close_side = "sell"
+    else:
+        stop_price = entry * (1 + stop_pct)
+        tp_price   = entry * (1 - tp_pct)
+        close_side = "buy"
+
+    result = bot.api.place_bracket_stop(pid, close_side, lots,
+                                        stop_price, tp_price)
+    success = result.get("success", False)
+    bot._emit("INFO" if success else "WARN",
+        f"{'✅' if success else '❌'} Stop set: {direction.upper()} "
+        f"{lots}L entry=${entry:.1f} stop=${stop_price:.1f} "
+        f"tp=${tp_price:.1f} → {result.get('error','OK')}")
+    return jsonify({
+        "success":     success,
+        "direction":   direction,
+        "entry":       entry,
+        "stop_price":  round(stop_price, 1),
+        "take_profit": round(tp_price, 1),
+        "close_side":  close_side,
+        "result":      result,
+    })
 
 @app.route("/api/server_config")
 def server_config():
