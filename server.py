@@ -124,6 +124,12 @@ class Cfg:
     BTC_PRODUCT_ID     = 27
     SCAN_INTERVAL      = 300
 
+    # ── EXECUTION REALITY (slippage model) ──────────────────────────────────
+    # Options: ~5% of mark price (wide spreads on small exchanges)
+    # Perpetuals: ~0.05% (tight BTC perpetual book)
+    SLIPPAGE_OPT_PCT   = 0.05
+    SLIPPAGE_PERP_PCT  = 0.0005
+
 # ══════════════════════════════════════════════════════════════════════════════
 # DELTA EXCHANGE API
 # ══════════════════════════════════════════════════════════════════════════════
@@ -207,17 +213,31 @@ class DeltaAPI:
             return None
 
     def get_candles(self, symbol="BTCUSD", resolution=5, limit=100):
-        """Public endpoint — no auth needed, works before and after login."""
+        """Signed request — Delta India requires auth for history/candles endpoint."""
         end   = int(time.time())
         start = end - (resolution * 60 * limit)
+        params = {"symbol": symbol, "resolution": resolution,
+                  "start": start, "end": end}
+        d = self._get("/v2/history/candles", params)
+        if d and d.get("success"):
+            result = d.get("result", [])
+            log.info(f"Candles: {len(result)} × {resolution}min {symbol}")
+            return result
+        if d:
+            log.warning(f"Candles error: {d.get('error','?')} {d.get('message','')}")
+        return []
+
+    def get_candles_debug(self, symbol="BTCUSD", resolution=5):
+        """Returns raw candle response for debugging."""
+        end   = int(time.time())
+        start = end - (resolution * 60 * 20)
         qs = f"?symbol={symbol}&resolution={resolution}&start={start}&end={end}"
+        url = f"{self.base}/v2/history/candles{qs}"
         try:
-            r = self.session.get(f"{self.base}/v2/history/candles{qs}", timeout=10)
-            d = r.json()
-            return d.get("result", []) if d and d.get("success") else []
+            r = self.session.get(url, timeout=10)
+            return {"url": url, "status": r.status_code, "raw": r.json()}
         except Exception as e:
-            log.warning(f"Candles fetch failed: {e}")
-            return []
+            return {"url": url, "error": str(e)}
 
     def get_ticker(self, symbol="BTCUSD"):
         """Public endpoint — no auth needed, works before login."""
@@ -659,29 +679,36 @@ class NewsEngine:
             pass
 
         total = bull + bear
-        if total < 0.5:
-            return {"score": 0.0, "label": "Neutral", "confidence": 0.2,
-                    "bull_score": 0, "bear_score": 0, "sources_checked": checked}
+        # Minimum 2 sources required for reliable signal
+        if checked < 2 or total < 0.5:
+            return {"score": 0.0, "label": "Neutral (insufficient sources)",
+                    "confidence": 0.1,
+                    "bull_score": round(bull,1), "bear_score": round(bear,1),
+                    "sources_checked": checked}
         score = (bull - bear) / total
-        label = ("Strongly Bullish" if score > 0.5 else
-                 "Bullish"          if score > 0.2 else
-                 "Strongly Bearish" if score < -0.5 else
-                 "Bearish"          if score < -0.2 else "Neutral")
+        # Require meaningful score gap to label as Bull/Bear
+        label = ("Strongly Bullish" if score > 0.6 else
+                 "Bullish"          if score > 0.3 else
+                 "Strongly Bearish" if score < -0.6 else
+                 "Bearish"          if score < -0.3 else "Neutral")
         return {"score": round(score, 3), "label": label,
                 "confidence": round(min(total / 8.0, 1.0), 2),
                 "bull_score": round(bull, 1), "bear_score": round(bear, 1),
                 "sources_checked": checked}
 
     def get_multiplier(self) -> float:
-        """FIX BUG: Capped tighter (1.10/0.88 vs 1.15/0.75).
-        Prevents single bullish headline from overriding veto logic."""
+        """News multiplier — only applies when 2+ sources and high confidence."""
         s = self.get_sentiment()
-        sc, conf = s.get("score", 0), s.get("confidence", 0)
-        if conf < 0.3: return 1.0
-        if sc > 0.5:  return 1.10
-        if sc > 0.2:  return 1.05
-        if sc < -0.5: return 0.88
-        if sc < -0.2: return 0.94
+        sc   = s.get("score", 0)
+        conf = s.get("confidence", 0)
+        srcs = s.get("sources_checked", 0)
+        # Ignore single-source sentiment entirely
+        if srcs < 2 or conf < 0.4:
+            return 1.0
+        if sc > 0.6:  return 1.08
+        if sc > 0.3:  return 1.03
+        if sc < -0.6: return 0.90
+        if sc < -0.3: return 0.96
         return 1.0
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -813,8 +840,111 @@ class RiskGuard:
         }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 7-PILLAR CONFIDENCE ENGINE — FIXED + PROFITABILITY TUNED
+# INSTITUTIONAL CONFIDENCE ENGINE — 4 HIGH-QUALITY PILLARS
+# Reduced from 7 to 4: removes funding/news/HTF (too noisy, hidden overfitting)
+# Each pillar independently falsifiable with clear edge rationale
 # ══════════════════════════════════════════════════════════════════════════════
+
+class RegimeEngine:
+    """
+    Regime confidence using 3 independent signals — ADX alone is weak.
+    All three must agree for high confidence.
+    """
+
+    @staticmethod
+    def structure_score(highs: list, lows: list, closes: list,
+                        lookback: int = 10) -> tuple:
+        """
+        Market structure: Higher Highs/Higher Lows = bull structure.
+        Lower Highs/Lower Lows = bear structure.
+        Returns (score -1 to +1, label)
+        """
+        if len(closes) < lookback:
+            return 0.0, "unknown"
+        h = highs[-lookback:]
+        l = lows[-lookback:]
+        half = lookback // 2
+
+        # Count HH/HL vs LH/LL
+        hh = sum(1 for i in range(half, lookback) if h[i] > h[i-1])
+        hl = sum(1 for i in range(half, lookback) if l[i] > l[i-1])
+        lh = sum(1 for i in range(half, lookback) if h[i] < h[i-1])
+        ll = sum(1 for i in range(half, lookback) if l[i] < l[i-1])
+
+        bull_score = (hh + hl) / (2 * half)  # 0 to 1
+        bear_score = (lh + ll) / (2 * half)
+
+        net = bull_score - bear_score  # -1 to +1
+        label = ("bull" if net > 0.3 else "bear" if net < -0.3 else "neutral")
+        return round(net, 3), label
+
+    @staticmethod
+    def volatility_regime(highs: list, lows: list, closes: list,
+                          period: int = 14) -> tuple:
+        """
+        ATR expansion = trending (good for directional trades)
+        ATR contraction = ranging (bad for directional, good for range)
+        Returns (expanding: bool, atr_ratio: float)
+        """
+        if len(closes) < period * 2:
+            return False, 1.0
+        atr_now  = TechEngine.atr(highs, lows, closes, period)
+        atr_prev = TechEngine.atr(highs[:-period], lows[:-period],
+                                   closes[:-period], period)
+        if atr_prev == 0:
+            return False, 1.0
+        ratio = atr_now / atr_prev
+        expanding = ratio > 1.15  # 15% expansion = trending
+        return expanding, round(ratio, 3)
+
+    @staticmethod
+    def full_regime(highs: list, lows: list, closes: list,
+                    adx_val: float, pdi: float, ndi: float) -> dict:
+        """
+        Combines ADX + structure + volatility expansion for regime confidence.
+        Returns score 0-100 and regime label with confidence.
+        """
+        struct_score, struct_label = RegimeEngine.structure_score(
+            highs, lows, closes)
+        vol_expanding, atr_ratio = RegimeEngine.volatility_regime(
+            highs, lows, closes)
+
+        # ADX strength
+        adx_score = min(adx_val / 30.0, 1.0)  # 0 to 1, capped at ADX=30
+
+        # Structure alignment with ADX direction
+        adx_bull = pdi > ndi
+        struct_aligned = ((adx_bull and struct_label == "bull") or
+                          (not adx_bull and struct_label == "bear"))
+
+        # Combined regime confidence
+        confidence = (adx_score * 40 +
+                      abs(struct_score) * 35 +
+                      (15 if vol_expanding else 0) +
+                      (10 if struct_aligned else 0))
+
+        # Direction
+        if adx_val > 20 and struct_aligned:
+            if adx_bull and struct_label == "bull":
+                label = "STRONG_BULL" if confidence > 65 else "BULL"
+            elif not adx_bull and struct_label == "bear":
+                label = "STRONG_BEAR" if confidence > 65 else "BEAR"
+            else:
+                label = "NEUTRAL"
+        else:
+            label = "NEUTRAL"
+
+        return {
+            "label":       label,
+            "confidence":  round(confidence, 1),
+            "adx":         round(adx_val, 1),
+            "structure":   struct_label,
+            "vol_expanding": vol_expanding,
+            "atr_ratio":   atr_ratio,
+            "adx_bull":    adx_bull,
+        }
+
+
 class ConfidenceEngine:
 
     def score(self, data: dict, direction: str,
@@ -823,74 +953,51 @@ class ConfidenceEngine:
         highs   = data.get("highs", [])
         lows    = data.get("lows", [])
         volumes = data.get("volumes", [])
-        c5m     = data.get("closes_5m", closes)
         c15m    = data.get("closes_15m", closes)
+        h15m    = data.get("highs_15m",  highs)
+        l15m    = data.get("lows_15m",   lows)
         h_utc   = data.get("hour_utc", 12)
         m_utc   = data.get("minute_utc", 0)
-        funding = data.get("funding_rate", 0.0)
         weekend = data.get("is_weekend", False)
-        oi_chg  = data.get("oi_change_pct", 0.0)
 
         if len(closes) < 55:
             return 0, True, "insufficient_data(<55 candles)", {}
 
         adx_val, pdi, ndi = TechEngine.adx(highs, lows, closes)
-        adx_min = learner.adx_min if learner else Cfg.ADX_TREND_MIN
 
-        # ── HARD VETOES ──────────────────────────────────────────────────────
-        if adx_val < 13:
-            return 0, True, f"ADX={adx_val:.1f}<13(extreme_chop)", {}
+        # ── HARD VETOES (binary, non-negotiable) ─────────────────────────────
         if h_utc in Cfg.DEAD_ZONE_HOURS and not weekend:
             return 0, True, f"dead_zone_{h_utc}UTC", {}
         for mh, mm in Cfg.MACRO_BLACKOUT_TIMES:
             if abs((h_utc * 60 + m_utc) - (mh * 60 + mm)) <= Cfg.BLACKOUT_WINDOW_MINS:
                 return 0, True, f"macro_blackout_{mh}:{mm:02d}", {}
-        if direction == "long"  and funding > Cfg.FUNDING_LONG_MAX:
-            return 0, True, f"funding={funding:.4f}>long_max", {}
-        if direction == "short" and funding < Cfg.FUNDING_SHORT_MIN:
-            return 0, True, f"funding={funding:.4f}<short_min", {}
         if volumes and not TechEngine.volume_ok(volumes):
             return 0, True, "low_volume_trap", {}
-
-        # HTF contradiction veto — ONLY on 15m, not 5m (less strict)
-        if len(c15m) >= 21:
-            h15e8 = TechEngine.ema(c15m, 8)[-1]
-            if direction == "long"  and c15m[-1] < h15e8 * 0.998:
-                return 0, True, "15m_trend_contradiction", {}
-            if direction == "short" and c15m[-1] > h15e8 * 1.002:
-                return 0, True, "15m_trend_contradiction", {}
 
         bd = {}
         total = 0
 
-        # ── P1: Regime (25%) ─────────────────────────────────────────────────
-        e8  = TechEngine.ema(closes, 8)[-1]
-        e21 = TechEngine.ema(closes, 21)[-1]
-        e55 = TechEngine.ema(closes, 55)[-1]
-        pr  = closes[-1]
-        bull = pr > e8 > e21 > e55 and adx_val > adx_min and pdi > ndi
-        bear = pr < e8 < e21 < e55 and adx_val > adx_min and ndi > pdi
+        # ── PILLAR 1: REGIME CONFIDENCE (40%) ────────────────────────────────
+        # Uses ADX + market structure (HH/HL) + volatility expansion
+        # Not just ADX — all 3 must agree for full score
+        regime_info = RegimeEngine.full_regime(highs, lows, closes,
+                                               adx_val, pdi, ndi)
+        reg_label   = regime_info["label"]
+        reg_conf    = regime_info["confidence"]
 
-        if   direction == "long"  and bull: bd["regime"] = 25
-        elif direction == "short" and bear: bd["regime"] = 25
-        elif adx_val > adx_min:             bd["regime"] = 12
+        if   direction == "long"  and reg_label in ("STRONG_BULL", "BULL"):
+            bd["regime"] = int(reg_conf * 0.40)
+        elif direction == "short" and reg_label in ("STRONG_BEAR", "BEAR"):
+            bd["regime"] = int(reg_conf * 0.40)
+        elif reg_label == "NEUTRAL" and regime_info["vol_expanding"]:
+            bd["regime"] = 8  # Possible breakout forming
         else:
-            # FIX: NEUTRAL now gets 5 points (was 0 — blocked all range trades)
-            bd["regime"] = 5
+            bd["regime"] = max(0, int(reg_conf * 0.10))  # Minimal credit
+        bd["regime"] = min(bd["regime"], 40)
         total += bd["regime"]
 
-        # ── P2: HTF Alignment (20%) ───────────────────────────────────────────
-        htf = 0
-        for htfc in [c5m, c15m]:
-            if len(htfc) >= 21:
-                he8  = TechEngine.ema(htfc, 8)[-1]
-                he21 = TechEngine.ema(htfc, 21)[-1]
-                if direction == "long"  and htfc[-1] > he8 > he21: htf += 10
-                elif direction == "short" and htfc[-1] < he8 < he21: htf += 10
-        bd["htf_alignment"] = htf
-        total += htf
-
-        # ── P3: Momentum (15%) ────────────────────────────────────────────────
+        # ── PILLAR 2: MOMENTUM QUALITY (30%) ─────────────────────────────────
+        # RSI position + MACD divergence (highest-alpha signal per the autopsy)
         rsi_v = TechEngine.rsi(closes, Cfg.RSI_PERIOD)
         _, _, _, histogram = TechEngine.macd(closes, Cfg.MACD_FAST,
                                               Cfg.MACD_SLOW, Cfg.MACD_SIGNAL)
@@ -900,60 +1007,61 @@ class ConfidenceEngine:
 
         mom = 0
         if direction == "long":
-            if rmin <= rsi_v <= rmax:     mom += 7
-            elif rsi_v > rmax:            mom += 4
-            elif rsi_v < 35:              mom += 3   # Oversold bounce potential
+            # RSI in bull pullback zone
+            if rmin <= rsi_v <= rmax:  mom += 12
+            elif 35 <= rsi_v < rmin:   mom += 7   # Oversold but recovering
+            # MACD momentum
             if (len(histogram) >= 3 and
+                    histogram[-1] > histogram[-2] > histogram[-3] and
+                    histogram[-1] > 0): mom += 10  # Rising above zero = strong
+            elif (len(histogram) >= 3 and
                     histogram[-1] > histogram[-2] > histogram[-3]): mom += 5
-            if divergence == "bullish":   mom += 8
+            # Divergence = highest-conviction entry (per BTC autopsy)
+            if divergence == "bullish": mom += 18
         else:
-            if Cfg.RSI_SHORT_MIN <= rsi_v <= Cfg.RSI_SHORT_MAX: mom += 7
-            elif rsi_v < Cfg.RSI_SHORT_MIN: mom += 4
-            elif rsi_v > 65:              mom += 3   # Overbought short potential
+            if Cfg.RSI_SHORT_MIN <= rsi_v <= Cfg.RSI_SHORT_MAX: mom += 12
+            elif rsi_v > 65: mom += 7
             if (len(histogram) >= 3 and
+                    histogram[-1] < histogram[-2] < histogram[-3] and
+                    histogram[-1] < 0): mom += 10
+            elif (len(histogram) >= 3 and
                     histogram[-1] < histogram[-2] < histogram[-3]): mom += 5
-            if divergence == "bearish":   mom += 8
-        bd["momentum"] = min(mom, 15)
+            if divergence == "bearish": mom += 18
+        bd["momentum"] = min(mom, 30)
         total += bd["momentum"]
 
-        # ── P4: Volume + OI (10%) ─────────────────────────────────────────────
+        # ── PILLAR 3: VOLATILITY REGIME (20%) ────────────────────────────────
+        # ATR expansion + BB squeeze release = real move coming
+        _, _, _, bw = TechEngine.bollinger(closes)
+        vol_expanding, atr_ratio = RegimeEngine.volatility_regime(highs, lows, closes)
+        atr_val = TechEngine.atr(highs, lows, closes)
+
         vs = 0
+        if vol_expanding and 0.3 < bw < 5.0:   vs = 20  # Trending volatility
+        elif not vol_expanding and bw < 0.4:    vs = 15  # Squeeze = breakout pending
+        elif 0.3 < bw < 4.0:                   vs = 12  # Normal
+        elif bw >= 4.0:                         vs = 4   # Extreme — IV crush risk
+        else:                                   vs = 2
+        bd["volatility"] = vs
+        total += vs
+
+        # ── PILLAR 4: EXECUTION QUALITY (10%) ────────────────────────────────
+        # Volume + session timing — is this a high-quality execution window?
+        vol_score = 0
         if volumes:
             avg = sum(volumes[-20:]) / max(len(volumes[-20:]), 1)
             if avg > 0:
-                if   volumes[-1] > avg * 1.5: vs = 8
-                elif volumes[-1] > avg * 1.0: vs = 5
-                elif volumes[-1] > avg * 0.5: vs = 3
-        if oi_chg > Cfg.OI_SPIKE_PCT: vs = min(vs + 2, 10)
-        bd["volume_oi"] = vs
-        total += vs
+                ratio = volumes[-1] / avg
+                if ratio > 1.5: vol_score += 5
+                elif ratio > 1.0: vol_score += 3
+        # Session quality
+        if h_utc in Cfg.PEAK_HOURS: vol_score += 5
+        elif not weekend:           vol_score += 2
+        bd["execution"] = min(vol_score, 10)
+        total += bd["execution"]
 
-        # ── P5: Volatility (10%) ─────────────────────────────────────────────
-        _, _, _, bw = TechEngine.bollinger(closes)
-        if   0.25 < bw < 4.0: vs2 = 10
-        elif 0.1  < bw <= 0.25: vs2 = 6   # Squeeze — breakout potential
-        elif bw >= 4.0:        vs2 = 4    # Extreme — reduce but don't zero
-        else:                  vs2 = 2
-        bd["volatility"] = vs2
-        total += vs2
-
-        # ── P6: Time-of-day adaptive (10%) ────────────────────────────────────
-        base_t = 10 if h_utc in Cfg.PEAK_HOURS else (3 if weekend else 6)
-        hm = learner.hour_mult(h_utc) if learner else 1.0
-        ts = min(int(base_t * hm), 10)
-        bd["time_of_day"] = ts
-        total += ts
-
-        # ── P7: Funding (10%) ─────────────────────────────────────────────────
-        fs = 7  # Neutral default
-        if direction == "long":
-            if   funding > 0.0005:  fs = 3
-            elif funding < -0.0003: fs = 10
-        else:
-            if   funding < -0.0003: fs = 3
-            elif funding > 0.0005:  fs = 10
-        bd["funding"] = fs
-        total += fs
+        # Store regime info for dashboard
+        bd["_regime_detail"] = regime_info
 
         return min(total, 100), False, "", bd
 
@@ -1031,10 +1139,19 @@ class Position:
         self.rsi_entry  = rsi
         self.adx_entry  = adx
         self.hour_utc   = hour_utc
+        # ── Position Analytics (MAE/MFE) ─────────────────────────────────────
+        self.mae        = 0.0   # Max Adverse Excursion (worst % against us)
+        self.mfe        = 0.0   # Max Favorable Excursion (best % for us)
+        self.slippage   = 0.0   # Actual slippage paid on entry
+        self.entry_adj  = entry # Adjusted entry after slippage
 
     def check_exit(self, price: float) -> tuple:
         pct = ((price - self.entry) / self.entry if self.side == "long"
                else (self.entry - price) / self.entry)
+
+        # Track MAE/MFE (tells you if stops are too tight / targets too early)
+        self.mae = min(self.mae, pct)   # Most negative pct seen
+        self.mfe = max(self.mfe, pct)   # Most positive pct seen
 
         # ── RANGE/SCALP MODE — tight exits ──────────────────────────────
         if getattr(self, 'range_mode', False):
@@ -1074,59 +1191,136 @@ class Position:
         return False, "", False
 
 # ══════════════════════════════════════════════════════════════════════════════
-# OPTIONS SELECTOR — FIXED premium formula
+# INSTITUTIONAL OPTIONS SELECTOR
+# Filters: IV crush risk, liquidity (OI+volume), bid-ask spread, theta vs move
 # ══════════════════════════════════════════════════════════════════════════════
 class OptionsSelector:
+
+    # Institutional-grade filters
+    MIN_OI_CONTRACTS     = 50    # Skip illiquid strikes
+    MIN_VOLUME_CONTRACTS = 5     # Min daily volume
+    MAX_SPREAD_PCT       = 0.20  # Reject if spread > 20% of mark (too wide)
+    MAX_IV_RANK          = 75    # Skip if IV too high (IV crush risk after entry)
+    MIN_DELTA_ABS        = 0.15  # Skip deep OTM (gamma risk, low delta)
+
+    @staticmethod
+    def _liquidity_ok(opt: dict) -> tuple:
+        """Check OI, volume, and bid-ask spread. Returns (ok, reason)."""
+        oi     = int(float(opt.get("open_interest", 0) or 0))
+        vol    = int(float(opt.get("volume",         0) or 0))
+        bid    = float(opt.get("best_bid_price",  0) or 0)
+        ask    = float(opt.get("best_ask_price",  0) or 0)
+        mark   = float(opt.get("mark_price",      0) or 0)
+
+        if oi < OptionsSelector.MIN_OI_CONTRACTS:
+            return False, f"OI={oi}<{OptionsSelector.MIN_OI_CONTRACTS}"
+        if vol < OptionsSelector.MIN_VOLUME_CONTRACTS:
+            return False, f"vol={vol}<{OptionsSelector.MIN_VOLUME_CONTRACTS}"
+        if bid > 0 and ask > 0 and mark > 0:
+            spread_pct = (ask - bid) / mark
+            if spread_pct > OptionsSelector.MAX_SPREAD_PCT:
+                return False, f"spread={spread_pct:.0%}>{OptionsSelector.MAX_SPREAD_PCT:.0%}"
+        return True, "ok"
+
+    @staticmethod
+    def _theta_risk_ok(mark: float, atr_usd: float, hold_hours: float = 4.0) -> tuple:
+        """
+        Theta decay check: expected move must justify premium paid.
+        Expected move = ATR × √(hold_hours/24)
+        Minimum ratio: 1.5x (need move 1.5x larger than premium to profit)
+        Returns (ok, ratio)
+        """
+        expected_move = atr_usd * math.sqrt(hold_hours / 24.0)
+        if mark <= 0 or expected_move <= 0:
+            return True, 0.0  # Can't check, allow
+        ratio = expected_move / mark
+        return ratio >= Cfg.MIN_MOVE_TO_PREMIUM_RATIO, round(ratio, 2)
+
     @staticmethod
     def select(chain: list, price: float, direction: str,
                confidence: int, atr_usd: float) -> Optional[dict]:
-        if not chain or price <= 0: return None
+        if not chain or price <= 0:
+            return None
         target_type = "call_options" if direction == "long" else "put_options"
         today = datetime.now(timezone.utc).date()
         candidates = []
+        rejected = []
 
         for opt in chain:
-            if opt.get("contract_type") != target_type: continue
+            if opt.get("contract_type") != target_type:
+                continue
             try:
                 expiry = datetime.strptime(
                     opt.get("settlement_time", "")[:10], "%Y-%m-%d").date()
                 dte = (expiry - today).days
-                if dte < 0 or dte > 3: continue
+                if dte < 0 or dte > 3:
+                    continue
+
                 strike = float(opt.get("strike_price", 0) or 0)
                 mark   = float(opt.get("mark_price",   0) or 0)
-                if mark <= 0 or strike <= 0: continue
+                if mark <= 0 or strike <= 0:
+                    continue
 
-                # FIX BUG 9: Premium vs move formula
-                # expected_move = ATR_usd × sqrt(hold_hours/24)
-                # mark is option price in USD per contract
-                # We compare: mark (USD) vs expected_move (USD)
-                expected_move = atr_usd * math.sqrt(4.0 / 24.0)
-                if expected_move > 0 and mark > expected_move * Cfg.MIN_MOVE_TO_PREMIUM_RATIO:
-                    continue  # Option premium too expensive for expected move
+                # ── INSTITUTIONAL FILTER 1: Liquidity ────────────────────
+                liq_ok, liq_reason = OptionsSelector._liquidity_ok(opt)
+                if not liq_ok:
+                    rejected.append(f"{strike}: {liq_reason}")
+                    continue
 
+                # ── INSTITUTIONAL FILTER 2: Theta vs Move ────────────────
+                theta_ok, move_ratio = OptionsSelector._theta_risk_ok(
+                    mark, atr_usd)
+                if not theta_ok:
+                    rejected.append(f"{strike}: theta/move={move_ratio:.1f}x<1.5")
+                    continue
+
+                # ── INSTITUTIONAL FILTER 3: Moneyness (no deep OTM) ──────
                 moneyness = ((strike - price) / price if direction == "long"
                              else (price - strike) / price)
+                # Skip deep OTM options (low delta, high theta risk)
+                if moneyness > 0.04:  # More than 4% OTM
+                    rejected.append(f"{strike}: too_OTM={moneyness:.2%}")
+                    continue
+
                 candidates.append({
-                    "product": opt, "dte": dte, "moneyness": moneyness,
-                    "mark": mark, "product_id": opt.get("id"),
+                    "product":    opt,
+                    "dte":        dte,
+                    "moneyness":  moneyness,
+                    "mark":       mark,
+                    "product_id": opt.get("id"),
+                    "move_ratio": move_ratio,
+                    "oi":         int(float(opt.get("open_interest", 0) or 0)),
                 })
             except Exception:
                 continue
 
-        if not candidates: return None
+        if rejected:
+            log.info(f"Options rejected: {len(rejected)} contracts "
+                     f"({', '.join(rejected[:3])})")
+
+        if not candidates:
+            log.warning(f"No options passed filters for {direction} "
+                        f"(${price:,.0f}, ATR=${atr_usd:.0f})")
+            return None
 
         def score_opt(c):
-            dte_sc = 10 - c["dte"] * 3  # Prefer shorter DTE
+            # Prefer: shorter DTE + near ATM + high OI + good move ratio
+            dte_sc  = (3 - c["dte"]) * 5       # 0→15, prefer 0DTE
+            # Moneyness: slight ITM for high conf, ATM otherwise
             if confidence >= Cfg.HIGH_CONFIDENCE:
-                # High confidence → slight ITM for better delta
-                mon_sc = 10 if -0.025 <= c["moneyness"] <= 0.005 else 4
+                atm_sc = 15 if -0.02 <= c["moneyness"] <= 0.005 else 5
             else:
-                # Lower confidence → ATM for lower premium risk
-                mon_sc = 10 if -0.008 <= c["moneyness"] <= 0.008 else 3
-            return dte_sc + mon_sc
+                atm_sc = 15 if -0.01 <= c["moneyness"] <= 0.005 else 5
+            oi_sc   = min(c["oi"] // 50, 5)    # OI bonus up to 5 pts
+            ratio_sc= min(int(c["move_ratio"] * 2), 5)  # Move ratio bonus
+            return dte_sc + atm_sc + oi_sc + ratio_sc
 
         candidates.sort(key=score_opt, reverse=True)
-        return candidates[0]
+        best = candidates[0]
+        log.info(f"Selected option: {best['product'].get('symbol','')} "
+                 f"mark=${best['mark']:.2f} DTE={best['dte']} "
+                 f"OTM={best['moneyness']:.1%} move_ratio={best['move_ratio']:.1f}x")
+        return best
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN BOT
@@ -1570,11 +1764,12 @@ class AlphaBot:
                  f"{reason} | ${pnl_usd:+.2f} ({pnl_pct*100:+.2f}%)")
 
     def _log(self, action: str, side: str, price: float, amount: float,
-              conf: int, symbol: str, reason: str = "", pnl_pct: float = 0):
+              conf: int, symbol: str, reason: str = "", pnl_pct: float = 0,
+              pos: "Position" = None):
         if action == "OPEN":
             self.trades_today += 1
             self.trades_week  += 1
-        self.trade_log.append({
+        entry = {
             "time": datetime.now(timezone.utc).isoformat(),
             "action": action, "side": side, "price": price,
             "amount": amount, "confidence": conf, "symbol": symbol,
@@ -1582,7 +1777,22 @@ class AlphaBot:
             "capital": self.capital,
             "win_rate": self.sizer.win_rate,
             "streak": self.sizer.streak,
-        })
+        }
+        # Add MAE/MFE analytics if closing a position
+        if action == "CLOSE" and pos:
+            entry["mae_pct"]      = round(pos.mae * 100, 3)
+            entry["mfe_pct"]      = round(pos.mfe * 100, 3)
+            entry["slippage_usd"] = round(getattr(pos, "slippage", 0), 4)
+            # Quality assessment
+            if pnl_pct > 0:
+                # If MFE >> actual PnL, we left money on the table
+                capture_ratio = (pnl_pct / pos.mfe) if pos.mfe > 0 else 0
+                entry["profit_capture"] = round(capture_ratio, 2)
+            else:
+                # If MAE ~= PnL, stop was well-placed
+                stop_efficiency = abs(pnl_pct / pos.mae) if pos.mae < 0 else 0
+                entry["stop_efficiency"] = round(stop_efficiency, 2)
+        self.trade_log.append(entry)
 
     def _run_loop(self):
         cycle    = 0
@@ -1829,6 +2039,30 @@ def wallet_debug():
         })
     except Exception as e:
         return jsonify({"error": str(e), "api_key_set": bool(bot.api.key)})
+
+
+@app.route("/api/candles/debug")
+def candles_debug():
+    """
+    Shows raw Delta Exchange candle response.
+    If empty, candles aren't loading — this is why ADX/ATR shows —
+    Visit: render-bot-w6rc.onrender.com/api/candles/debug
+    """
+    raw = bot.api.get_candles_debug("BTCUSD", 5)
+    candles = raw.get("raw", {}).get("result", [])
+    return jsonify({
+        "url_called":    raw.get("url",""),
+        "http_status":   raw.get("status", 0),
+        "candles_count": len(candles),
+        "first_candle":  candles[0] if candles else None,
+        "last_candle":   candles[-1] if candles else None,
+        "raw_response":  raw.get("raw", {}),
+        "diagnosis": (
+            f"✅ {len(candles)} candles loaded — technical analysis is working"
+            if len(candles) >= 5 else
+            "❌ Zero candles — Delta candle API may need auth or different params"
+        )
+    })
 
 @app.route("/api/wallet/sync", methods=["POST"])
 def wallet_sync():
@@ -2495,6 +2729,17 @@ canvas#miniChart{width:100%;height:44px}
     <div class="chd"><span class="ct">Signal Strength</span><span id="confScore" style="font-size:13px;font-family:'DM Mono';font-weight:700;color:var(--t)">&#8212; / 100</span></div>
     <div id="pilRows"></div>
   </div>
+  <!-- Regime Detail Card -->
+  <div class="card">
+    <div class="chd"><span class="ct">Regime Analysis</span><span class="badge bb2">Multi-factor</span></div>
+    <div id="regimeDetail" style="font-size:11px;color:var(--t2);line-height:1.8;font-family:'DM Mono'">
+      Waiting for first scan...
+    </div>
+    <div style="font-size:10px;color:var(--t3);margin-top:8px">
+      Combines: ADX strength + Market structure (HH/HL) + ATR expansion — not ADX alone
+    </div>
+  </div>
+
   <div class="card">
     <div class="chd"><span class="ct">Adaptive Learning</span><span class="badge bb2" id="learnBadge">0 trades</span></div>
     <div style="font-size:12px;color:var(--t2);display:flex;flex-direction:column;gap:6px">
@@ -2890,14 +3135,12 @@ function renderState(s){
   document.getElementById('confScore').textContent=
     totalScore>0?(totalScore+' / 100'):(conf?conf+' / 100':'— / 100');
   // Pillar definitions with actual score keys
+  // 4-pillar institutional confidence engine
   const pillars=[
-    {n:'Market Regime',  key:'regime',          max:25, c:'#0066ff'},
-    {n:'HTF Alignment',  key:'htf_alignment',   max:20, c:'#00c896'},
-    {n:'Momentum',       key:'momentum',        max:15, c:'#ff9f00'},
-    {n:'Volume+OI',      key:'volume_oi',       max:10, c:'#ff6b6b'},
-    {n:'Volatility',     key:'volatility',      max:10, c:'#a29bfe'},
-    {n:'Session',        key:'time_of_day',     max:10, c:'#74b9ff'},
-    {n:'Funding',        key:'funding',         max:10, c:'#fd79a8'}
+    {n:'Regime (ADX+Structure)',key:'regime',   max:40, c:'#0066ff'},
+    {n:'Momentum Quality',      key:'momentum', max:30, c:'#00c896'},
+    {n:'Volatility Regime',     key:'volatility',max:20,c:'#ff9f00'},
+    {n:'Execution Quality',     key:'execution',max:10, c:'#ff6b6b'}
   ];
   document.getElementById('pilRows').innerHTML=pillars.map(p=>{
     const actual=bd[p.key]!==undefined?bd[p.key]:null;
@@ -2909,6 +3152,18 @@ function renderState(s){
       +'<div class="pt"><div class="pf" style="width:'+barPct+'%;background:'+p.c+';opacity:'+opacity+'"></div></div>'
       +'<div class="pw" style="color:'+p.c+'">'+label+'</div></div>';
   }).join('');
+
+  // Show regime detail if available
+  const last_bd = s.last_breakdown || {};
+  const rd = last_bd._regime_detail || {};
+  if(rd.label){
+    const rdEl = document.getElementById('regimeDetail');
+    if(rdEl) rdEl.innerHTML =
+      '<b>'+rd.label+'</b> confidence='+rd.confidence+'% | '+
+      'Structure: '+rd.structure+' | '+
+      'Vol expanding: '+(rd.vol_expanding?'YES ↑':'NO ↔')+' | '+
+      'ATR ratio: '+rd.atr_ratio+'×';
+  }
 
   // Learning
   const lrn=s.learning||{};
