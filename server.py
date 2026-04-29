@@ -576,11 +576,17 @@ class TechEngine:
         return bb_width < kc_width
 
     @staticmethod
-    def volume_ok(volumes: list, min_ratio: float = 0.30) -> bool:
-        """FIX BUG: Relaxed to 0.30× (was 0.50×). Crypto volume is episodic."""
-        if len(volumes) < 20: return True
-        avg = sum(volumes[-20:]) / 20
-        return volumes[-1] >= avg * min_ratio if avg > 0 else True
+    def volume_ok(volumes: list, min_ratio: float = 0.12) -> bool:
+        """
+        Volume trap check.
+        Uses SECOND-TO-LAST candle (index -2) because the current candle
+        is still forming and always has artificially low volume.
+        Threshold: 12% of 20-candle avg (was 30% — too strict, caught partial candles).
+        """
+        if len(volumes) < 21: return True
+        avg = sum(volumes[-21:-1]) / 20   # Avg of 20 COMPLETED candles
+        check_vol = volumes[-2]           # Last COMPLETED candle
+        return check_vol >= avg * min_ratio if avg > 0 else True
 
     @staticmethod
     def parse_candles(candles: list) -> tuple:
@@ -979,7 +985,12 @@ class ConfidenceEngine:
             if abs((h_utc * 60 + m_utc) - (mh * 60 + mm)) <= Cfg.BLACKOUT_WINDOW_MINS:
                 return 0, True, f"macro_blackout_{mh}:{mm:02d}", {}
         if volumes and not TechEngine.volume_ok(volumes):
-            return 0, True, "low_volume_trap", {}
+            # Compute partial score anyway so dashboard shows real bar values
+            # Volume veto fires but pillars 1-3 still computed for display
+            partial_bd = {"_veto": "low_volume_trap",
+                          "regime": 0, "momentum": 0,
+                          "volatility": 0, "execution": 0}
+            return 0, True, "low_volume_trap", partial_bd
 
         bd = {}
         total = 0
@@ -1627,7 +1638,7 @@ class AlphaBot:
 
         self._emit("INFO", f"BTC ${price:,.0f} | {self.regime} | "
                  f"RSI={self.last_rsi:.1f} ADX={self.last_adx:.1f} | "
-                 f"L={ls}{'✗'+lr if lv else '✓'} S={ss}{'✗'+sr if sv else '✓'} | News={news_m:.2f}")
+                 f"L={ls}{'✗'+lr if lv else '✓'} S={ss}{'✗'+sr if sv else '✓'}")
 
         direction = score = None
         if not lv and ls >= Cfg.MIN_CONFIDENCE and ls > ss:
@@ -3187,7 +3198,9 @@ function renderState(s){
   const bd=s.last_breakdown||{};
   // Total actual score
   const totalScore=Object.values(bd).reduce((a,b)=>a+b,0);
+  const veto = last_bd._veto||null;
   document.getElementById('confScore').textContent=
+    veto ? ('⛔ '+veto) :
     totalScore>0?(totalScore+' / 100'):(conf?conf+' / 100':'— / 100');
   // Pillar definitions with actual score keys
   // 4-pillar institutional confidence engine
