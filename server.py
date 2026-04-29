@@ -1855,11 +1855,25 @@ class AlphaBot:
                 f"FAILED pid={Cfg.BTC_PRODUCT_ID} {side} {lots}lots "
                 f"@ ${price:,.0f} → {err}")
     def _manage_positions(self, price: float):
+        # Check bot-tracked positions
         for pos in self.positions:
             if pos.closed: continue
             exit_, reason, partial = pos.check_exit(price)
             if exit_:
                 self._close(pos, price, reason, partial)
+
+        # Also check real Delta positions not yet in bot (safety net)
+        try:
+            tracked_pids = {p.product_id for p in self.positions if not p.closed}
+            live = self.api.get_positions() or []
+            for lp in live:
+                pid = int(lp.get("product_id", 0) or 0)
+                if pid and pid not in tracked_pids:
+                    # Unknown position — sync and monitor it
+                    self._sync_positions_from_delta()
+                    break
+        except Exception:
+            pass
 
     def _close(self, pos: Position, price: float,
                 reason: str, partial: bool):
@@ -1966,6 +1980,16 @@ class AlphaBot:
         log.info("ΔLPHA Bot v6.2 stopped")
 
     def get_state(self) -> dict:
+        # Re-sync positions from Delta on every state check (lightweight)
+        try:
+            live_pids = {int(p.get("product_id", 0))
+                         for p in (self.api.get_positions() or [])
+                         if float(p.get("size", 0) or 0) != 0}
+            tracked   = {p.product_id for p in self.positions if not p.closed}
+            if live_pids - tracked:
+                self._sync_positions_from_delta()
+        except Exception:
+            pass
         sc  = self.start_capital if self.start_capital > 0 else self.capital
         pct = round((self.capital - sc) / sc * 100, 2) if sc > 0 else 0.0
         ct, gr, _ = self.guard.can_trade()
@@ -2375,6 +2399,28 @@ def set_product_id():
     return jsonify({"success": True,
                     "old_product_id": old,
                     "new_product_id": Cfg.BTC_PRODUCT_ID})
+
+
+@app.route("/api/positions/raw")
+def positions_raw():
+    """Show EXACT raw response from Delta positions endpoint — diagnose sync."""
+    raw = bot.api._get("/v2/positions/margined")
+    positions_list = []
+    if raw and raw.get("success"):
+        for p in raw.get("result", []):
+            positions_list.append(p)  # Full raw dict, no filtering
+    return jsonify({
+        "raw_response": raw,
+        "positions_count": len(positions_list),
+        "positions": positions_list,
+        "bot_tracked": [
+            {"symbol": p.symbol, "side": p.side,
+             "entry": p.entry, "closed": p.closed}
+            for p in bot.positions
+        ],
+        "api_key_set": bool(bot.api.key),
+        "hint": "Check field names: size, product_id, entry_price, side"
+    })
 
 
 @app.route("/api/test_order")
