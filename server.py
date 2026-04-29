@@ -2055,48 +2055,6 @@ def wallet_debug():
 
 @app.route("/api/candles/debug")
 def candles_debug():
-    """Debug candles endpoint — shows raw Delta response and what we tried."""
-    import time as _time
-    results = {}
-    price = bot.last_price or 77000
-
-    # Try multiple resolution formats Delta India might use
-    for res in [5, "5", 1, "1"]:
-        end   = int(_time.time())
-        start = end - (300 * 20)  # 20 x 5min = 100min of data
-        params = {"symbol": "BTCUSD", "resolution": res,
-                  "start": start, "end": end}
-        try:
-            d = bot.api._get("/v2/history/candles", params)
-            result_count = len(d.get("result", [])) if d and d.get("success") else 0
-            results[f"resolution_{res}"] = {
-                "success":      d.get("success") if d else False,
-                "candle_count": result_count,
-                "error":        d.get("error","none") if d else "no_response",
-                "message":      d.get("message","") if d else "",
-                "sample":       d.get("result",[])[0] if result_count > 0 else None,
-            }
-        except Exception as e:
-            results[f"resolution_{res}"] = {"error": str(e)}
-
-    # Also try ticker to confirm auth works
-    ticker = bot.api._get("/v2/tickers/BTCUSD")
-    results["ticker_auth_test"] = {
-        "success": ticker.get("success") if ticker else False,
-        "price":   ticker.get("result",{}).get("mark_price","?") if ticker else "N/A",
-    }
-
-    return jsonify({
-        "candle_tests":  results,
-        "api_key_set":   bool(bot.api.key),
-        "api_key_len":   len(bot.api.key),
-        "base_url":      bot.api.base,
-        "fix_hint": "If all candle tests fail but ticker works = endpoint path or auth format issue"
-    })
-
-
-@app.route("/api/candles/debug")
-def candles_debug():
     """
     Shows raw Delta Exchange candle response.
     If empty, candles aren't loading — this is why ADX/ATR shows —
