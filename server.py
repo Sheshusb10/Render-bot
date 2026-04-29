@@ -1347,6 +1347,8 @@ class AlphaBot:
                 self.regime = "BEAR"
             else:
                 self.regime = "NEUTRAL"
+            self._emit("INFO", f"Regime: {self.regime} | RSI={self.last_rsi:.1f} "
+                       f"ADX={self.last_adx:.1f} ATR={self.atr_pct:.3f}%")
 
         self._manage_positions(price)
 
@@ -2832,12 +2834,12 @@ function renderState(s){
   pE.className='wpp '+(pct>0?'pu':pct<0?'pdn':'pnn');
   document.getElementById('walPnl').textContent='P&L: $'+(pnl>=0?'+':'')+pnl.toFixed(2);
   const chips=[];
-  if(s.wallet_usdt>0) chips.push('USDT '+s.wallet_usdt.toFixed(2));
+  if(s.wallet_usdt>0) chips.push('USD '+s.wallet_usdt.toFixed(2));
   if(s.wallet_inr>0)  chips.push('INR '+s.wallet_inr.toFixed(0));
   if(s.wallet_btc>0)  chips.push('BTC '+s.wallet_btc.toFixed(6));
   document.getElementById('walChips').innerHTML=(chips.length?chips:['Not connected']).map(c=>'<span class="chip">'+c+'</span>').join('');
   const ss2=document.getElementById('syncSt');
-  if(s.wallet_synced){ss2.textContent='&#10003; Synced from Delta Exchange';ss2.className='ss ss-ok';}
+  if(s.wallet_synced){ss2.textContent='✓ Synced from Delta Exchange';ss2.className='ss ss-ok';}
   else{ss2.textContent='Not connected — go to Settings';ss2.className='ss ss-warn';}
 
   // Monthly progress
@@ -2937,7 +2939,7 @@ function renderState(s){
   const cb=document.getElementById('connBadge');
   const cm=document.getElementById('connMsg');
   if(s.wallet_synced||s.running){
-    cb.textContent='Connected &#10003;'; cb.className='badge bg2';
+    cb.textContent='Connected ✓'; cb.className='badge bg2';
     cm.innerHTML='<span style="color:var(--g)">&#10003; Connected — bot running. Balance: $'+cap.toFixed(2)+'</span>';
   }
 }
