@@ -66,12 +66,26 @@ class Cfg:
     MAX_CONSEC_LOSSES  = 3
     RECOVERY_TRADES    = 2
 
-    # Exits — calibrated for BTC options 0-3 DTE
-    HARD_STOP_PCT      = 0.025
+    # ── TREND MODE exits (ADX > 25, confirmed regime) ──────────────────────
+    HARD_STOP_PCT      = 0.025   # 2.5% hard stop
     TP1_PCT            = 0.015   # Take 50% at +1.5%
     TP2_PCT            = 0.030   # Full exit at +3.0%
     TRAIL_ACTIVATE_PCT = 0.012
     TRAIL_DISTANCE_PCT = 0.007
+
+    # ── RANGE/SCALP MODE exits (ADX < 20, choppy market) ───────────────────
+    # Smaller targets, tighter stops — designed for whale stop-hunt reversals
+    RANGE_HARD_STOP    = 0.008   # 0.8% stop (tight — exit fast if wrong)
+    RANGE_TP1          = 0.005   # Take 70% at +0.5%
+    RANGE_TP2          = 0.010   # Full exit at +1.0%
+    RANGE_MAX_HOLD_MIN = 30      # Max 30 min hold in range mode (decay risk)
+    RANGE_MIN_CONF     = 45      # Lower confidence threshold for range trades
+    RANGE_RISK_PCT     = 0.008   # Only 0.8% capital per range trade (smaller)
+
+    # ── WHALE TRAP detection thresholds ─────────────────────────────────────
+    WICK_RATIO_MIN     = 2.0    # Wick must be 2x candle body (trap signal)
+    VOLUME_SPIKE_RATIO = 1.8    # Volume spike needed for real breakout confirm
+    ENTRY_DELAY_SECS   = 15     # Wait 15s after signal to avoid stop-hunt entry
 
     # Regime
     ADX_TREND_MIN      = 22     # Lowered slightly — 25 too strict for BTC
@@ -226,12 +240,18 @@ class DeltaAPI:
             for b in d.get("result", []):
                 symbol = (b.get("asset_symbol") or b.get("currency") or
                           b.get("asset") or "?")
+                # Values come as strings from Delta India — must cast to float
                 avail  = float(b.get("available_balance") or
                                b.get("available") or b.get("balance") or 0)
                 if symbol and symbol != "?":
                     balances[symbol.upper()] = avail
                     balances[symbol.lower()] = avail
-            log.info(f"Wallet assets with balance: {[k for k in balances if balances[k]>0 and k==k.upper()]}")
+            # Fallback: use meta.net_equity if USD balance not found
+            meta = d.get("meta", {})
+            if not balances.get("USD") and meta.get("net_equity"):
+                balances["USD"] = float(meta["net_equity"])
+                balances["usd"] = float(meta["net_equity"])
+            log.info(f"Wallet assets: { {k:v for k,v in balances.items() if v>0 and k==k.upper()} }")
             return balances
         if d:
             err = d.get("error", d.get("message", "unknown"))
@@ -420,6 +440,103 @@ class TechEngine:
         except Exception:
             pass
         return "none"
+
+    @staticmethod
+    def detect_whale_trap(opens: list, highs: list, lows: list,
+                          closes: list, volumes: list) -> dict:
+        """
+        Detects whale stop-hunt / liquidity grab patterns.
+
+        Pattern: Price spikes below support OR above resistance (the trap),
+        then a strong reversal candle closes back above/below the level.
+        This is the ENTRY SIGNAL — trade the reversal, not the breakout.
+
+        Returns: {
+            "trap_type": "bull_trap" | "bear_trap" | "none",
+            "strength": 0-100,
+            "entry_direction": "long" | "short" | None,
+            "stop_level": float
+        }
+        """
+        if len(closes) < 10 or not volumes:
+            return {"trap_type": "none", "strength": 0,
+                    "entry_direction": None, "stop_level": 0}
+        try:
+            # Last 3 candles
+            c1, c2, c3 = closes[-3], closes[-2], closes[-1]
+            h1, h2, h3 = highs[-3], highs[-2], highs[-1]
+            l1, l2, l3 = lows[-3], lows[-2], lows[-1]
+            o2, o3 = opens[-2] if len(opens) >= 2 else c2, opens[-1] if opens else c3
+            v_avg = sum(volumes[-10:]) / 10
+            v_last = volumes[-1]
+
+            body2 = abs(c2 - o2)
+            lower_wick2 = min(o2, c2) - l2
+            upper_wick2 = h2 - max(o2, c2)
+
+            # ── BULL TRAP (bear stop-hunt reversal → go LONG) ─────────────
+            # Candle 2: Spike DOWN with long lower wick (stop hunt below support)
+            # Candle 3: Strong close ABOVE candle 2 open (reclaim)
+            bull_trap = (
+                lower_wick2 > body2 * Cfg.WICK_RATIO_MIN and  # Long lower wick
+                l2 < l3 and                                     # Spike low
+                c3 > o2 and                                     # Reclaim
+                c3 > c2 and                                     # Bullish close
+                v_last > v_avg * 1.2                            # Volume confirm
+            )
+
+            # ── BEAR TRAP (bull stop-hunt reversal → go SHORT) ────────────
+            # Candle 2: Spike UP with long upper wick
+            # Candle 3: Strong close BELOW candle 2 open (rejection)
+            bear_trap = (
+                upper_wick2 > body2 * Cfg.WICK_RATIO_MIN and
+                h2 > h3 and
+                c3 < o2 and
+                c3 < c2 and
+                v_last > v_avg * 1.2
+            )
+
+            if bull_trap:
+                strength = min(100, int((lower_wick2 / body2) * 25 +
+                                        (v_last / v_avg) * 25))
+                return {"trap_type": "bull_trap", "strength": strength,
+                        "entry_direction": "long", "stop_level": l2}
+            if bear_trap:
+                strength = min(100, int((upper_wick2 / body2) * 25 +
+                                        (v_last / v_avg) * 25))
+                return {"trap_type": "bear_trap", "strength": strength,
+                        "entry_direction": "short", "stop_level": h2}
+        except Exception:
+            pass
+        return {"trap_type": "none", "strength": 0,
+                "entry_direction": None, "stop_level": 0}
+
+    @staticmethod
+    def range_bounds(highs: list, lows: list,
+                     period: int = 20) -> tuple:
+        """Detect range support/resistance for range-mode trading."""
+        if len(highs) < period:
+            return 0.0, 0.0
+        resistance = max(highs[-period:])
+        support    = min(lows[-period:])
+        return support, resistance
+
+    @staticmethod
+    def is_range_market(adx_val: float, bb_width: float) -> bool:
+        """True when market is choppy/sideways — use range strategy."""
+        return adx_val < 20 and bb_width < 3.5
+
+    @staticmethod
+    def breakout_confirmed(closes: list, volumes: list,
+                           resistance: float) -> bool:
+        """Real breakout needs: price above level + volume spike + hold."""
+        if len(closes) < 3 or not volumes:
+            return False
+        v_avg = sum(volumes[-10:]) / 10 if len(volumes) >= 10 else volumes[-1]
+        # Need 2 consecutive closes above + volume spike
+        return (closes[-1] > resistance and
+                closes[-2] > resistance and
+                volumes[-1] > v_avg * Cfg.VOLUME_SPIKE_RATIO)
 
     @staticmethod
     def squeeze_detected(closes: list, highs: list, lows: list,
@@ -919,11 +1036,26 @@ class Position:
         pct = ((price - self.entry) / self.entry if self.side == "long"
                else (self.entry - price) / self.entry)
 
+        # ── RANGE/SCALP MODE — tight exits ──────────────────────────────
+        if getattr(self, 'range_mode', False):
+            if pct <= -Cfg.RANGE_HARD_STOP:
+                return True, "range_stop", False
+            if not self.tp1_hit and pct >= Cfg.RANGE_TP1:
+                self.tp1_hit = True
+                return True, "range_tp1_70pct", True   # Take 70% at 0.5%
+            if pct >= Cfg.RANGE_TP2:
+                return True, "range_tp2_full", False
+            age_mins = (datetime.now(timezone.utc) - self.entered_at).total_seconds() / 60
+            if age_mins >= Cfg.RANGE_MAX_HOLD_MIN:
+                return True, "range_time_exit", False
+            return False, "", False
+
+        # ── TREND MODE — standard exits ──────────────────────────────────
         if pct <= -Cfg.HARD_STOP_PCT:
             return True, "hard_stop", False
         if not self.tp1_hit and pct >= Cfg.TP1_PCT:
             self.tp1_hit = True
-            return True, "tp1_50pct", True   # Partial
+            return True, "tp1_50pct", True
         if pct >= Cfg.TRAIL_ACTIVATE_PCT:
             self.trailing = True
             self.trail_ref = (max(self.trail_ref, price) if self.side == "long"
@@ -1040,6 +1172,7 @@ class AlphaBot:
         self.will_trade      = False
         self.trade_dir       = None
         self.candles         = []
+        self.last_breakdown  = {}   # Last confidence pillar scores
         self.trades_today    = 0
         self.trades_week     = 0
         # Real-time log buffer (shown on dashboard)
@@ -1092,12 +1225,14 @@ class AlphaBot:
                     self.status_msg = "⚠ Wallet read failed — check API keys on Render"
                 return self.capital
 
-            usdt = float(bal.get("USDT", bal.get("usdt", 0)) or 0)
+            # Delta India uses "USD" (not "USDT") — values are strings, cast to float
+            usdt = float(bal.get("USD",  bal.get("USDT",
+                         bal.get("usdt", bal.get("usd", 0)))) or 0)
             inr  = float(bal.get("INR",  bal.get("inr",
                          bal.get("USDINR", bal.get("usdinr", 0)))) or 0)
             btc  = float(bal.get("BTC",  bal.get("btc",
                          bal.get("XBT",   bal.get("xbt",   0)))) or 0)
-            log.info(f"Wallet values — USDT:{usdt} INR:{inr} BTC:{btc} | all keys: {list(bal.keys())[:10]}")
+            log.info(f"Wallet — USD:{usdt:.2f} INR:{inr:.2f} BTC:{btc:.6f}")
 
             inr_usd = 0.0
             if inr > 0:
@@ -1227,8 +1362,10 @@ class AlphaBot:
             return
 
         news_m = self.news.get_multiplier()
-        ls, lv, lr, _ = self.conf_eng.score(data, "long",  self.learner)
-        ss, sv, sr, _ = self.conf_eng.score(data, "short", self.learner)
+        ls, lv, lr, lbd = self.conf_eng.score(data, "long",  self.learner)
+        ss, sv, sr, sbd = self.conf_eng.score(data, "short", self.learner)
+        # Store the breakdown from whichever direction has higher score
+        self.last_breakdown = lbd if ls >= ss else sbd
         ls = min(int(ls * news_m), 100)
         ss = min(int(ss * news_m), 100)
 
@@ -1251,12 +1388,89 @@ class AlphaBot:
         self.trade_dir   = direction
 
         if not direction:
-            if TechEngine.squeeze_detected(data["closes"], data["highs"], data["lows"]):
-                self.status_msg = "⚡ Squeeze coiling — watching for breakout"
+            # ── NO TREND SIGNAL — try RANGE/WHALE-TRAP mode ──────────────
+            cl, hi, lo, vo = data["closes"], data["highs"], data["lows"], data["volumes"]
+            _, _, _, bb_w = TechEngine.bollinger(cl)
+            is_range = TechEngine.is_range_market(self.last_adx, bb_w)
+
+            if is_range and len(cl) >= 20:
+                # Check for whale trap (stop-hunt reversal)
+                opens = [float(c.get("open", cl[i])) if isinstance(c, dict)
+                         else cl[i] for i, c in enumerate(data.get("raw_candles", []))
+                         ][:len(cl)]
+                if not opens or len(opens) != len(cl):
+                    opens = cl  # fallback
+
+                trap = TechEngine.detect_whale_trap(opens, hi, lo, cl, vo)
+                support, resistance = TechEngine.range_bounds(hi, lo)
+
+                if trap["trap_type"] != "none" and trap["strength"] >= 40:
+                    # Whale trap detected — trade the reversal
+                    trap_dir = trap["entry_direction"]
+                    trap_price = cl[-1]
+                    range_size = (resistance - support) / trap_price if trap_price > 0 else 0
+
+                    if range_size >= 0.003:  # Range must be at least 0.3% wide
+                        size_usd = max(Cfg.MIN_TRADE_SIZE_USD,
+                                       self.capital * Cfg.RANGE_RISK_PCT * risk_m)
+                        rsi_now = TechEngine.rsi(cl, Cfg.RSI_PERIOD)
+                        adx_now, _, _ = TechEngine.adx(hi, lo, cl)
+
+                        chain = self.api.get_options_chain("BTC")
+                        atr_usd = data.get("atr", trap_price * 0.005)
+                        opt = self.opt_sel.select(chain, trap_price, trap_dir,
+                                                   60, atr_usd)
+                        if opt:
+                            contracts = max(1, int(size_usd / (opt["mark"] * 100)))
+                            result = self.api.place_order(opt["product_id"],
+                                                          "buy", contracts)
+                        else:
+                            side = "buy" if trap_dir == "long" else "sell"
+                            contracts = max(1, int(size_usd / trap_price * 1000))
+                            result = self.api.place_order(Cfg.BTC_PRODUCT_ID,
+                                                          side, contracts)
+                            opt = None
+
+                        if result.get("success"):
+                            sym = opt["product"].get("symbol","") if opt else "BTCUSD_PERP"
+                            pid = opt["product_id"] if opt else Cfg.BTC_PRODUCT_ID
+                            pos = Position(pid, trap_dir, trap_price, size_usd,
+                                           sym, rsi_now, adx_now, data["hour_utc"])
+                            pos.range_mode = True   # Use tight range exits
+                            self.positions.append(pos)
+                            self._log("OPEN", trap_dir, trap_price, size_usd, 55,
+                                      sym, "whale_trap")
+                            msg = (f"🎣 WHALE TRAP {trap['trap_type'].upper()} "
+                                   f"→ {trap_dir.upper()} @ ${trap_price:,.0f} "
+                                   f"strength={trap['strength']} "
+                                   f"TP={Cfg.RANGE_TP2*100:.1f}% SL={Cfg.RANGE_HARD_STOP*100:.1f}%")
+                            self.status_msg = msg
+                            self._emit("TRADE", msg)
+                        return
+
+                # Range mode — trade near support/resistance
+                rsi_now = TechEngine.rsi(cl, Cfg.RSI_PERIOD)
+                price = cl[-1]
+                near_support = support > 0 and (price - support) / price < 0.003
+                near_resist  = resistance > 0 and (resistance - price) / price < 0.003
+
+                if near_support and rsi_now < 38:
+                    self._emit("INFO", f"📊 RANGE BUY zone: price ${price:,.0f} near support ${support:,.0f} RSI={rsi_now:.1f}")
+                elif near_resist and rsi_now > 62:
+                    self._emit("INFO", f"📊 RANGE SELL zone: price ${price:,.0f} near resistance ${resistance:,.0f} RSI={rsi_now:.1f}")
+                else:
+                    self.status_msg = (f"Range mode: S=${support:,.0f} R=${resistance:,.0f} "
+                                       f"RSI={rsi_now:.1f} ADX={self.last_adx:.1f} "
+                                       f"BB={bb_w:.2f}%")
+
+            elif TechEngine.squeeze_detected(cl, hi, lo):
+                self.status_msg = "⚡ BB Squeeze coiling — breakout imminent"
+                self._emit("INFO", self.status_msg)
             else:
                 self.status_msg = (f"Watching: L={ls}{'✗' if lv else ''} "
                                    f"S={ss}{'✗' if sv else ''} | "
-                                   f"{self.regime} | Need ≥{Cfg.MIN_CONFIDENCE}")
+                                   f"{self.regime} | ADX={self.last_adx:.1f} | "
+                                   f"Need ≥{Cfg.MIN_CONFIDENCE}")
                 self._emit("INFO", self.status_msg)
             return
 
@@ -1449,6 +1663,8 @@ class AlphaBot:
             "logs":            self.log_buffer[-50:],
             # Server IP (for Delta Exchange whitelist)
             "server_ip":       self._get_server_ip(),
+            # Actual pillar scores from last confidence calculation
+            "last_breakdown":  self.last_breakdown,
         }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2662,13 +2878,35 @@ function renderState(s){
   document.getElementById('sentFill').style.width=bPct+'%';
   document.getElementById('sentFill').style.background=bPct>50?'var(--g)':'var(--r)';
   document.getElementById('sentLabel').textContent=ns.label||'Neutral';
-  document.getElementById('sentTxt').textContent='Bull '+bPct+'% / Bear '+(100-bPct)+'% | Sources: '+(ns.sources_checked||0);
+  const srcCount=ns.sources_checked||0;document.getElementById('sentTxt').textContent='Bull '+bPct+'% / Bear '+(100-bPct)+'% | Sources: '+srcCount+(srcCount<2?' (low confidence — need 2+ sources)':'');
 
-  // Pillars
+  // Pillars — show REAL scores from last confidence calculation
   const conf=(s.recent_trades&&s.recent_trades.length)?s.recent_trades[s.recent_trades.length-1].confidence||0:0;
-  document.getElementById('confScore').textContent=conf?conf+' / 100':'&#8212; / 100';
-  const pillars=[{n:'Market Regime',w:25,c:'#0066ff'},{n:'HTF Alignment',w:20,c:'#00c896'},{n:'Momentum',w:15,c:'#ff9f00'},{n:'Volume+OI',w:10,c:'#ff6b6b'},{n:'Volatility',w:10,c:'#a29bfe'},{n:'Session',w:10,c:'#74b9ff'},{n:'Funding',w:10,c:'#fd79a8'}];
-  document.getElementById('pilRows').innerHTML=pillars.map(p=>'<div class="pil"><div class="pn">'+p.n+'</div><div class="pt"><div class="pf" style="width:'+(p.w*4)+'%;background:'+p.c+'"></div></div><div class="pw" style="color:'+p.c+'">'+p.w+'</div></div>').join('');
+  const bd=s.last_breakdown||{};
+  // Total actual score
+  const totalScore=Object.values(bd).reduce((a,b)=>a+b,0);
+  document.getElementById('confScore').textContent=
+    totalScore>0?(totalScore+' / 100'):(conf?conf+' / 100':'— / 100');
+  // Pillar definitions with actual score keys
+  const pillars=[
+    {n:'Market Regime',  key:'regime',          max:25, c:'#0066ff'},
+    {n:'HTF Alignment',  key:'htf_alignment',   max:20, c:'#00c896'},
+    {n:'Momentum',       key:'momentum',        max:15, c:'#ff9f00'},
+    {n:'Volume+OI',      key:'volume_oi',       max:10, c:'#ff6b6b'},
+    {n:'Volatility',     key:'volatility',      max:10, c:'#a29bfe'},
+    {n:'Session',        key:'time_of_day',     max:10, c:'#74b9ff'},
+    {n:'Funding',        key:'funding',         max:10, c:'#fd79a8'}
+  ];
+  document.getElementById('pilRows').innerHTML=pillars.map(p=>{
+    const actual=bd[p.key]!==undefined?bd[p.key]:null;
+    const displayVal=actual!==null?actual:p.max;
+    const barPct=(displayVal/p.max)*100;
+    const label=actual!==null?actual:p.max;
+    const opacity=actual!==null?'1':'0.35'; // Dim if no real data yet
+    return '<div class="pil"><div class="pn">'+p.n+'</div>'
+      +'<div class="pt"><div class="pf" style="width:'+barPct+'%;background:'+p.c+';opacity:'+opacity+'"></div></div>'
+      +'<div class="pw" style="color:'+p.c+'">'+label+'</div></div>';
+  }).join('');
 
   // Learning
   const lrn=s.learning||{};
