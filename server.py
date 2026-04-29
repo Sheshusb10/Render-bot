@@ -1,6 +1,8 @@
 """
-ALPHA BOT — Delta Exchange India | BTCUSD Perpetual
-Pure price action trading. No news. No external signals.
+ALPHA BOT v7 — Delta Exchange India
+Quantum-grade BTC options + perpetuals bot.
+Multi-source data: Delta + Binance public API
+Pure price action. No news. No external sentiment.
 """
 import os, time, hmac, hashlib, json, math, logging, threading, requests
 from datetime import datetime, timezone, timedelta
@@ -9,1546 +11,1973 @@ from flask_cors import CORS
 
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("bot")
+log = logging.getLogger("v7")
 
-
+# ═══════════════════════════════════════════════════════════════════
+#  CONFIG
+# ═══════════════════════════════════════════════════════════════════
 class C:
-    BASE      = "https://api.india.delta.exchange"
-    KEY       = os.getenv("DELTA_API_KEY", "").strip()
-    SECRET    = os.getenv("DELTA_API_SECRET", "").strip()
-    PID       = 27
-    LOT_BTC   = 0.001
-    LEVERAGE  = 5
-    SCAN      = 300
-    MIN_CONF  = 58
-    STOP_PCT  = 0.025
-    TP_PCT    = 0.030
-    RISK_PCT  = 0.015
-    HALT_PCT  = 0.08
-    PAUSE_PCT = 0.03
-    STATE     = "/tmp/ab.json"
+    BASE       = "https://api.india.delta.exchange"
+    BINANCE    = "https://api.binance.com"
+    KEY        = os.getenv("DELTA_API_KEY",    "").strip()
+    SECRET     = os.getenv("DELTA_API_SECRET", "").strip()
+    PID        = 27           # BTCUSD perpetual
+    SYMBOL     = "BTCUSD"
+    LOT_BTC    = 0.001
+    LEVERAGE   = 5
+    SCAN_SECS  = 300
 
+    # ── Confidence thresholds ──────────────────────────────────────
+    CONF_TRADE   = 62   # minimum to trade
+    CONF_ITM     = 78   # above this → buy ITM option (higher delta)
+    CONF_STRADDLE= 55   # moderate both ways → straddle
 
-class API:
+    # ── Perpetual guards ──────────────────────────────────────────
+    STOP_PCT     = 0.025   # 2.5% hard stop
+    TP_PCT       = 0.030   # 3.0% take profit
+    RISK_PCT     = 0.015   # 1.5% capital per trade
+
+    # ── Options guards ────────────────────────────────────────────
+    OPT_TP_PCT   = 0.80    # +80% premium = take profit
+    OPT_FLOOR    = 0.60    # trail from peak: if peak was +60%, hold
+    OPT_STOP_PCT = 0.50    # -50% premium = stop loss
+    OPT_MAX_PREM = 0.15    # max 15% of capital on one option trade
+    OPT_EXPIRY_BUFFER = 60 # close options 60min before Friday expiry
+
+    # ── Account guards ────────────────────────────────────────────
+    HALT_PCT     = 0.08    # halt if down 8% from start
+    PAUSE_PCT    = 0.03    # pause if down 3% today
+    COOLDOWN_MIN = 30      # wait 30min after any close
+    CIRCUIT_N    = 3       # 3 consecutive losses = pause
+    CIRCUIT_MIN  = 120     # pause 2hr after circuit break
+    MIN_HOLD_MIN = 15      # min 15min before software stop fires
+    ADX_TREND    = 22      # ADX floor for trend trades
+    STATE        = "/tmp/ab_v7.json"
+
+# ═══════════════════════════════════════════════════════════════════
+#  DELTA API
+# ═══════════════════════════════════════════════════════════════════
+class DeltaAPI:
     def __init__(self):
-        self.key    = C.KEY
-        self.secret = C.SECRET
-        self.base   = C.BASE
-        self.sess   = requests.Session()
+        self.key  = C.KEY
+        self.sec  = C.SECRET
+        self.sess = requests.Session()
 
-    def set(self, key, secret):
-        self.key    = key.strip()
-        self.secret = secret.strip()
+    def set(self, k, s):
+        self.key = k.strip()
+        self.sec  = s.strip()
 
     def _sign(self, method, path, qs="", body=""):
         ts  = str(int(time.time()))
-        sig = hmac.new(
-            self.secret.encode(),
-            (method + ts + path + qs + body).encode(),
-            hashlib.sha256).hexdigest()
-        return {
-            "api-key": self.key, "timestamp": ts,
-            "signature": sig, "Content-Type": "application/json"
-        }
+        sig = hmac.new(self.sec.encode(),
+            (method+ts+path+qs+body).encode(), hashlib.sha256).hexdigest()
+        return {"api-key":self.key,"timestamp":ts,"signature":sig,
+                "Content-Type":"application/json"}
 
-    def get(self, path, params=None):
-        qs = ("?" + "&".join(f"{k}={v}" for k, v in params.items())) if params else ""
+    def get(self, path, p=None):
+        qs = ("?"+"&".join(f"{k}={v}" for k,v in p.items())) if p else ""
         try:
-            r = self.sess.get(f"{self.base}{path}{qs}",
-                headers=self._sign("GET", path, qs), timeout=10)
+            r = self.sess.get(f"{C.BASE}{path}{qs}",
+                headers=self._sign("GET",path,qs), timeout=10)
             return r.json()
         except Exception as e:
-            log.warning(f"GET {path}: {e}")
+            log.warning(f"DeltaGET {path}: {e}")
             return None
 
     def post(self, path, body):
         b = json.dumps(body)
         try:
-            r = self.sess.post(f"{self.base}{path}",
-                headers=self._sign("POST", path, "", b),
-                data=b, timeout=10)
+            r = self.sess.post(f"{C.BASE}{path}",
+                headers=self._sign("POST",path,"",b), data=b, timeout=10)
             return r.json()
         except Exception as e:
-            log.warning(f"POST {path}: {e}")
+            log.warning(f"DeltaPOST {path}: {e}")
             return {}
 
     def price(self):
         try:
-            r = self.sess.get(f"{self.base}/v2/tickers/BTCUSD", timeout=6)
-            return float(r.json().get("result", {}).get("mark_price", 0) or 0)
-        except Exception:
-            return 0.0
+            r = self.sess.get(f"{C.BASE}/v2/tickers/BTCUSD", timeout=6)
+            return float(r.json().get("result",{}).get("mark_price",0) or 0)
+        except: return 0.0
 
     def balance(self):
-        """Returns (amount, raw_response, error_string)."""
         d = self.get("/v2/wallet/balances")
-        if not d:
-            return 0.0, None, "No response from Delta"
+        if not d: return 0.0, None, "No response"
         if not d.get("success"):
-            err  = d.get("error", {})
-            code = err.get("code", "") if isinstance(err, dict) else str(err)
-            msg  = d.get("message", "")
-            return 0.0, d, f"API error: {code} {msg}".strip()
+            err = d.get("error",{})
+            code = err.get("code","") if isinstance(err,dict) else str(err)
+            return 0.0, d, f"API error: {code}"
+        for b in d.get("result",[]):
+            if str(b.get("asset_symbol","")).upper() in ("USD","USDT"):
+                av = float(b.get("available_balance",0) or 0)
+                bk = float(b.get("blocked_margin",0) or 0)
+                if av+bk > 0: return round(av+bk,2), d, "ok"
+        ne = float((d.get("meta") or {}).get("net_equity",0) or 0)
+        if ne > 0: return round(ne,2), d, "ok"
+        return 0.0, d, f"Zero. Assets:{[b.get('asset_symbol') for b in d.get('result',[])]}"
 
-        # Try every known balance field
-        for b in d.get("result", []):
-            sym = str(b.get("asset_symbol", "")).upper()
-            if sym not in ("USD", "USDT"):
-                continue
-            avail   = float(b.get("available_balance", 0) or 0)
-            blocked = float(b.get("blocked_margin",   0) or 0)
-            total   = avail + blocked
-            if total > 0:
-                return round(total, 2), d, "ok"
+    def candles(self, res="5m", n=100):
+        mins = {"1m":1,"5m":5,"15m":15}.get(res,5)
+        end  = int(time.time())
+        d    = self.get("/v2/history/candles",{
+            "symbol":C.SYMBOL,"resolution":res,
+            "start":end-mins*60*n,"end":end})
+        return d.get("result",[]) if d and d.get("success") else []
 
-        # Fallback: net_equity from meta
-        ne = float((d.get("meta") or {}).get("net_equity", 0) or 0)
-        if ne > 0:
-            return round(ne, 2), d, "ok"
-
-        assets = [b.get("asset_symbol") for b in d.get("result", [])]
-        return 0.0, d, f"Balance is zero. Assets: {assets}"
-
-    def candles(self, resolution="5m", limit=100):
-        mins  = {"5m": 5, "15m": 15}.get(resolution, 5)
-        end   = int(time.time())
-        d     = self.get("/v2/history/candles", {
-            "symbol": "BTCUSD", "resolution": resolution,
-            "start": end - mins * 60 * limit, "end": end
-        })
-        return d.get("result", []) if d and d.get("success") else []
-
-    def positions(self):
+    def btcusd_positions(self):
         d = self.get("/v2/positions/margined")
-        if d and d.get("success"):
-            return [p for p in d.get("result", [])
-                    if abs(float(p.get("size", 0) or 0)) > 0]
-        return []
+        if not d or not d.get("success"): return []
+        return [p for p in d.get("result",[])
+                if int(p.get("product_id",0) or 0)==C.PID
+                and abs(float(p.get("size",0) or 0))>0]
 
-    def order(self, side, lots):
-        return self.post("/v2/orders", {
-            "product_id": C.PID, "size": lots, "side": side,
-            "order_type": "market_order", "time_in_force": "ioc"
-        })
+    def option_positions(self):
+        d = self.get("/v2/positions/margined")
+        if not d or not d.get("success"): return []
+        out = []
+        for p in d.get("result",[]):
+            sym = str(p.get("product_symbol",""))
+            sz  = float(p.get("size",0) or 0)
+            if sz > 0 and (sym.startswith("C-BTC") or sym.startswith("P-BTC")):
+                out.append(p)
+        return out
+
+    def order(self, side, lots, pid=None):
+        return self.post("/v2/orders",{
+            "product_id":pid or C.PID,"size":lots,"side":side,
+            "order_type":"market_order","time_in_force":"ioc"})
 
     def bracket(self, side, lots, stop, tp):
-        return self.post("/v2/orders", {
-            "product_id": C.PID, "size": lots, "side": side,
-            "order_type": "stop_market_order",
-            "stop_price": str(round(stop, 1)),
-            "bracket_stop_loss_price":   str(round(stop, 1)),
-            "bracket_take_profit_price": str(round(tp, 1)),
-            "time_in_force": "gtc",
-            "stop_trigger_method": "mark_price"
-        })
+        return self.post("/v2/orders",{
+            "product_id":C.PID,"size":lots,"side":side,
+            "order_type":"stop_market_order",
+            "stop_price":str(round(stop,1)),
+            "bracket_stop_loss_price":str(round(stop,1)),
+            "bracket_take_profit_price":str(round(tp,1)),
+            "time_in_force":"gtc","stop_trigger_method":"mark_price"})
 
-    def close_all(self):
-        n = 0
-        for p in self.positions():
-            sz  = float(p.get("size", 0) or 0)
-            qty = abs(int(sz))
-            if qty:
-                self.post("/v2/orders", {
-                    "product_id": p.get("product_id", C.PID),
-                    "size": qty,
-                    "side": "sell" if sz > 0 else "buy",
-                    "order_type": "market_order",
-                    "time_in_force": "ioc"
-                })
-                n += 1
-        return n
+    def close_position(self, size, pid=None):
+        qty  = abs(int(size))
+        side = "sell" if size > 0 else "buy"
+        return self.post("/v2/orders",{
+            "product_id":pid or C.PID,"size":qty,"side":side,
+            "order_type":"market_order","time_in_force":"ioc"})
 
+    def get_option_pid(self, symbol):
+        prefix = "call_options" if symbol.startswith("C-") else "put_options"
+        d = self.get("/v2/products",{"contract_type":prefix,"state":"live"})
+        if d and d.get("success"):
+            for p in d.get("result",[]):
+                if p.get("symbol") == symbol:
+                    return p.get("id")
+        td = self.get(f"/v2/tickers/{symbol}")
+        if td and td.get("success"):
+            return td.get("result",{}).get("product_id")
+        return None
 
-# ── Indicators ────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+#  MULTI-SOURCE MARKET DATA
+# ═══════════════════════════════════════════════════════════════════
+class MarketData:
+    """
+    Fetches candles from multiple sources:
+    - Delta Exchange India (authenticated, BTCUSD)
+    - Binance public API (BTCUSDT, no auth needed)
+    Merges and validates. Falls back gracefully.
+    """
+    def __init__(self, delta: DeltaAPI):
+        self.delta = delta
+        self.sess  = requests.Session()
 
-def parse_candles(raw):
-    cl, hi, lo, vo = [], [], [], []
-    for c in raw:
+    def _binance_candles(self, interval="1m", limit=100) -> list:
+        """Binance public API — no auth. Returns [{close,high,low,vol}]"""
         try:
-            v = float(c.get("close", 0) or 0)
-            if v > 0:
-                cl.append(v)
-                hi.append(float(c.get("high",   v) or v))
-                lo.append(float(c.get("low",    v) or v))
-                vo.append(float(c.get("volume", 0) or 0))
-        except Exception:
-            pass
-    return cl, hi, lo, vo
+            r = self.sess.get(
+                f"{C.BINANCE}/api/v3/klines",
+                params={"symbol":"BTCUSDT","interval":interval,"limit":limit},
+                timeout=8)
+            raw = r.json()
+            out = []
+            for c in raw:
+                out.append({
+                    "close":  float(c[4]),
+                    "high":   float(c[2]),
+                    "low":    float(c[3]),
+                    "volume": float(c[5]),
+                    "open":   float(c[1]),
+                })
+            return out
+        except Exception as e:
+            log.warning(f"Binance {interval}: {e}")
+            return []
 
+    def _parse_delta(self, raw: list) -> list:
+        out = []
+        for c in raw:
+            try:
+                v = float(c.get("close",0) or 0)
+                if v > 0:
+                    out.append({
+                        "close":  v,
+                        "high":   float(c.get("high",  v) or v),
+                        "low":    float(c.get("low",   v) or v),
+                        "volume": float(c.get("volume",0) or 0),
+                        "open":   float(c.get("open",  v) or v),
+                    })
+            except: pass
+        return out
 
-def calc_ema(prices, n):
-    if len(prices) < n:
-        return [prices[-1]] * len(prices) if prices else []
-    k = 2.0 / (n + 1)
-    v = [sum(prices[:n]) / n]
-    for x in prices[n:]:
-        v.append(x * k + v[-1] * (1 - k))
-    return [v[0]] * (n - 1) + v
+    def get_all(self) -> dict:
+        """
+        Returns dict of candle arrays keyed by timeframe.
+        Merges Delta + Binance, uses longest valid source.
+        """
+        # Fetch in parallel-ish (sequential but fast)
+        d1m  = self._parse_delta(self.delta.candles("1m", 100))
+        d5m  = self._parse_delta(self.delta.candles("5m", 100))
+        d15m = self._parse_delta(self.delta.candles("15m", 60))
+        b1m  = self._binance_candles("1m", 100)
+        b5m  = self._binance_candles("5m", 100)
 
+        # Use whichever source has more data for each timeframe
+        c1m  = d1m  if len(d1m)  >= len(b1m)  else b1m
+        c5m  = d5m  if len(d5m)  >= len(b5m)  else b5m
+        c15m = d15m  # only Delta has 15m
 
-def calc_rsi(prices, n=14):
-    if len(prices) < n + 2:
-        return 50.0
-    d = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
-    g = sum(max(x, 0)  for x in d[-n:]) / n
-    l = sum(abs(min(x, 0)) for x in d[-n:]) / n
-    return round(100.0 if l < 1e-10 else 100 - 100 / (1 + g / l), 1)
+        return {
+            "1m":  c1m,
+            "5m":  c5m,
+            "15m": c15m,
+            "source_1m":  "delta" if d1m else "binance",
+            "source_5m":  "delta" if d5m else "binance",
+        }
 
+    def arrays(self, candles: list):
+        """Unpack candle list to (closes, highs, lows, volumes)"""
+        cl=[]; hi=[]; lo=[]; vo=[]
+        for c in candles:
+            cl.append(c["close"]); hi.append(c["high"])
+            lo.append(c["low"]);   vo.append(c["volume"])
+        return cl, hi, lo, vo
 
-def calc_adx(hi, lo, cl, n=14):
-    if len(cl) < n * 2 + 1:
-        return 0.0, 0.0, 0.0
-    tr, pm, nm = [], [], []
-    for i in range(1, len(cl)):
-        tr.append(max(hi[i]-lo[i], abs(hi[i]-cl[i-1]), abs(lo[i]-cl[i-1])))
-        u = hi[i] - hi[i - 1]
-        d = lo[i - 1] - lo[i]
-        pm.append(u if u > d and u > 0 else 0.0)
-        nm.append(d if d > u and d > 0 else 0.0)
+# ═══════════════════════════════════════════════════════════════════
+#  INDICATORS
+# ═══════════════════════════════════════════════════════════════════
+def ema(p, n):
+    if len(p) < n: return [p[-1]]*len(p) if p else []
+    k=2/(n+1); v=[sum(p[:n])/n]
+    for x in p[n:]: v.append(x*k+v[-1]*(1-k))
+    return [v[0]]*(n-1)+v
 
-    def wilder(a):
-        s = sum(a[:n])
-        r = [s]
-        for v in a[n:]:
-            s = s - s / n + v
-            r.append(s)
+def rsi(p, n=14):
+    if len(p) < n+2: return 50.0
+    d=[p[i]-p[i-1] for i in range(1,len(p))]
+    g=sum(max(x,0) for x in d[-n:])/n
+    l=sum(abs(min(x,0)) for x in d[-n:])/n
+    return round(100 if l<1e-10 else 100-100/(1+g/l), 1)
+
+def adx_calc(hi, lo, cl, n=14):
+    if len(cl) < n*2+1: return 0.0, 0.0, 0.0
+    tr,pm,nm=[],[],[]
+    for i in range(1,len(cl)):
+        tr.append(max(hi[i]-lo[i],abs(hi[i]-cl[i-1]),abs(lo[i]-cl[i-1])))
+        u=hi[i]-hi[i-1]; d=lo[i-1]-lo[i]
+        pm.append(u if u>d and u>0 else 0.0)
+        nm.append(d if d>u and d>0 else 0.0)
+    def ws(a):
+        s=sum(a[:n]); r=[s]
+        for v in a[n:]: s=s-s/n+v; r.append(s)
         return r
+    at=ws(tr); pd=ws(pm); nd=ws(nm)
+    pi=[100*pd[i]/at[i] if at[i]>0 else 0 for i in range(len(at))]
+    ni=[100*nd[i]/at[i] if at[i]>0 else 0 for i in range(len(at))]
+    dx=[abs(pi[i]-ni[i])/(pi[i]+ni[i])*100 if pi[i]+ni[i]>0 else 0
+        for i in range(len(pi))]
+    return round(sum(dx[-n:])/n,1), round(pi[-1],1), round(ni[-1],1)
 
-    at = wilder(tr)
-    pd = wilder(pm)
-    nd = wilder(nm)
-    pi = [100 * pd[i] / at[i] if at[i] > 0 else 0 for i in range(len(at))]
-    ni = [100 * nd[i] / at[i] if at[i] > 0 else 0 for i in range(len(at))]
-    dx = [abs(pi[i] - ni[i]) / (pi[i] + ni[i]) * 100
-          if pi[i] + ni[i] > 0 else 0 for i in range(len(pi))]
-    return round(sum(dx[-n:]) / n, 1), round(pi[-1], 1), round(ni[-1], 1)
+def atr_val(hi, lo, cl, n=14):
+    if len(cl) < n+1: return 0.0
+    trs=[max(hi[i]-lo[i],abs(hi[i]-cl[i-1]),abs(lo[i]-cl[i-1]))
+         for i in range(1,len(cl))]
+    return sum(trs[-n:])/n
 
+def bollinger(cl, n=20):
+    if len(cl) < n: m=cl[-1]; return m,m,m,0.0
+    w=cl[-n:]; m=sum(w)/n
+    s=math.sqrt(sum((p-m)**2 for p in w)/n)
+    bw=(4*s/m*100) if m>0 else 0.0
+    return m+2*s, m, m-2*s, bw
 
-def calc_atr(hi, lo, cl, n=14):
-    if len(cl) < n + 1:
-        return 0.0
-    trs = [max(hi[i]-lo[i], abs(hi[i]-cl[i-1]), abs(lo[i]-cl[i-1]))
-           for i in range(1, len(cl))]
-    return sum(trs[-n:]) / n
+def macd(cl, fast=12, slow=26, sig=9):
+    if len(cl) < slow+sig: return 0.0, 0.0, 0.0
+    ef=ema(cl,fast); es=ema(cl,slow)
+    line=[ef[i]-es[i] for i in range(len(es))]
+    signal=ema(line,sig)
+    hist=line[-1]-signal[-1]
+    return round(line[-1],2), round(signal[-1],2), round(hist,4)
 
+# ═══════════════════════════════════════════════════════════════════
+#  CONFIDENCE ENGINE  (7 pillars, 0-100)
+# ═══════════════════════════════════════════════════════════════════
+class ConfidenceEngine:
+    """
+    Scores a trade direction 0-100 across 7 independent pillars.
+    All inputs are price-derived. No news. No external sentiment.
+    """
 
-def signal_score(cl, hi, lo, vo, cl15, hour, direction):
-    """Score a trade direction 0-100. Returns (score, veto_reason)."""
-    if len(cl) < 55:
-        return 0, "need_55_candles"
-    if hour in [2, 3, 4, 5]:
-        return 0, "dead_zone_UTC"
-    if len(vo) >= 21:
-        avg = sum(vo[-21:-1]) / 20
-        if vo[-2] < avg * 0.10:
-            return 0, "low_volume"
+    def score(self, candles: dict, direction: str, hour: int) -> dict:
+        """
+        Returns {
+          total: 0-100,
+          pillars: {name: {score, max, detail}},
+          veto: reason or "",
+          regime: STRONG_BULL/BULL/NEUTRAL/BEAR/STRONG_BEAR/SIDEWAYS,
+          volatility_regime: LOW/NORMAL/HIGH,
+          strategy: SCALP/SWING/STRADDLE/WAIT,
+          direction: long/short/straddle/wait
+        }
+        """
+        c1m  = candles.get("1m", [])
+        c5m  = candles.get("5m", [])
+        c15m = candles.get("15m", [])
 
-    adx_v, pdi, ndi = calc_adx(hi, lo, cl)
-    rsi_v = calc_rsi(cl)
-    e8  = calc_ema(cl, 8)[-1]
-    e21 = calc_ema(cl, 21)[-1]
-    e55 = calc_ema(cl, 55)[-1]
-    price = cl[-1]
-    bull  = price > e8 > e21 > e55 and adx_v > 20 and pdi > ndi
-    bear  = price < e8 < e21 < e55 and adx_v > 20 and ndi > pdi
+        if len(c5m) < 55:
+            return {"total":0, "veto":"need_55_candles_5m",
+                    "regime":"UNKNOWN", "strategy":"WAIT",
+                    "direction":"wait", "pillars":{},
+                    "volatility_regime":"UNKNOWN"}
 
-    s = 0
-    # Regime (40 pts)
-    if   direction == "long"  and bull: s += 40
-    elif direction == "short" and bear: s += 40
-    elif adx_v > 15: s += 15
-    else: s += 5
+        cl5,hi5,lo5,vo5 = self._unpack(c5m)
+        cl1,hi1,lo1,vo1 = self._unpack(c1m) if len(c1m)>=20 else (cl5,hi5,lo5,vo5)
+        cl15,hi15,lo15,_ = self._unpack(c15m) if len(c15m)>=21 else (cl5,hi5,lo5,vo5)
 
-    # RSI position (25 pts)
-    if direction == "long":
-        if   35 <= rsi_v <= 55: s += 25
-        elif rsi_v < 35:        s += 20
-        elif rsi_v <= 65:       s += 10
-    else:
-        if   45 <= rsi_v <= 65: s += 25
-        elif rsi_v > 65:        s += 20
-        elif rsi_v >= 35:       s += 10
+        price = cl5[-1]
+        pillars = {}
 
-    # 15m alignment (20 pts)
-    if len(cl15) >= 21:
-        e8_  = calc_ema(cl15, 8)[-1]
-        e21_ = calc_ema(cl15, 21)[-1]
-        if   direction == "long"  and cl15[-1] > e8_ > e21_: s += 20
-        elif direction == "short" and cl15[-1] < e8_ < e21_: s += 20
-        else: s += 5
-    else:
-        s += 10
+        # ── PILLAR 1: Regime (25pts) ──────────────────────────────
+        p1 = self._pillar_regime(cl5, hi5, lo5, direction)
+        pillars["Regime"] = p1
 
-    # ADX strength (15 pts)
-    if   adx_v > 30: s += 15
-    elif adx_v > 22: s += 10
-    elif adx_v > 15: s += 5
+        # ── PILLAR 2: Multi-TF Alignment (20pts) ─────────────────
+        p2 = self._pillar_mtf(cl5, cl1, cl15, direction)
+        pillars["MTF Align"] = p2
 
-    return min(s, 100), ""
+        # ── PILLAR 3: Momentum RSI (15pts) ───────────────────────
+        p3 = self._pillar_rsi(cl5, cl1, direction)
+        pillars["RSI"] = p3
 
+        # ── PILLAR 4: MACD (15pts) ───────────────────────────────
+        p4 = self._pillar_macd(cl5, direction)
+        pillars["MACD"] = p4
 
-# ── Bot ───────────────────────────────────────────────────────────────
+        # ── PILLAR 5: Volatility / BB (10pts) ────────────────────
+        p5 = self._pillar_vol(cl5, hi5, lo5)
+        pillars["Volatility"] = p5
 
+        # ── PILLAR 6: Volume (10pts) ──────────────────────────────
+        p6 = self._pillar_volume(vo5, vo1)
+        pillars["Volume"] = p6
+
+        # ── PILLAR 7: Session Time (5pts) ────────────────────────
+        p7 = self._pillar_session(hour)
+        pillars["Session"] = p7
+
+        total = sum(v["score"] for v in pillars.values())
+        total = min(total, 100)
+
+        # ── Detect volatility regime for options strategy ─────────
+        _, _, _, bw = bollinger(cl5)
+        adx_v,_,_ = adx_calc(hi5, lo5, cl5)
+        atr_pct   = atr_val(hi5,lo5,cl5)/price*100 if price>0 else 0
+
+        if bw < 1.5 and adx_v < 18:
+            vol_regime = "LOW"       # → good for straddle (expansion coming)
+        elif bw > 5.0 or atr_pct > 0.8:
+            vol_regime = "HIGH"      # → scalp small, tight stops
+        else:
+            vol_regime = "NORMAL"
+
+        # ── Detect regime ─────────────────────────────────────────
+        e8 =ema(cl5,8)[-1]; e21=ema(cl5,21)[-1]; e55=ema(cl5,55)[-1]
+        adx_v2,pdi,ndi = adx_calc(hi5,lo5,cl5)
+        if   price>e8>e21>e55 and adx_v2>25 and pdi>ndi: regime="STRONG_BULL"
+        elif price>e8>e21 and adx_v2>18:                  regime="BULL"
+        elif price<e8<e21<e55 and adx_v2>25 and ndi>pdi: regime="STRONG_BEAR"
+        elif price<e8<e21 and adx_v2>18:                  regime="BEAR"
+        elif adx_v2 < 15:                                  regime="SIDEWAYS"
+        else:                                               regime="NEUTRAL"
+
+        # ── Determine strategy from total + regime + vol ─────────
+        veto = ""
+        if hour in [2,3,4,5]:
+            veto = "dead_zone_UTC"
+        if adx_v2 < 12 and vol_regime == "NORMAL":
+            veto = "no_trend_ADX<12"
+
+        if veto:
+            strategy = "WAIT"
+        elif regime == "SIDEWAYS" and vol_regime == "LOW":
+            strategy = "STRADDLE"   # compression → expect expansion
+        elif vol_regime == "HIGH" and total >= C.CONF_TRADE:
+            strategy = "SCALP"      # volatile → quick in/out
+        elif total >= C.CONF_TRADE and regime in ("STRONG_BULL","STRONG_BEAR"):
+            strategy = "SWING"      # strong trend → hold
+        elif total >= C.CONF_TRADE:
+            strategy = "SCALP"
+        else:
+            strategy = "WAIT"
+
+        # ── Final direction ───────────────────────────────────────
+        if strategy == "STRADDLE":
+            final_dir = "straddle"
+        elif total < C.CONF_TRADE or veto:
+            final_dir = "wait"
+        elif direction == "long" and regime in ("BULL","STRONG_BULL"):
+            final_dir = "long"
+        elif direction == "short" and regime in ("BEAR","STRONG_BEAR"):
+            final_dir = "short"
+        else:
+            final_dir = "wait"
+
+        return {
+            "total":             total,
+            "pillars":           pillars,
+            "veto":              veto,
+            "regime":            regime,
+            "volatility_regime": vol_regime,
+            "strategy":          strategy,
+            "direction":         final_dir,
+            "adx":               round(adx_v2,1),
+            "bw":                round(bw,2),
+            "atr_pct":           round(atr_pct,3),
+        }
+
+    def _unpack(self, candles):
+        cl=[c["close"] for c in candles]
+        hi=[c["high"]  for c in candles]
+        lo=[c["low"]   for c in candles]
+        vo=[c["volume"] for c in candles]
+        return cl,hi,lo,vo
+
+    def _pillar_regime(self, cl, hi, lo, direction):
+        if len(cl) < 55: return {"score":0,"max":25,"detail":"no data"}
+        adx_v,pdi,ndi = adx_calc(hi,lo,cl)
+        e8=ema(cl,8)[-1]; e21=ema(cl,21)[-1]; e55=ema(cl,55)[-1]
+        price=cl[-1]
+        bull = price>e8>e21>e55 and adx_v>20 and pdi>ndi
+        bear = price<e8<e21<e55 and adx_v>20 and ndi>pdi
+        if   direction=="long"  and bull: s,d = 25,"Strong bull regime"
+        elif direction=="short" and bear: s,d = 25,"Strong bear regime"
+        elif direction in ("long","short") and adx_v>15: s,d = 12,"Weak trend"
+        else:                                             s,d = 3,"No trend"
+        return {"score":s,"max":25,"detail":d,"adx":round(adx_v,1)}
+
+    def _pillar_mtf(self, cl5, cl1, cl15, direction):
+        score=0; details=[]
+        for tf_cl, label in [(cl1,"1m"),(cl15,"15m")]:
+            if len(tf_cl) < 21: continue
+            e8=ema(tf_cl,8)[-1]; e21=ema(tf_cl,21)[-1]; p=tf_cl[-1]
+            if direction=="long"  and p>e8>e21: score+=10; details.append(f"{label}↑")
+            elif direction=="short" and p<e8<e21: score+=10; details.append(f"{label}↓")
+            else:                                  details.append(f"{label}~")
+        return {"score":min(score,20),"max":20,
+                "detail":" ".join(details) or "checking"}
+
+    def _pillar_rsi(self, cl5, cl1, direction):
+        r5 = rsi(cl5)
+        r1 = rsi(cl1) if len(cl1)>=16 else r5
+        if direction=="long":
+            if   35<=r5<=55 and r1>r5: s,d = 15,"Pullback+rising"
+            elif r5<35:                 s,d = 12,"Oversold bounce"
+            elif r5<=65:                s,d = 7, "Mid-range"
+            else:                       s,d = 3, "Overbought"
+        else:
+            if   45<=r5<=65 and r1<r5: s,d = 15,"Distribution+falling"
+            elif r5>65:                 s,d = 12,"Overbought rejection"
+            elif r5>=35:                s,d = 7, "Mid-range"
+            else:                       s,d = 3, "Oversold"
+        return {"score":s,"max":15,"detail":d,"rsi5":r5,"rsi1":round(r1,1)}
+
+    def _pillar_macd(self, cl, direction):
+        line, sig, hist = macd(cl)
+        if direction=="long":
+            if hist > 0 and line > sig: s,d = 15,"MACD bullish"
+            elif hist > 0:              s,d = 8, "Hist positive"
+            else:                       s,d = 2, "MACD bearish"
+        else:
+            if hist < 0 and line < sig: s,d = 15,"MACD bearish"
+            elif hist < 0:              s,d = 8, "Hist negative"
+            else:                       s,d = 2, "MACD bullish"
+        return {"score":s,"max":15,"detail":d,"hist":hist}
+
+    def _pillar_vol(self, cl, hi, lo):
+        _,_,_, bw = bollinger(cl)
+        adx_v,_,_ = adx_calc(hi,lo,cl)
+        atr_pct   = atr_val(hi,lo,cl)/cl[-1]*100 if cl[-1]>0 else 0
+        if   0.5 < bw < 4.0 and 15<adx_v<50: s,d = 10,"Ideal vol"
+        elif bw < 0.5:                          s,d = 8, "Squeeze-ready"
+        elif bw > 6.0:                          s,d = 3, "Extreme vol"
+        else:                                   s,d = 6, "Normal vol"
+        return {"score":s,"max":10,"detail":d,"bw":round(bw,2),"atr_pct":round(atr_pct,3)}
+
+    def _pillar_volume(self, vo5, vo1):
+        if len(vo5) < 21: return {"score":5,"max":10,"detail":"no vol data"}
+        avg5 = sum(vo5[-21:-1])/20
+        cur  = vo5[-2]  # last completed candle
+        if   cur > avg5*2.0: s,d = 10,"Volume spike"
+        elif cur > avg5*1.3: s,d = 7, "Above average"
+        elif cur > avg5*0.5: s,d = 5, "Normal"
+        else:                 s,d = 2, "Low volume"
+        if cur < avg5*0.1: return {"score":0,"max":10,"detail":"volume trap","veto":"low_volume"}
+        return {"score":s,"max":10,"detail":d}
+
+    def _pillar_session(self, hour):
+        prime = [8,9,13,14,15,16,21,22,23,0]  # London + NY + Asia open
+        dead  = [2,3,4,5,6]
+        if   hour in dead:  return {"score":0,"max":5,"detail":"dead zone"}
+        elif hour in prime: return {"score":5,"max":5,"detail":"prime session"}
+        else:               return {"score":3,"max":5,"detail":"off-peak"}
+
+# ═══════════════════════════════════════════════════════════════════
+#  OPTIONS STRATEGY ENGINE
+# ═══════════════════════════════════════════════════════════════════
+class OptionsEngine:
+    """
+    Decides: ATM or ITM? Call or Put? Straddle?
+    Manages profit floor (trailing) + stop ceiling.
+    """
+    LOT_BTC = 0.001
+
+    def __init__(self, delta: DeltaAPI):
+        self.delta = delta
+        self._peak_premium = {}   # symbol -> peak mark price seen
+        self._entry_time   = {}   # symbol -> datetime opened
+
+    def next_friday(self) -> str:
+        from datetime import date, timedelta
+        today = date.today()
+        days  = (4 - today.weekday()) % 7
+        if days == 0: days = 7
+        return (today + timedelta(days=days)).strftime("%d%m%y")
+
+    def atm_strike(self, price, interval=500):
+        return round(price / interval) * interval
+
+    def itm_strike(self, price, direction, interval=500):
+        """ITM = 1 strike in-the-money for higher delta."""
+        atm = self.atm_strike(price, interval)
+        if direction == "call": return atm - interval   # lower strike = ITM call
+        else:                   return atm + interval   # higher strike = ITM put
+
+    def find_option(self, opt_type, btc_price, use_itm=False) -> dict:
+        """Find best option. Try ITM or ATM, fallback to other."""
+        prefix = "C" if opt_type=="call" else "P"
+        expiry = self.next_friday()
+        atm    = self.atm_strike(btc_price)
+
+        candidates = []
+        if use_itm:
+            itm = self.itm_strike(btc_price, opt_type)
+            candidates = [itm, atm]
+        else:
+            candidates = [atm, atm+500 if opt_type=="call" else atm-500]
+
+        for strike in candidates:
+            sym = f"{prefix}-BTC-{strike}-{expiry}"
+            d   = self.delta.get(f"/v2/tickers/{sym}")
+            if d and d.get("success"):
+                res  = d.get("result",{})
+                mark = float(res.get("mark_price",0) or 0)
+                bid  = float(res.get("best_bid",0)  or 0)
+                ask  = float(res.get("best_ask",0)  or 0)
+                if mark > 0:
+                    return {
+                        "found":    True,
+                        "symbol":   sym,
+                        "strike":   strike,
+                        "expiry":   expiry,
+                        "type":     opt_type,
+                        "mark":     mark,
+                        "bid":      bid,
+                        "ask":      ask,
+                        "moneyness":"ITM" if use_itm else "ATM",
+                        "premium_usd": mark * self.LOT_BTC,
+                    }
+        return {"found":False,"tried":candidates,"expiry":expiry}
+
+    def should_exit(self, sym, current_mark, entry_mark, opened_at) -> dict:
+        """
+        Profit floor + stop ceiling check.
+        Returns {exit: bool, reason: str}
+        """
+        if entry_mark <= 0: return {"exit":False,"reason":""}
+        pct = (current_mark - entry_mark) / entry_mark
+
+        # Track peak for profit floor
+        peak = self._peak_premium.get(sym, entry_mark)
+        if current_mark > peak:
+            self._peak_premium[sym] = current_mark
+            peak = current_mark
+
+        # Profit floor: if we've been up ≥60% and now drop 30% from peak
+        peak_pct = (peak - entry_mark) / entry_mark
+        drop_from_peak = (peak - current_mark) / peak if peak > 0 else 0
+
+        # Expiry check: close 60min before Friday 12:00 UTC
+        now = datetime.now(timezone.utc)
+        expiry_str = sym[-6:] if len(sym) >= 6 else ""
+        if expiry_str:
+            try:
+                exp_dt = datetime.strptime(expiry_str, "%d%m%y").replace(
+                    hour=11, minute=0, tzinfo=timezone.utc)
+                if now >= exp_dt:
+                    return {"exit":True,"reason":f"expiry","pct":pct}
+            except: pass
+
+        if pct >= C.OPT_TP_PCT:
+            return {"exit":True,"reason":f"TP +{pct*100:.0f}%","pct":pct}
+        if pct <= -C.OPT_STOP_PCT:
+            return {"exit":True,"reason":f"SL {pct*100:.0f}%","pct":pct}
+        if peak_pct >= C.OPT_FLOOR and drop_from_peak >= 0.30:
+            return {"exit":True,"reason":f"floor trail peak={peak_pct*100:.0f}%","pct":pct}
+
+        # Minimum hold: don't exit in first 5min
+        if opened_at:
+            hold = (now - opened_at).seconds / 60
+            if hold < 5:
+                return {"exit":False,"reason":f"min_hold {hold:.0f}m"}
+
+        return {"exit":False,"reason":f"holding pct={pct*100:.1f}%","pct":pct}
+
+    def record_open(self, sym):
+        self._entry_time[sym]   = datetime.now(timezone.utc)
+        self._peak_premium[sym] = 0
+
+    def record_close(self, sym):
+        self._entry_time.pop(sym, None)
+        self._peak_premium.pop(sym, None)
+
+    def opened_at(self, sym):
+        return self._entry_time.get(sym)
+
+    def straddle_find(self, btc_price) -> dict:
+        """Find matched call+put for straddle at ATM."""
+        c = self.find_option("call", btc_price, use_itm=False)
+        p = self.find_option("put",  btc_price, use_itm=False)
+        if c.get("found") and p.get("found"):
+            total_premium = c["premium_usd"] + p["premium_usd"]
+            return {
+                "found":True,"call":c,"put":p,
+                "total_premium_usd":round(total_premium,3),
+                "breakeven_up":   c["strike"] + total_premium/self.LOT_BTC,
+                "breakeven_down": p["strike"] - total_premium/self.LOT_BTC,
+            }
+        return {"found":False}
+
+# ═══════════════════════════════════════════════════════════════════
+#  BOT
+# ═══════════════════════════════════════════════════════════════════
 class Bot:
     def __init__(self):
-        self.api       = API()
+        self.delta     = DeltaAPI()
+        self.mdata     = None   # MarketData, set on connect
+        self.conf_eng  = ConfidenceEngine()
+        self.opts_eng  = None   # OptionsEngine, set on connect
         self.running   = False
         self.connected = False
+        self.opts_mode = False  # toggle from dashboard
+
+        # Account state
         self.capital   = 0.0
         self.start_cap = 0.0
         self.day_start = 0.0
         self.halted    = False
         self.halt_msg  = ""
+
+        # Dashboard state
         self.status    = "Not connected"
         self.logs      = []
         self.trades    = []
         self.scan_n    = 0
         self.next_scan = None
-        self.price     = 0.0
-        self.regime    = "—"
-        self.rsi_v     = 50.0
-        self.adx_v     = 0.0
-        self.atr_pct   = 0.0
-        self.l_sc      = 0
-        self.s_sc      = 0
-        self.l_vt      = ""
-        self.s_vt      = ""
+        self.btc_price = 0.0
+        self.last_conf = {}   # last confidence result
         self.total_tr  = 0
         self.wins      = 0
-        self._stops    = set()
+
+        # Anti-overtrading
+        self._stops       = set()
+        self._last_close  = None
+        self._consec_loss = 0
+        self._circuit_until = None
+        self._pos_opened  = {}
 
     def emit(self, level, msg):
-        entry = {
-            "t": datetime.now(timezone.utc).strftime("%H:%M:%S"),
-            "l": level, "m": msg
-        }
-        self.logs.append(entry)
-        if len(self.logs) > 500:
-            self.logs.pop(0)
-        fn = {"INFO": log.info, "WARN": log.warning,
-              "ERROR": log.error, "TRADE": log.info}.get(level, log.info)
-        fn(msg)
+        e = {"t":datetime.now(timezone.utc).strftime("%H:%M:%S"),
+             "l":level,"m":msg}
+        self.logs.append(e)
+        if len(self.logs) > 500: self.logs.pop(0)
+        getattr(log,{"INFO":"info","WARN":"warning",
+                     "ERROR":"error","TRADE":"info"}.get(level,"info"))(msg)
 
     def save(self):
         try:
-            data = {
-                "sc": self.start_cap, "ds": self.day_start,
-                "halted": self.halted, "hm": self.halt_msg,
-                "tr": self.total_tr, "w": self.wins,
-                "trades": self.trades[-100:],
-                "stops": list(self._stops)
-            }
-            with open(C.STATE, "w") as f:
-                json.dump(data, f)
-        except Exception:
-            pass
+            json.dump({
+                "start_cap":self.start_cap,"day_start":self.day_start,
+                "halted":self.halted,"halt_msg":self.halt_msg,
+                "total_tr":self.total_tr,"wins":self.wins,
+                "trades":self.trades[-100:],"stops":list(self._stops),
+                "consec":self._consec_loss,
+                "circuit":self._circuit_until.isoformat() if self._circuit_until else None,
+                "last_close":self._last_close.isoformat() if self._last_close else None,
+            }, open(C.STATE,"w"))
+        except: pass
 
     def load(self):
         try:
-            if not os.path.exists(C.STATE):
-                return False
-            with open(C.STATE) as f:
-                s = json.load(f)
-            self.start_cap = float(s.get("sc", 0))
-            self.day_start = float(s.get("ds", 0))
-            self.halted    = bool(s.get("halted", False))
-            self.halt_msg  = s.get("hm", "")
-            self.total_tr  = int(s.get("tr", 0))
-            self.wins      = int(s.get("w", 0))
-            self.trades    = s.get("trades", [])
-            self._stops    = set(s.get("stops", []))
+            if not os.path.exists(C.STATE): return False
+            s = json.load(open(C.STATE))
+            self.start_cap     = float(s.get("start_cap",0))
+            self.day_start     = float(s.get("day_start",0))
+            self.halted        = bool(s.get("halted",False))
+            self.halt_msg      = s.get("halt_msg","")
+            self.total_tr      = int(s.get("total_tr",0))
+            self.wins          = int(s.get("wins",0))
+            self.trades        = s.get("trades",[])
+            self._stops        = set(s.get("stops",[]))
+            self._consec_loss  = int(s.get("consec",0))
+            cu = s.get("circuit"); self._circuit_until = datetime.fromisoformat(cu) if cu else None
+            lc = s.get("last_close"); self._last_close = datetime.fromisoformat(lc) if lc else None
             if self.start_cap > 0:
-                self.emit("INFO",
-                    f"Restored: start=${self.start_cap:.2f} "
-                    f"trades={self.total_tr}")
+                self.emit("INFO",f"Restored: start=${self.start_cap:.2f} trades={self.total_tr}")
                 return True
-        except Exception:
-            pass
+        except: pass
         return False
 
     def connect(self, key, secret):
-        self.api.set(key, secret)
-        bal, raw, err = self.api.balance()
+        self.delta.set(key, secret)
+        bal, raw, err = self.delta.balance()
         if bal <= 0:
             srv = "unknown"
-            try:
-                srv = requests.get(
-                    "https://api.ipify.org?format=json",
-                    timeout=4).json().get("ip", "?")
-            except Exception:
-                pass
-            return {"success": False, "message": err,
-                    "server_ip": srv, "raw_response": raw}
+            try: srv = requests.get("https://api.ipify.org?format=json",timeout=4).json().get("ip","?")
+            except: pass
+            return {"success":False,"message":err,"server_ip":srv}
         self.capital   = bal
         self.connected = True
+        self.mdata     = MarketData(self.delta)
+        self.opts_eng  = OptionsEngine(self.delta)
         if not self.load() or self.start_cap <= 0:
-            self.start_cap = bal
-            self.day_start = bal
-            self.save()
+            self.start_cap = bal; self.day_start = bal; self.save()
         self.emit("INFO",
-            f"Connected | ${bal:.2f} | "
-            f"Start ${self.start_cap:.2f} | "
+            f"Connected | ${bal:.2f} | Start ${self.start_cap:.2f} | "
             f"Halt <${self.start_cap*(1-C.HALT_PCT):.2f}")
         self._sync_positions()
-        if not self.running:
-            self.start()
-        return {"success": True, "balance": bal}
-
-    def _sync_positions(self):
-        """Read Delta positions → add to trades + place stops."""
-        for p in self.api.positions():
-            sz    = float(p.get("size", 0) or 0)
-            entry = float(p.get("entry_price")
-                          or p.get("avg_entry_price") or 0)
-            if sz == 0 or entry == 0:
-                continue
-            pid  = str(p.get("product_id", C.PID))
-            sym  = str(p.get("product_symbol", "BTCUSD"))
-            side = "long" if sz > 0 else "short"
-            lots = abs(int(sz))
-            upnl = float(p.get("unrealized_pnl", 0) or 0)
-
-            already = any(
-                str(t.get("pid", "")) == pid and t.get("exit") is None
-                for t in self.trades)
-            if not already:
-                self.trades.append({
-                    "time":   datetime.now(timezone.utc).isoformat(),
-                    "side":   side,
-                    "entry":  round(entry, 1),
-                    "exit":   None,
-                    "lots":   lots,
-                    "pnl":    None,
-                    "pct":    None,
-                    "reason": "synced",
-                    "won":    None,
-                    "pid":    pid,
-                    "sym":    sym,
-                    "upnl":   round(upnl, 3)
-                })
-                self.emit("INFO",
-                    f"Synced: {side.upper()} {lots}L {sym} @ ${entry:.0f}")
-
-            if pid not in self._stops:
-                sp = entry * (1-C.STOP_PCT if side=="long" else 1+C.STOP_PCT)
-                tp = entry * (1+C.TP_PCT   if side=="long" else 1-C.TP_PCT)
-                cs = "sell" if side == "long" else "buy"
-                r  = self.api.bracket(cs, lots, sp, tp)
-                if r.get("success"):
-                    self._stops.add(pid)
-                    self.emit("INFO",
-                        f"Stop placed: stop=${sp:.0f} TP=${tp:.0f}")
-                    self.save()
-                else:
-                    self.emit("WARN",
-                        f"Stop FAILED — set manually: ${sp:.0f} | "
-                        f"{r.get('error', '?')}")
+        if not self.running: self.start()
+        return {"success":True,"balance":bal}
 
     def _sync_wallet(self):
-        bal, _, err = self.api.balance()
-        if bal <= 0:
-            self.emit("WARN", f"Wallet sync: {err}")
-            return
+        bal,_,err = self.delta.balance()
+        if bal <= 0: self.emit("WARN",f"Wallet: {err}"); return
         self.capital = bal
         if self.start_cap > 0:
-            loss = (self.start_cap - bal) / self.start_cap
+            loss = (self.start_cap-bal)/self.start_cap
             if loss >= C.HALT_PCT and not self.halted:
-                self.halted   = True
-                self.halt_msg = (f"Down {loss*100:.1f}% "
-                                 f"(${self.start_cap:.2f} -> ${bal:.2f})")
-                self.emit("ERROR", f"BOT HALTED: {self.halt_msg}")
-                self.save()
-        status = "HALTED" if self.halted else "OK"
-        self.emit("INFO", f"Wallet ${bal:.2f} | {status}")
+                self.halted=True
+                self.halt_msg=f"Down {loss*100:.1f}% (${self.start_cap:.2f}→${bal:.2f})"
+                self.emit("ERROR",f"HALTED: {self.halt_msg}"); self.save()
+        self.emit("INFO",f"Wallet ${bal:.2f} | {'HALTED' if self.halted else 'OK'}")
 
-    def _pos_display(self):
+    def _sync_positions(self):
+        for p in self.delta.btcusd_positions():
+            sz    = float(p.get("size",0) or 0)
+            entry = float(p.get("entry_price") or p.get("avg_entry_price") or 0)
+            if sz==0 or entry==0: continue
+            pid  = str(p.get("product_id",C.PID))
+            side = "long" if sz>0 else "short"
+            lots = abs(int(sz))
+            if not any(str(t.get("pid",""))==pid and t.get("exit") is None for t in self.trades):
+                now = datetime.now(timezone.utc)
+                self.trades.append({"time":now.isoformat(),"side":side,
+                    "entry":round(entry,1),"exit":None,"lots":lots,"pnl":None,
+                    "pct":None,"reason":"synced","won":None,"pid":pid,"sym":C.SYMBOL})
+                self._pos_opened[pid] = now
+                self.emit("INFO",f"Synced: {side.upper()} {lots}L @ ${entry:.0f}")
+            if pid not in self._stops and entry>0:
+                sp=entry*(1-C.STOP_PCT if side=="long" else 1+C.STOP_PCT)
+                tp=entry*(1+C.TP_PCT   if side=="long" else 1-C.TP_PCT)
+                cs="sell" if side=="long" else "buy"
+                r=self.delta.bracket(cs,lots,sp,tp)
+                if r.get("success"): self._stops.add(pid); self.save()
+                else: self.emit("WARN",f"Stop FAILED — set manually ${sp:.0f}")
+
+    def _check_perp_exits(self, positions):
+        if not self.btc_price: return
+        for p in positions:
+            sz    = float(p.get("size",0) or 0)
+            entry = float(p.get("entry_price") or p.get("avg_entry_price") or 0)
+            if sz==0 or entry==0: continue
+            side = "long" if sz>0 else "short"
+            pct  = (self.btc_price-entry)/entry if side=="long" else (entry-self.btc_price)/entry
+            lots = abs(int(sz)); pid = p.get("product_id",C.PID)
+            now  = datetime.now(timezone.utc)
+            opened_at = self._pos_opened.get(str(pid))
+            hold_min = (now-opened_at).seconds//60 if opened_at else C.MIN_HOLD_MIN+1
+            if hold_min < C.MIN_HOLD_MIN: continue
+            reason = None
+            if pct <= -C.STOP_PCT: reason="stop"
+            elif pct >= C.TP_PCT:  reason="tp"
+            if reason:
+                r = self.delta.close_position(sz, pid)
+                if r.get("success"):
+                    pnl = round(entry*lots*C.LOT_BTC*pct,4); won=pct>0
+                    self.emit("TRADE",
+                        f"{'✅TP' if won else '❌SL'} {side.upper()} {lots}L "
+                        f"${entry:.0f}→${self.btc_price:.0f} "
+                        f"P&L ${pnl:+.4f} ({pct*100:.2f}%) held={hold_min}m")
+                    self._on_close(won, pnl, side, entry, self.btc_price, lots, reason)
+
+    def _check_options_exits(self):
+        if not self.opts_eng: return
+        for p in self.delta.option_positions():
+            sym    = p.get("product_symbol","")
+            pid    = p.get("product_id")
+            size   = float(p.get("size",0) or 0)
+            entry  = float(p.get("avg_entry_price") or p.get("entry_price") or 0)
+            mark   = float(p.get("mark_price") or 0)
+            if size<=0 or entry<=0 or mark<=0 or not pid: continue
+            lots  = int(size)
+            check = self.opts_eng.should_exit(sym, mark, entry, self.opts_eng.opened_at(sym))
+            if check["exit"]:
+                r = self.delta.close_position(size, pid)
+                if r.get("success"):
+                    pct = check.get("pct",0)
+                    pnl = round((mark-entry)*lots*self.opts_eng.LOT_BTC,4)
+                    won = pnl > 0
+                    self.emit("TRADE",
+                        f"{'✅' if won else '❌'} OPT {check['reason']} | "
+                        f"{sym} | entry ${entry:.2f}→${mark:.2f} | P&L ${pnl:+.4f}")
+                    self.opts_eng.record_close(sym)
+                    self._on_close(won, pnl, "option", entry, mark, lots, check["reason"])
+
+    def _on_close(self, won, pnl, side, entry, exit_p, lots, reason):
+        now = datetime.now(timezone.utc)
+        self._last_close = now
+        if won:
+            self._consec_loss = 0; self.wins += 1
+        else:
+            self._consec_loss += 1
+            if self._consec_loss >= C.CIRCUIT_N:
+                self._circuit_until = now + timedelta(minutes=C.CIRCUIT_MIN)
+                self.emit("WARN",
+                    f"CIRCUIT BREAKER: {self._consec_loss} losses — "
+                    f"pause {C.CIRCUIT_MIN}min")
+        for t in reversed(self.trades):
+            if t.get("exit") is None and t.get("entry")==round(entry,1):
+                t.update({"exit":round(exit_p,1),"pnl":pnl,
+                          "pct":round(pnl/max(entry*lots*C.LOT_BTC,0.001)*100,2),
+                          "won":won,"reason":reason})
+                break
+        self.save()
+
+    def _pos_display(self, positions=None):
+        if positions is None: positions = self.delta.btcusd_positions()
         out = []
-        for p in self.api.positions():
-            sz    = float(p.get("size", 0) or 0)
-            entry = float(p.get("entry_price")
-                          or p.get("avg_entry_price") or 0)
-            if sz == 0 or entry == 0:
-                continue
-            mark = float(p.get("mark_price") or self.price or entry)
+        for p in positions:
+            sz    = float(p.get("size",0) or 0)
+            entry = float(p.get("entry_price") or p.get("avg_entry_price") or 0)
+            if sz==0 or entry==0: continue
+            mark = float(p.get("mark_price") or self.btc_price or entry)
             upnl = float(p.get("unrealized_pnl") or 0)
-            side = "long" if sz > 0 else "short"
-            pct  = ((mark-entry)/entry if side == "long"
-                    else (entry-mark)/entry) * 100
+            side = "long" if sz>0 else "short"
+            pct  = ((mark-entry)/entry if side=="long" else (entry-mark)/entry)*100
+            out.append({"sym":C.SYMBOL,"side":side,"lots":abs(sz),
+                "entry":round(entry,1),"mark":round(mark,1),
+                "upnl":round(upnl,3),"pct":round(pct,2),
+                "stop":round(entry*(1-C.STOP_PCT if side=="long" else 1+C.STOP_PCT),1),
+                "tp":  round(entry*(1+C.TP_PCT   if side=="long" else 1-C.TP_PCT),1)})
+        return out
+
+    def _opts_display(self):
+        out = []
+        for p in self.delta.option_positions():
+            sym   = p.get("product_symbol","")
+            sz    = float(p.get("size",0) or 0)
+            entry = float(p.get("avg_entry_price") or p.get("entry_price") or 0)
+            mark  = float(p.get("mark_price") or 0)
+            upnl  = float(p.get("unrealized_pnl") or 0)
+            if sz<=0: continue
+            pct = (mark-entry)/entry*100 if entry>0 else 0
+            peak = self.opts_eng._peak_premium.get(sym,entry) if self.opts_eng else entry
             out.append({
-                "sym":  p.get("product_symbol", "BTCUSD"),
-                "side": side,
-                "lots": abs(sz),
-                "entry": round(entry, 1),
-                "mark":  round(mark, 1),
-                "upnl":  round(upnl, 3),
-                "pct":   round(pct, 2),
-                "stop":  round(entry*(1-C.STOP_PCT if side=="long"
-                                      else 1+C.STOP_PCT), 1),
-                "tp":    round(entry*(1+C.TP_PCT if side=="long"
-                                     else 1-C.TP_PCT), 1)
+                "sym":sym,"lots":int(sz),"entry":round(entry,4),
+                "mark":round(mark,4),"upnl":round(upnl,3),"pct":round(pct,1),
+                "peak":round(peak,4),"type":"CALL" if sym.startswith("C-") else "PUT"
             })
         return out
 
-    def _check_exits(self):
-        if not self.price:
-            return
-        for p in self.api.positions():
-            sz    = float(p.get("size", 0) or 0)
-            entry = float(p.get("entry_price")
-                          or p.get("avg_entry_price") or 0)
-            if sz == 0 or entry == 0:
-                continue
-            side = "long" if sz > 0 else "short"
-            pct  = ((self.price - entry) / entry if side == "long"
-                    else (entry - self.price) / entry)
-            lots = abs(int(sz))
-            pid  = p.get("product_id", C.PID)
-
-            if pct <= -C.STOP_PCT or pct >= C.TP_PCT:
-                cs = "sell" if side == "long" else "buy"
-                r  = self.api.post("/v2/orders", {
-                    "product_id": pid, "size": lots, "side": cs,
-                    "order_type": "market_order", "time_in_force": "ioc"
-                })
-                if r.get("success"):
-                    pnl    = round(entry * lots * C.LOT_BTC * pct, 4)
-                    reason = "stop" if pct <= -C.STOP_PCT else "tp"
-                    icon   = "STOP" if pct < 0 else "TP"
-                    self.emit("TRADE",
-                        f"{icon} | {side.upper()} {lots}L "
-                        f"${entry:.0f}->${self.price:.0f} "
-                        f"P&L ${pnl:+.4f} ({pct*100:.2f}%)")
-                    for t in reversed(self.trades):
-                        if (t.get("side") == side
-                                and t.get("entry") == round(entry, 1)
-                                and t.get("exit") is None):
-                            t["exit"]   = round(self.price, 1)
-                            t["pnl"]    = pnl
-                            t["pct"]    = round(pct * 100, 2)
-                            t["won"]    = pct > 0
-                            t["reason"] = reason
-                            if pct > 0:
-                                self.wins += 1
-                            break
-                    self.save()
-
     def scan(self):
-        self.scan_n   += 1
-        self.next_scan = (datetime.now(timezone.utc)
-                          + timedelta(seconds=C.SCAN)).isoformat()
+        self.scan_n += 1
+        self.next_scan = (datetime.now(timezone.utc)+timedelta(seconds=C.SCAN_SECS)).isoformat()
 
-        p = self.api.price()
-        if p > 0:
-            self.price = p
+        p = self.delta.price()
+        if p > 0: self.btc_price = p
+        if self.scan_n % 5 == 0: self._sync_wallet()
+        if self.halted: self.status=f"HALTED: {self.halt_msg}"; return
 
-        if self.scan_n % 5 == 0:
-            self._sync_wallet()
+        # Fetch all candle data (Delta + Binance)
+        if not self.mdata: return
+        candles = self.mdata.get_all()
+        c5m = candles.get("5m",[])
+        if len(c5m) < 55:
+            self.status=f"Need 55 candles, got {len(c5m)}"; return
+        self.btc_price = c5m[-1]["close"]
 
-        if self.halted:
-            self.status = f"HALTED: {self.halt_msg}"
-            return
-
-        raw5  = self.api.candles("5m",  100)
-        raw15 = self.api.candles("15m", 60)
-        cl, hi, lo, vo = parse_candles(raw5)
-        cl15, *_       = parse_candles(raw15)
-
-        if len(cl) < 55:
-            self.status = f"{len(cl)} candles — need 55"
-            return
-
-        self.price   = cl[-1]
-        self.rsi_v   = calc_rsi(cl)
-        self.adx_v, pdi, ndi = calc_adx(hi, lo, cl)
-        self.atr_pct = round(calc_atr(hi, lo, cl) / self.price * 100, 3)
-
-        e8  = calc_ema(cl, 8)[-1]
-        e21 = calc_ema(cl, 21)[-1]
-        e55 = calc_ema(cl, 55)[-1]
-
-        if   self.price>e8>e21>e55 and self.adx_v>25 and pdi>ndi:
-            self.regime = "STRONG BULL"
-        elif self.price>e8>e21 and self.adx_v>18:
-            self.regime = "BULL"
-        elif self.price<e8<e21<e55 and self.adx_v>25 and ndi>pdi:
-            self.regime = "STRONG BEAR"
-        elif self.price<e8<e21 and self.adx_v>18:
-            self.regime = "BEAR"
-        else:
-            self.regime = "NEUTRAL"
-
-        real = self.api.positions()
-        self._check_exits()
+        # Real positions from Delta (fetched once)
+        real_pos = self.delta.btcusd_positions()
+        self._check_perp_exits(real_pos)
+        self._check_options_exits()
         self._sync_positions()
 
-        if len(real) >= 1:
-            d = self._pos_display()
-            x = d[0] if d else {}
-            self.status = (
-                f"Holding {x.get('side','').upper()} "
+        # Score LONG and SHORT
+        hour = datetime.now(timezone.utc).hour
+        res_long  = self.conf_eng.score(candles, "long",  hour)
+        res_short = self.conf_eng.score(candles, "short", hour)
+
+        # Pick best direction
+        if res_long["total"] >= res_short["total"]:
+            best = res_long;  other = res_short; best_dir = "long"
+        else:
+            best = res_short; other = res_long;  best_dir = "short"
+
+        self.last_conf = best
+        regime = best["regime"]
+        strat  = best["strategy"]
+
+        # Log the scan
+        lv = res_long.get("veto",""); sv = res_short.get("veto","")
+        self.emit("INFO",
+            f"#{self.scan_n} ${self.btc_price:,.0f} | {regime} | "
+            f"ADX={best['adx']} BW={best['bw']} | "
+            f"L={res_long['total']}{'✗'+lv if lv else ''} "
+            f"S={res_short['total']}{'✗'+sv if sv else ''} | "
+            f"→{strat}")
+
+        # Guard checks
+        now = datetime.now(timezone.utc)
+        if self._circuit_until and now < self._circuit_until:
+            left = int((self._circuit_until-now).seconds/60)
+            self.status=f"Circuit breaker: pause {left}m more"; return
+        elif self._circuit_until and now >= self._circuit_until:
+            self._circuit_until=None; self._consec_loss=0
+            self.emit("INFO","Circuit breaker lifted")
+        if self._last_close:
+            gap = (now-self._last_close).seconds//60
+            if gap < C.COOLDOWN_MIN:
+                self.status=f"Cooldown: {C.COOLDOWN_MIN-gap}m remaining"; return
+        if self.day_start>0 and (self.capital-self.day_start)/self.day_start<=-C.PAUSE_PCT:
+            self.status="Paused — daily -3% limit"; return
+
+        # No open perpetual positions?
+        if len(real_pos) >= 1:
+            d=self._pos_display(real_pos); x=d[0] if d else {}
+            self.status=(f"Holding {x.get('side','').upper()} "
                 f"{x.get('lots',0):.0f}L @ ${x.get('entry',0):,.0f} | "
                 f"UPL ${x.get('upnl',0):+.3f} ({x.get('pct',0):+.2f}%)")
-            self.emit("INFO", self.status)
+            self.emit("INFO",self.status); return
+
+        # OPTIONS mode
+        if self.opts_mode and self.opts_eng:
+            self._trade_options(best, res_long, res_short, now)
             return
 
-        if (self.day_start > 0 and
-                (self.capital - self.day_start) / self.day_start <= -C.PAUSE_PCT):
-            self.status = "Paused — daily -3% limit"
-            return
+        # PERPETUALS mode
+        if strat == "WAIT" or best["total"] < C.CONF_TRADE:
+            self.status=f"Watching | {regime} | {strat} score={best['total']}"; return
 
-        hour = datetime.now(timezone.utc).hour
-        ls, lv = signal_score(cl, hi, lo, vo, cl15, hour, "long")
-        ss, sv = signal_score(cl, hi, lo, vo, cl15, hour, "short")
-        self.l_sc = ls; self.s_sc = ss
-        self.l_vt = lv; self.s_vt = sv
+        direction = res_long["direction"] if res_long["total"]>res_short["total"] else res_short["direction"]
+        if direction in ("wait","straddle"):
+            self.status=f"Watching | {regime} | {direction}"; return
 
-        lv_str = ("x" + lv) if lv else ""
-        sv_str = ("x" + sv) if sv else ""
-        self.emit("INFO",
-            f"#{self.scan_n} ${self.price:,.0f} {self.regime} "
-            f"RSI={self.rsi_v} ADX={self.adx_v} "
-            f"L={ls}{lv_str} S={ss}{sv_str}")
-
-        direction = score = None
-        if not lv and ls >= C.MIN_CONF and ls > ss:
-            direction, score = "long",  ls
-        elif not sv and ss >= C.MIN_CONF and ss > ls:
-            direction, score = "short", ss
-
-        if not direction:
-            why = lv or sv or f"score {max(ls,ss)}<{C.MIN_CONF}"
-            self.status = f"Watching — {why} | {self.regime}"
-            return
-
-        # Lot sizing
-        margin_per_lot = self.price * C.LOT_BTC / C.LEVERAGE
-        risk_usd = max(self.capital * C.RISK_PCT, margin_per_lot)
-        lots     = max(1, min(
-            int(risk_usd / margin_per_lot),
-            max(1, int(self.capital * 0.10 / margin_per_lot))
-        ))
-
-        side = "buy" if direction == "long" else "sell"
-        self.emit("INFO",
-            f"Placing {side.upper()} {lots}L @ ${self.price:,.0f} "
-            f"score={score}")
-
-        r = self.api.order(side, lots)
+        # Size + order
+        margin = self.btc_price * C.LOT_BTC / C.LEVERAGE
+        lots   = max(1, min(int(max(self.capital*C.RISK_PCT,margin)/margin),
+                            max(1,int(self.capital*.10/margin))))
+        side   = "buy" if direction=="long" else "sell"
+        r      = self.delta.order(side, lots)
         if not r.get("success"):
-            err = r.get("error", r.get("message", str(r)[:60]))
-            self.status = f"Order failed: {err}"
-            self.emit("ERROR", self.status)
+            self.emit("ERROR",f"Order failed: {r.get('error',r.get('message','?'))}")
+            return
+        sp = self.btc_price*(1-C.STOP_PCT if direction=="long" else 1+C.STOP_PCT)
+        tp = self.btc_price*(1+C.TP_PCT   if direction=="long" else 1-C.TP_PCT)
+        self.delta.bracket("sell" if direction=="long" else "buy", lots, sp, tp)
+        self._pos_opened[str(C.PID)] = now
+        self.status=f"{direction.upper()} {lots}L @ ${self.btc_price:,.0f} conf={best['total']}"
+        self.emit("TRADE",f"{self.status} | {strat}")
+        self.total_tr += 1
+        self.trades.append({"time":now.isoformat(),"side":direction,
+            "entry":round(self.btc_price,1),"exit":None,"lots":lots,"pnl":None,
+            "pct":None,"reason":strat.lower(),"won":None,"pid":str(C.PID),"sym":C.SYMBOL})
+        self.save()
+
+    def _trade_options(self, best, res_long, res_short, now):
+        """Options trading logic with ATM/ITM selection + straddle."""
+        # Check existing options
+        opt_pos = self.delta.option_positions()
+        if opt_pos:
+            self.status=f"Holding {len(opt_pos)} option(s)"
+            self.emit("INFO",self.status); return
+
+        strat   = best["strategy"]
+        total_l = res_long["total"]
+        total_s = res_short["total"]
+
+        # STRADDLE: low volatility compression
+        if strat == "STRADDLE" and (total_l >= C.CONF_STRADDLE or total_s >= C.CONF_STRADDLE):
+            st = self.opts_eng.straddle_find(self.btc_price)
+            if st.get("found"):
+                total_prem = st["total_premium_usd"]
+                if total_prem <= self.capital * C.OPT_MAX_PREM * 2:
+                    # Buy call leg
+                    c_opt = st["call"]
+                    cp = self.delta.get_option_pid(c_opt["symbol"])
+                    if cp: self.delta.order("buy",1,cp)
+                    # Buy put leg
+                    p_opt = st["put"]
+                    pp = self.delta.get_option_pid(p_opt["symbol"])
+                    if pp: self.delta.order("buy",1,pp)
+                    if cp and pp:
+                        self.opts_eng.record_open(c_opt["symbol"])
+                        self.opts_eng.record_open(p_opt["symbol"])
+                        self.status=f"STRADDLE: C+P ${total_prem:.2f} | BE up=${st['breakeven_up']:.0f} dn=${st['breakeven_down']:.0f}"
+                        self.emit("TRADE",self.status)
+                        self.total_tr+=1
+                        for opt,otype in [(c_opt,"call"),(p_opt,"put")]:
+                            self.trades.append({"time":now.isoformat(),"side":otype,
+                                "entry":round(opt["mark"],4),"exit":None,"lots":1,
+                                "pnl":None,"pct":None,"reason":"straddle","won":None,
+                                "pid":str(cp if otype=="call" else pp),"sym":opt["symbol"]})
+                        self.save()
             return
 
-        sp = self.price * (1-C.STOP_PCT if direction=="long" else 1+C.STOP_PCT)
-        tp = self.price * (1+C.TP_PCT   if direction=="long" else 1-C.TP_PCT)
-        cs = "sell" if direction == "long" else "buy"
-        sr = self.api.bracket(cs, lots, sp, tp)
-        if sr.get("success"):
-            self._stops.add(str(C.PID))
-            self.emit("INFO", f"Stop ${sp:.0f} TP ${tp:.0f}")
+        # DIRECTIONAL: call or put
+        if total_l >= C.CONF_TRADE and total_l >= total_s:
+            opt_type = "call"
+            conf     = total_l
+        elif total_s >= C.CONF_TRADE:
+            opt_type = "put"
+            conf     = total_s
         else:
-            self.emit("WARN", f"BRACKET FAILED — set stop manually at ${sp:.0f}")
+            self.status=f"Options: conf {max(total_l,total_s)}<{C.CONF_TRADE}"
+            return
 
-        self.status = f"{direction.upper()} {lots}L @ ${self.price:,.0f} score={score}"
-        self.emit("TRADE", self.status)
-        self.total_tr += 1
-        self.trades.append({
-            "time":   datetime.now(timezone.utc).isoformat(),
-            "side":   direction,
-            "entry":  round(self.price, 1),
-            "exit":   None,
-            "lots":   lots,
-            "pnl":    None,
-            "pct":    None,
-            "reason": "bot",
-            "won":    None,
-            "pid":    str(C.PID),
-            "sym":    "BTCUSD"
-        })
-        self.save()
+        use_itm = (conf >= C.CONF_ITM)  # high confidence → ITM for better delta
+        opt = self.opts_eng.find_option(opt_type, self.btc_price, use_itm)
+
+        if not opt.get("found"):
+            self.emit("WARN",f"No {opt_type} option found | tried {opt.get('tried')}")
+            return
+
+        prem_usd = opt["premium_usd"]
+        if prem_usd > self.capital * C.OPT_MAX_PREM:
+            self.emit("INFO",f"Premium ${prem_usd:.2f} > max ${self.capital*C.OPT_MAX_PREM:.2f}")
+            return
+        if prem_usd <= 0:
+            self.emit("WARN",f"Zero premium for {opt['symbol']}"); return
+
+        pid = self.delta.get_option_pid(opt["symbol"])
+        if not pid:
+            self.emit("WARN",f"No pid for {opt['symbol']}"); return
+
+        r = self.delta.order("buy",1,pid)
+        if r.get("success"):
+            self.opts_eng.record_open(opt["symbol"])
+            mon = opt["moneyness"]
+            self.status=(f"OPT {opt_type.upper()} {mon} | "
+                f"{opt['symbol']} | premium ${prem_usd:.2f} | conf={conf}")
+            self.emit("TRADE",self.status)
+            self.total_tr+=1
+            self.trades.append({"time":now.isoformat(),"side":opt_type,
+                "entry":round(opt["mark"],4),"exit":None,"lots":1,"pnl":None,
+                "pct":None,"reason":f"{mon.lower()}_{strat.lower()}",
+                "won":None,"pid":str(pid),"sym":opt["symbol"]})
+            self.save()
+        else:
+            self.emit("ERROR",f"OPT order failed: {r.get('error','?')}")
 
     def start(self):
         if not self.running:
-            self.running = True
-            threading.Thread(target=self._loop, daemon=True).start()
-            self.emit("INFO", "Bot started")
+            self.running=True
+            threading.Thread(target=self._loop,daemon=True).start()
+            self.emit("INFO","▶ Bot started")
 
     def stop(self):
-        self.running = False
-        self.emit("INFO", "Bot stopped")
+        self.running=False; self.emit("INFO","■ Bot stopped")
 
     def _loop(self):
         while self.running:
-            try:
-                self.scan()
+            try: self.scan()
             except Exception as e:
-                log.error(f"Scan error: {e}", exc_info=True)
-                self.status = f"Error: {e}"
-            time.sleep(C.SCAN)
+                log.error(f"Error: {e}",exc_info=True)
+                self.status=f"Error: {e}"
+            time.sleep(C.SCAN_SECS)
 
     def state(self):
         sc   = self.start_cap or self.capital
-        pnl  = (self.capital - sc) / sc * 100 if sc > 0 else 0.0
+        pnl  = (self.capital-sc)/sc*100 if sc>0 else 0
         done = [t for t in self.trades if t.get("won") is not None]
-        wr   = sum(1 for t in done if t["won"]) / len(done) * 100 if done else 0
+        wr   = sum(1 for t in done if t["won"])/len(done)*100 if done else 0
+        cf   = self.last_conf
+        pillars = cf.get("pillars",{})
         return {
-            "running":      self.running,
-            "connected":    self.connected,
-            "halted":       self.halted,
-            "halt_msg":     self.halt_msg,
-            "status":       self.status,
-            "price":        round(self.price, 1),
-            "regime":       self.regime,
-            "rsi":          self.rsi_v,
-            "adx":          self.adx_v,
-            "atr_pct":      self.atr_pct,
-            "l_sc":         self.l_sc,
-            "s_sc":         self.s_sc,
-            "l_vt":         self.l_vt,
-            "s_vt":         self.s_vt,
-            "capital":      round(self.capital, 2),
-            "start_cap":    round(sc, 2),
-            "pnl_pct":      round(pnl, 2),
-            "win_rate":     round(wr, 1),
-            "total_trades": self.total_tr,
-            "wins":         self.wins,
-            "next_scan":    self.next_scan,
-            "scan_n":       self.scan_n,
-            "open_pos":     self._pos_display(),
-            "trades":       list(reversed(self.trades[-50:])),
-            "logs":         list(reversed(self.logs[-100:])),
-            "guardrails": {
-                "Hard stop":     f"{C.STOP_PCT*100:.1f}% bracket on Delta",
-                "Take profit":   f"{C.TP_PCT*100:.1f}%",
-                "Monthly halt":  f"Down {C.HALT_PCT*100:.0f}% from start",
-                "Daily pause":   f"Down {C.PAUSE_PCT*100:.0f}% today",
-                "Max positions": "1 (live Delta API check)"
-            }
+            "connected":self.connected,"running":self.running,
+            "halted":self.halted,"halt_msg":self.halt_msg,
+            "status":self.status,"price":round(self.btc_price,1),
+            "regime":cf.get("regime","—"),"strategy":cf.get("strategy","—"),
+            "vol_regime":cf.get("volatility_regime","—"),
+            "adx":cf.get("adx",0),"bw":cf.get("bw",0),
+            "atr_pct":cf.get("atr_pct",0),
+            "conf_long": sum(v["score"] for v in pillars.values()) if pillars else 0,
+            "pillars":   {k:{"s":v["score"],"m":v["max"],"d":v.get("detail","")} for k,v in pillars.items()},
+            "capital":round(self.capital,2),"start_cap":round(sc,2),
+            "pnl_pct":round(pnl,2),"win_rate":round(wr,1),
+            "total_trades":self.total_tr,"wins":self.wins,
+            "next_scan":self.next_scan,"scan_n":self.scan_n,
+            "opts_mode":self.opts_mode,
+            "open_pos":  self._pos_display(),
+            "opts_pos":  self._opts_display(),
+            "trades":    list(reversed(self.trades[-50:])),
+            "logs":      list(reversed(self.logs[-80:])),
+            "circuit_active": self._circuit_until is not None,
+            "consec_loss":    self._consec_loss,
+            "cooldown_left":  max(0,(C.COOLDOWN_MIN*60-(datetime.now(timezone.utc)-self._last_close).seconds)//60) if self._last_close else 0,
+            "guardrails":{
+                "Perp stop":f"{C.STOP_PCT*100:.1f}%","Perp TP":f"{C.TP_PCT*100:.1f}%",
+                "Opt TP":f"+{C.OPT_TP_PCT*100:.0f}% premium","Opt SL":f"-{C.OPT_STOP_PCT*100:.0f}% premium",
+                "Opt floor trail":"30% drop from peak (if up 60%)",
+                "Monthly halt":f"-{C.HALT_PCT*100:.0f}%","Daily pause":f"-{C.PAUSE_PCT*100:.0f}%",
+                "Cooldown":f"{C.COOLDOWN_MIN}min","Circuit":f"{C.CIRCUIT_N} losses={C.CIRCUIT_MIN}min",
+                "Min hold":f"{C.MIN_HOLD_MIN}min","ADX floor":str(C.ADX_TREND),
+            },
         }
 
 
-# ── Flask ─────────────────────────────────────────────────────────────
-
+# ═══════════════════════════════════════════════════════════════════
+#  FLASK
+# ═══════════════════════════════════════════════════════════════════
 app = Flask(__name__)
 CORS(app)
 bot = Bot()
 
 if C.KEY and C.SECRET:
-    threading.Thread(
-        target=lambda: bot.connect(C.KEY, C.SECRET),
-        daemon=True).start()
-
+    threading.Thread(target=lambda: bot.connect(C.KEY,C.SECRET),daemon=True).start()
 
 @app.after_request
-def _cors(r):
-    r.headers.update({
-        "Access-Control-Allow-Origin":  "*",
-        "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type"
-    })
+def _c(r):
+    r.headers.update({"Access-Control-Allow-Origin":"*",
+        "Access-Control-Allow-Methods":"GET,POST,OPTIONS",
+        "Access-Control-Allow-Headers":"Content-Type"})
     return r
-
 
 @app.route("/api/status")
 @app.route("/api/bot/status")
-def api_status():
-    return jsonify(bot.state())
+def api_status(): return jsonify(bot.state())
 
-
-@app.route("/api/connect", methods=["POST", "OPTIONS"])
+@app.route("/api/connect", methods=["POST","OPTIONS"])
 def api_connect():
-    if request.method == "OPTIONS":
-        return jsonify({})
-    d = request.json or {}
-    k = d.get("api_key", "").strip()
-    s = d.get("api_secret", "").strip()
-    if not k or not s:
-        return jsonify({"success": False, "message": "Key and secret required"})
-    return jsonify(bot.connect(k, s))
+    if request.method=="OPTIONS": return jsonify({})
+    d=request.json or {}; k=d.get("api_key",""); s=d.get("api_secret","")
+    if not k or not s: return jsonify({"success":False,"message":"Key+secret required"})
+    return jsonify(bot.connect(k.strip(),s.strip()))
 
+@app.route("/api/bot/start",   methods=["POST"])
+def api_start(): bot.start(); return jsonify({"success":True})
 
-@app.route("/api/bot/start", methods=["POST"])
-def api_start():
-    bot.start()
-    return jsonify({"success": True})
-
-
-@app.route("/api/bot/stop", methods=["POST"])
-def api_stop():
-    bot.stop()
-    return jsonify({"success": True})
-
+@app.route("/api/bot/stop",    methods=["POST"])
+def api_stop():  bot.stop();  return jsonify({"success":True})
 
 @app.route("/api/bot/run_now", methods=["POST"])
-def api_run_now():
-    threading.Thread(target=bot.scan, daemon=True).start()
-    return jsonify({"success": True})
-
+def api_run():
+    threading.Thread(target=bot.scan,daemon=True).start()
+    return jsonify({"success":True})
 
 @app.route("/api/trades")
-def api_trades():
-    return jsonify(list(reversed(bot.trades[-50:])))
-
+def api_trades(): return jsonify(list(reversed(bot.trades[-50:])))
 
 @app.route("/api/logs")
-def api_logs():
-    return jsonify(bot.logs)
-
+def api_logs(): return jsonify(bot.logs)
 
 @app.route("/api/positions")
 def api_positions():
-    return jsonify({"raw": bot.api.positions(), "display": bot._pos_display()})
-
+    return jsonify({"perp":bot._pos_display(),"options":bot._opts_display()})
 
 @app.route("/api/ticker")
 def api_ticker():
-    p = bot.api.price()
+    p=bot.delta.price()
     if not p:
-        try:
-            p = requests.get(
-                "https://api.coingecko.com/api/v3/simple/price"
-                "?ids=bitcoin&vs_currencies=usd",
-                timeout=5).json()["bitcoin"]["usd"]
-        except Exception:
-            p = 0
-    return jsonify({"price": p})
-
+        try: p=requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd",timeout=5).json()["bitcoin"]["usd"]
+        except: p=0
+    return jsonify({"price":p})
 
 @app.route("/api/ip")
 def api_ip():
-    try:
-        ip = requests.get(
-            "https://api.ipify.org?format=json",
-            timeout=5).json().get("ip", "?")
-    except Exception:
-        ip = "unknown"
-    return jsonify({"ip": ip})
-
+    try: ip=requests.get("https://api.ipify.org?format=json",timeout=5).json().get("ip","?")
+    except: ip="unknown"
+    return jsonify({"ip":ip})
 
 @app.route("/api/close_all", methods=["POST"])
 def api_close_all():
-    n = bot.api.close_all()
-    bot.emit("TRADE", f"Emergency close: {n} position(s)")
-    return jsonify({"success": True, "closed": n})
-
+    n=0
+    for p in bot.delta.btcusd_positions():
+        sz=float(p.get("size",0) or 0)
+        r=bot.delta.close_position(sz,p.get("product_id",C.PID))
+        if r.get("success"): n+=1
+    for p in bot.delta.option_positions():
+        sz=float(p.get("size",0) or 0)
+        pid=p.get("product_id")
+        if pid: r=bot.delta.close_position(sz,pid)
+        if r.get("success"): n+=1
+    bot.emit("TRADE",f"Emergency close: {n} positions")
+    return jsonify({"success":True,"closed":n})
 
 @app.route("/api/manual_trade", methods=["POST"])
 def api_manual():
-    d    = request.json or {}
-    dirn = d.get("direction", "")
-    if dirn not in ("long", "short"):
-        return jsonify({"success": False, "message": "direction: long or short"})
-    p    = bot.price or bot.api.price()
-    lots = max(1, int(d.get("lots", 1)))
-    side = "buy" if dirn == "long" else "sell"
-    r    = bot.api.order(side, lots)
+    d=request.json or {}; dirn=d.get("direction","")
+    if dirn not in ("long","short"): return jsonify({"success":False,"message":"direction: long/short"})
+    p=bot.btc_price or bot.delta.price(); lots=max(1,int(d.get("lots",1)))
+    r=bot.delta.order("buy" if dirn=="long" else "sell", lots)
     if r.get("success"):
-        sp = p * (1-C.STOP_PCT if dirn=="long" else 1+C.STOP_PCT)
-        tp = p * (1+C.TP_PCT   if dirn=="long" else 1-C.TP_PCT)
-        bot.api.bracket("sell" if dirn=="long" else "buy", lots, sp, tp)
-        bot.emit("TRADE",
-            f"MANUAL {dirn.upper()} {lots}L @${p:,.0f} "
-            f"stop=${sp:.0f} TP=${tp:.0f}")
-        bot.trades.append({
-            "time":   datetime.now(timezone.utc).isoformat(),
-            "side":   dirn, "entry": round(p, 1), "exit": None,
-            "lots":   lots, "pnl": None, "pct": None,
-            "reason": "manual", "won": None,
-            "pid":    str(C.PID), "sym": "BTCUSD"
-        })
+        sp=p*(1-C.STOP_PCT if dirn=="long" else 1+C.STOP_PCT)
+        tp=p*(1+C.TP_PCT   if dirn=="long" else 1-C.TP_PCT)
+        bot.delta.bracket("sell" if dirn=="long" else "buy",lots,sp,tp)
+        bot.emit("TRADE",f"MANUAL {dirn.upper()} {lots}L @ ${p:,.0f}")
+        bot.trades.append({"time":datetime.now(timezone.utc).isoformat(),"side":dirn,
+            "entry":round(p,1),"exit":None,"lots":lots,"pnl":None,"pct":None,
+            "reason":"manual","won":None,"pid":str(C.PID),"sym":C.SYMBOL})
         bot.save()
-        return jsonify({"success": True, "entry": round(p, 1),
-                        "stop": round(sp, 1), "tp": round(tp, 1)})
-    return jsonify({"success": False,
-                    "message": r.get("error", "Order failed")})
+        return jsonify({"success":True,"entry":round(p,1),"stop":round(sp,1),"tp":round(tp,1)})
+    return jsonify({"success":False,"message":r.get("error","failed")})
 
+@app.route("/api/opts/toggle", methods=["POST"])
+def api_opts_toggle():
+    d=request.json or {}
+    bot.opts_mode = bool(d.get("enabled", not bot.opts_mode))
+    msg = "Options mode ON" if bot.opts_mode else "Options mode OFF"
+    bot.emit("INFO",msg)
+    return jsonify({"success":True,"opts_mode":bot.opts_mode,"message":msg})
 
-@app.route("/api/set_stop", methods=["POST"])
-def api_set_stop():
-    d     = request.json or {}
-    dirn  = d.get("direction", "long")
-    entry = float(d.get("entry", bot.price or 77000))
-    lots  = int(d.get("lots", 1))
-    sp    = entry * (1-C.STOP_PCT if dirn=="long" else 1+C.STOP_PCT)
-    tp    = entry * (1+C.TP_PCT   if dirn=="long" else 1-C.TP_PCT)
-    cs    = "sell" if dirn == "long" else "buy"
-    r     = bot.api.bracket(cs, lots, sp, tp)
-    ok    = r.get("success", False)
-    bot.emit("INFO" if ok else "WARN",
-        f"{'OK' if ok else 'FAIL'} Stop: {dirn.upper()} "
-        f"${entry:.0f} stop=${sp:.0f} TP=${tp:.0f}")
-    return jsonify({"success": ok, "stop": round(sp, 1), "tp": round(tp, 1)})
+@app.route("/api/opts/find", methods=["POST"])
+def api_opts_find():
+    if not bot.opts_eng: return jsonify({"error":"Not connected"})
+    d=request.json or {}; t=d.get("type","call")
+    p=bot.btc_price or bot.delta.price()
+    opt=bot.opts_eng.find_option(t,p,d.get("itm",False))
+    if opt.get("found"): opt["premium_usd"]=round(opt["mark"]*0.001,3)
+    return jsonify(opt)
 
+@app.route("/api/opts/straddle", methods=["POST"])
+def api_opts_straddle():
+    if not bot.opts_eng: return jsonify({"error":"Not connected"})
+    p=bot.btc_price or bot.delta.price()
+    return jsonify(bot.opts_eng.straddle_find(p))
+
+@app.route("/api/config", methods=["POST"])
+def api_config():
+    d=request.json or {}
+    if "min_confidence" in d: C.CONF_TRADE=int(d["min_confidence"])
+    if "opts_mode"      in d: bot.opts_mode=bool(d["opts_mode"])
+    return jsonify({"success":True})
+
+@app.route("/api/wallet/sync", methods=["POST"])
+def api_wallet():
+    bot._sync_wallet()
+    return jsonify({"success":True,"balance":bot.capital})
 
 @app.route("/api/debug/auth")
-def api_debug_auth():
-    out = {"key_len": len(bot.api.key), "key_set": bool(bot.api.key),
-           "secret_len": len(bot.api.secret)}
+def api_debug():
+    out={"key_len":len(bot.delta.key),"key_set":bool(bot.delta.key)}
     try:
-        r = requests.get(f"{bot.api.base}/v2/tickers/BTCUSD", timeout=6)
-        out["ticker_ok"]  = r.status_code == 200
-        out["btc_price"]  = r.json().get("result", {}).get("mark_price", "?")
-    except Exception as e:
-        out["ticker_error"] = str(e)
-    bal, raw, err = bot.api.balance()
-    out["balance"]  = bal
-    out["bal_err"]  = err
-    out["raw"]      = raw
+        r=requests.get(f"{C.BASE}/v2/tickers/BTCUSD",timeout=6)
+        out["ticker_ok"]=r.status_code==200
+        out["btc_price"]=r.json().get("result",{}).get("mark_price","?")
+    except Exception as e: out["ticker_err"]=str(e)
+    bal,raw,err=bot.delta.balance(); out["balance"]=bal; out["err"]=err
     return jsonify(out)
 
 
-@app.route("/api/debug/candles")
-def api_debug_candles():
-    for res in ["5m", "1m", "15m"]:
-        d = bot.api.get("/v2/history/candles", {
-            "symbol": "BTCUSD", "resolution": res,
-            "start": int(time.time()) - 3600,
-            "end":   int(time.time())
-        })
-        if d and d.get("success") and d.get("result"):
-            return jsonify({"ok": True, "res": res,
-                            "count": len(d["result"]),
-                            "sample": d["result"][0]})
-    return jsonify({"ok": False, "error": "all resolutions failed"})
 
-
-@app.route("/api/debug/positions")
-def api_debug_positions():
-    return jsonify(bot.api.get("/v2/positions/margined")
-                   or {"error": "no_response"})
-
-
-
-DASHBOARD_HTML = r"""
+DASHBOARD = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="theme-color" content="#ffffff">
-<title>Alpha Bot</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Alpha Bot v7</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
-*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 :root{
-  --white:#ffffff;--bg:#f5f7fa;--bg2:#eef1f6;
-  --text:#0f1923;--text2:#52616b;--text3:#8a9bb0;
-  --green:#00c896;--green-bg:#e8faf5;--green-dim:#b3edd9;
-  --red:#f0483e;--red-bg:#fff0ef;--red-dim:#fbb8b5;
-  --blue:#0066ff;--blue-bg:#e8f0ff;
-  --orange:#ff7b00;--orange-bg:#fff3e8;
-  --border:#e8ecf2;--shadow:0 1px 3px rgba(0,0,0,.06),0 4px 16px rgba(0,0,0,.04);
-  --shadow2:0 2px 8px rgba(0,0,0,.08),0 8px 32px rgba(0,0,0,.06);
-  --radius:16px;--radius-sm:10px;--radius-xs:8px;
+  --g:#00c896;--gb:#e6faf5;--gd:#b3edd9;
+  --r:#f04b4b;--rb:#fff0f0;--rd:#fbb8b8;
+  --y:#f59e0b;--yb:#fef3c7;
+  --b:#3b82f6;--bb:#eff6ff;
+  --bg:#f4f6f9;--w:#ffffff;
+  --t:#0f172a;--t2:#64748b;--t3:#94a3b8;
+  --bdr:1px solid #e2e8f0;
+  --sh:0 1px 3px rgba(15,23,42,.06),0 4px 12px rgba(15,23,42,.04);
+  --r8:8px;--r12:12px;--r16:16px;
+  --ff:'DM Sans',system-ui,sans-serif;
+  --fm:'DM Mono',monospace;
 }
-html,body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;min-height:100vh;overflow-x:hidden}
-
-/* ── HEADER ── */
-.hdr{background:var(--white);border-bottom:1px solid var(--border);padding:0 16px;height:56px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
-.hdr-left{display:flex;align-items:center;gap:10px}
-.hdr-ico{width:32px;height:32px;background:var(--text);border-radius:9px;display:flex;align-items:center;justify-content:center;color:white;font-size:15px;font-family:'DM Mono';font-weight:500}
-.hdr-title{font-size:15px;font-weight:600;color:var(--text)}
-.hdr-sub{font-size:11px;color:var(--text3);margin-top:1px}
-.pill{display:inline-flex;align-items:center;gap:5px;padding:5px 12px;border-radius:20px;font-size:11px;font-weight:600;letter-spacing:.2px}
-.pill-on{background:var(--green-bg);color:var(--green)}
-.pill-off{background:var(--red-bg);color:var(--red)}
-.pill-dot{width:6px;height:6px;border-radius:50%}
-.pill-on .pill-dot{background:var(--green);animation:pulse 2s infinite}
-.pill-off .pill-dot{background:var(--red)}
-@keyframes pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.4);opacity:.6}}
-
-/* ── WRAP ── */
-.wrap{padding:12px 12px 88px;max-width:480px;margin:0 auto}
-
-/* ── BTC HERO CARD ── */
-.btc-card{background:var(--text);border-radius:var(--radius);padding:20px;margin-bottom:12px;position:relative;overflow:hidden}
-.btc-card::before{content:'';position:absolute;top:-40px;right:-40px;width:160px;height:160px;background:rgba(255,255,255,.04);border-radius:50%}
-.btc-card::after{content:'';position:absolute;bottom:-20px;right:20px;width:80px;height:80px;background:rgba(255,255,255,.03);border-radius:50%}
-.btc-label{font-size:11px;color:rgba(255,255,255,.5);text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px;font-weight:500}
-.btc-price{font-size:36px;font-weight:700;color:white;font-family:'DM Mono';line-height:1;margin-bottom:4px}
-.btc-change{display:flex;align-items:center;gap:8px}
-.btc-chg-badge{font-size:12px;font-weight:600;padding:3px 8px;border-radius:6px}
-.btc-chg-up{background:rgba(0,200,150,.2);color:#00e8b0}
-.btc-chg-dn{background:rgba(240,72,62,.2);color:#ff6b64}
-.btc-chg-lbl{font-size:11px;color:rgba(255,255,255,.4)}
-.btc-right{position:absolute;top:20px;right:20px;text-align:right}
-.btc-predict{font-size:10px;color:rgba(255,255,255,.4);text-transform:uppercase;letter-spacing:.6px;margin-bottom:4px}
-.btc-pred-val{font-size:14px;font-weight:600;font-family:'DM Mono'}
-.btc-pred-up{color:#00e8b0}.btc-pred-dn{color:#ff6b64}.btc-pred-neu{color:rgba(255,255,255,.6)}
-.btc-signal{font-size:10px;margin-top:3px;padding:2px 7px;border-radius:5px;display:inline-block}
-.sig-bull{background:rgba(0,200,150,.2);color:#00e8b0}
-.sig-bear{background:rgba(240,72,62,.2);color:#ff6b64}
-.sig-neu{background:rgba(255,255,255,.1);color:rgba(255,255,255,.5)}
-
-/* ── WALLET CARD ── */
-.wallet-card{background:var(--white);border-radius:var(--radius);padding:18px;margin-bottom:12px;box-shadow:var(--shadow)}
-.wc-top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px}
-.wc-lbl{font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.6px;font-weight:500;margin-bottom:5px}
-.wc-amount{font-size:28px;font-weight:700;font-family:'DM Mono';color:var(--text);line-height:1}
-.wc-start{font-size:11px;color:var(--text3);margin-top:3px}
-.wc-pnl{text-align:right}
-.wc-pnl-pct{font-size:20px;font-weight:700;font-family:'DM Mono'}
-.wc-pnl-abs{font-size:11px;color:var(--text3);margin-top:2px}
-.pnl-up{color:var(--green)}.pnl-dn{color:var(--red)}.pnl-neu{color:var(--text2)}
-.wc-breakdown{display:flex;gap:8px;flex-wrap:wrap}
-.wc-chip{background:var(--bg);border-radius:var(--radius-xs);padding:5px 10px;font-size:11px;color:var(--text2);font-family:'DM Mono';font-weight:500}
-.sync-btn{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-xs);padding:6px 12px;font-size:11px;font-weight:600;color:var(--text2);cursor:pointer;font-family:'DM Sans';transition:all .15s}
-.sync-btn:active{background:var(--bg2)}
-.sync-row{display:flex;align-items:center;justify-content:space-between;margin-top:12px;padding-top:12px;border-top:1px solid var(--border)}
-.sync-status{font-size:11px;color:var(--text3)}
-.sync-status.warn{color:var(--orange)}
-.sync-status.ok{color:var(--green)}
-
-/* ── STAT CARDS ── */
-.stats-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
-.stat-card{background:var(--white);border-radius:var(--radius-sm);padding:14px;box-shadow:var(--shadow)}
-.stat-lbl{font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.6px;font-weight:500;margin-bottom:6px}
-.stat-val{font-size:22px;font-weight:700;font-family:'DM Mono';color:var(--text);line-height:1}
-.stat-val.green{color:var(--green)}.stat-val.red{color:var(--red)}.stat-val.blue{color:var(--blue)}
-.stat-sub{font-size:10px;color:var(--text3);margin-top:4px}
-.stat-badge{display:inline-block;font-size:9px;font-weight:700;padding:2px 6px;border-radius:4px;margin-top:4px}
-.sb-green{background:var(--green-bg);color:var(--green)}
-.sb-red{background:var(--red-bg);color:var(--red)}
-.sb-blue{background:var(--blue-bg);color:var(--blue)}
-.sb-orange{background:var(--orange-bg);color:var(--orange)}
-
-/* ── STATUS CARD ── */
-.status-card{background:var(--white);border-radius:var(--radius-sm);padding:14px 16px;margin-bottom:12px;box-shadow:var(--shadow);display:flex;align-items:center;gap:12px}
-.status-ico{width:36px;height:36px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
-.status-ico.running{background:var(--green-bg)}
-.status-ico.stopped{background:var(--red-bg)}
-.status-ico.syncing{background:var(--orange-bg)}
-.status-text{flex:1;font-size:13px;font-weight:500;color:var(--text);line-height:1.4}
-.status-time{font-size:10px;color:var(--text3);font-family:'DM Mono';white-space:nowrap}
-
-/* ── CONTROLS ── */
-.controls{display:flex;gap:8px;margin-bottom:12px}
-.ctrl-btn{flex:1;padding:13px 8px;border-radius:var(--radius-sm);border:none;font-family:'DM Sans';font-size:13px;font-weight:600;cursor:pointer;transition:all .15s;display:flex;align-items:center;justify-content:center;gap:6px}
-.ctrl-btn:active{transform:scale(.97)}
-.ctrl-start{background:var(--text);color:white}
-.ctrl-stop{background:var(--red-bg);color:var(--red);border:1.5px solid var(--red-dim)}
-.ctrl-run{background:var(--blue-bg);color:var(--blue);border:1.5px solid rgba(0,102,255,.2)}
-
-/* ── LAST TRADE ── */
-.trade-card{background:var(--white);border-radius:var(--radius-sm);padding:16px;margin-bottom:12px;box-shadow:var(--shadow)}
-.tc-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
-.tc-title{font-size:12px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.5px}
-.tc-viewall{font-size:11px;color:var(--blue);font-weight:600;cursor:pointer;background:none;border:none;font-family:'DM Sans'}
-.trade-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)}
-.trade-row:last-child{border-bottom:none}
-.trade-left{display:flex;align-items:center;gap:10px}
-.trade-icon{width:34px;height:34px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;flex-shrink:0}
-.ti-long{background:var(--green-bg);color:var(--green)}
-.ti-short{background:var(--red-bg);color:var(--red)}
-.ti-open{background:var(--blue-bg);color:var(--blue)}
-.trade-info .t-sym{font-size:13px;font-weight:600;color:var(--text)}
-.trade-info .t-time{font-size:10px;color:var(--text3);margin-top:1px;font-family:'DM Mono'}
-.trade-right{text-align:right}
-.t-pnl{font-size:14px;font-weight:700;font-family:'DM Mono'}
-.t-pnl.up{color:var(--green)}.t-pnl.dn{color:var(--red)}.t-pnl.neu{color:var(--text2)}
-.t-price{font-size:10px;color:var(--text3);margin-top:1px;font-family:'DM Mono'}
-.empty-trades{text-align:center;padding:24px 0;color:var(--text3);font-size:13px}
-
-/* ── PREDICTION CARD ── */
-.pred-card{background:var(--white);border-radius:var(--radius-sm);padding:16px;margin-bottom:12px;box-shadow:var(--shadow)}
-.pred-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
-.pred-title{font-size:12px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.5px}
-.pred-updated{font-size:10px;color:var(--text3);font-family:'DM Mono'}
-.pred-row{display:flex;gap:8px}
-.pred-item{flex:1;background:var(--bg);border-radius:var(--radius-xs);padding:10px;text-align:center}
-.pred-horizon{font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px;font-weight:500}
-.pred-price{font-size:13px;font-weight:700;font-family:'DM Mono';color:var(--text)}
-.pred-dir{font-size:10px;font-weight:600;margin-top:3px}
-.pred-up{color:var(--green)}.pred-dn{color:var(--red)}.pred-neu{color:var(--text3)}
-.pred-confidence{font-size:9px;color:var(--text3);margin-top:2px}
-.sentiment-row{display:flex;align-items:center;gap:8px;margin-top:12px;padding-top:12px;border-top:1px solid var(--border)}
-.sent-lbl{font-size:11px;color:var(--text3);flex-shrink:0}
-.sent-bar{flex:1;height:6px;background:var(--border);border-radius:3px;overflow:hidden;position:relative}
-.sent-fill{height:100%;border-radius:3px;transition:width .8s ease}
-.sent-pct{font-size:11px;font-weight:600;font-family:'DM Mono'}
-
-/* ── BOTTOM NAV ── */
-.bnav{position:fixed;bottom:0;left:0;right:0;background:var(--white);border-top:1px solid var(--border);display:flex;justify-content:space-around;padding:8px 0 max(8px,env(safe-area-inset-bottom));z-index:100}
-.bnav-btn{display:flex;flex-direction:column;align-items:center;gap:3px;padding:6px 16px;border:none;background:none;cursor:pointer;border-radius:var(--radius-xs);transition:all .15s}
-.bnav-btn.active .nb-ico{color:var(--text)}
-.bnav-btn.active .nb-lbl{color:var(--text);font-weight:600}
-.nb-ico{font-size:20px;color:var(--text3)}
-.nb-lbl{font-size:9px;color:var(--text3);font-weight:500;text-transform:uppercase;letter-spacing:.4px}
-
-/* ── FULL TRADES TAB ── */
-.tab{display:none}.tab.active{display:block}
-.section-title{font-size:13px;font-weight:700;color:var(--text);margin-bottom:10px}
-
-/* ── TOAST ── */
-.toast{position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:var(--text);color:white;padding:10px 20px;border-radius:20px;font-size:12px;font-weight:500;z-index:200;opacity:0;transition:opacity .25s;white-space:nowrap;pointer-events:none}
-.toast.show{opacity:1}
-
-/* ── CLOSE ALL ── */
-.danger-btn{width:100%;padding:13px;border-radius:var(--radius-sm);border:1.5px solid var(--red-dim);background:var(--red-bg);color:var(--red);font-family:'DM Sans';font-size:13px;font-weight:600;cursor:pointer;margin-top:8px}
-.danger-btn:active{background:var(--red-dim)}
-
-@media(min-width:480px){.wrap{padding-left:24px;padding-right:24px}}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+body{background:var(--bg);color:var(--t);font-family:var(--ff);font-size:14px;min-height:100vh}
+/* HEADER */
+.hdr{background:var(--w);padding:0 16px;height:54px;display:flex;align-items:center;justify-content:space-between;border-bottom:var(--bdr);position:sticky;top:0;z-index:100}
+.logo{display:flex;align-items:center;gap:9px}
+.logo-icon{width:32px;height:32px;background:var(--t);border-radius:9px;display:flex;align-items:center;justify-content:center;color:#fff;font-family:var(--fm);font-size:13px;font-weight:700;flex-shrink:0}
+.logo-name{font-size:16px;font-weight:700;color:var(--t);letter-spacing:-.3px}
+.logo-sub{font-size:10px;color:var(--t3);margin-top:1px}
+.status-pill{display:flex;align-items:center;gap:5px;padding:5px 12px;border-radius:20px;font-size:11px;font-weight:600}
+.pill-live{background:var(--gb);color:var(--g)}
+.pill-off{background:var(--rb);color:var(--r)}
+.pill-dot{width:6px;height:6px;border-radius:50%;background:currentColor;animation:blink 2s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+/* WRAP + NAV */
+.wrap{padding:12px 14px 90px;max-width:480px;margin:0 auto}
+.tab-c{display:none}.tab-c.active{display:block}
+.nav{position:fixed;bottom:0;left:0;right:0;background:var(--w);border-top:var(--bdr);display:flex;padding:8px 0 max(8px,env(safe-area-inset-bottom));z-index:99}
+.nav-btn{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;padding:4px 0;border:none;background:none;cursor:pointer;font-family:var(--ff)}
+.nav-ico{font-size:20px;color:var(--t3)}
+.nav-lbl{font-size:9px;color:var(--t3);font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.nav-btn.active .nav-ico,.nav-btn.active .nav-lbl{color:var(--t)}
+/* CARDS */
+.card{background:var(--w);border-radius:var(--r12);padding:16px;margin-bottom:10px;box-shadow:var(--sh)}
+.card-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.card-title{font-size:11px;font-weight:700;color:var(--t2);text-transform:uppercase;letter-spacing:.6px}
+/* BTC HERO */
+.hero{background:var(--t);border-radius:var(--r16);padding:20px;margin-bottom:10px;overflow:hidden;position:relative}
+.hero::after{content:'';position:absolute;top:-30px;right:-30px;width:120px;height:120px;border-radius:50%;background:rgba(255,255,255,.04)}
+.hero-lbl{font-size:10px;color:rgba(255,255,255,.4);text-transform:uppercase;letter-spacing:.8px;margin-bottom:5px}
+.hero-price{font-family:var(--fm);font-size:40px;font-weight:700;color:#fff;line-height:1;letter-spacing:-1px}
+.hero-row{display:flex;align-items:center;gap:10px;margin-top:8px;flex-wrap:wrap}
+.hero-chip{padding:3px 10px;border-radius:6px;font-size:12px;font-weight:600}
+.hc-g{background:rgba(0,200,150,.2);color:#00e8b0}
+.hc-r{background:rgba(240,75,75,.2);color:#ff8080}
+.hc-n{background:rgba(255,255,255,.1);color:rgba(255,255,255,.5)}
+.hero-strat{font-size:11px;font-weight:700;padding:3px 10px;border-radius:6px}
+.hs-bull{background:rgba(0,200,150,.15);color:#00e8b0}
+.hs-bear{background:rgba(240,75,75,.15);color:#ff8080}
+.hs-neu{background:rgba(255,255,255,.08);color:rgba(255,255,255,.5)}
+/* REGIME BANNER */
+.regime{display:flex;align-items:center;gap:8px;padding:9px 13px;border-radius:var(--r8);margin-bottom:10px;font-size:12px;font-weight:600;border:1px solid transparent}
+.r-sb{background:#dcfce7;color:#15803d;border-color:#bbf7d0}
+.r-b{background:var(--gb);color:#059669;border-color:var(--gd)}
+.r-n{background:#f1f5f9;color:#64748b;border-color:#e2e8f0}
+.r-be{background:var(--rb);color:#dc2626;border-color:var(--rd)}
+.r-sb2{background:#fef2f2;color:#991b1b;border-color:#fecaca}
+.r-sw{background:#fef9c3;color:#854d0e;border-color:#fde68a}
+/* CONFIDENCE PILLARS */
+.pillars{display:flex;flex-direction:column;gap:0}
+.pillar{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:var(--bdr)}
+.pillar:last-child{border:none}
+.pillar-name{width:88px;font-size:11px;font-weight:600;color:var(--t2);flex-shrink:0}
+.pillar-bar{flex:1;height:5px;background:#f1f5f9;border-radius:3px;overflow:hidden}
+.pillar-fill{height:100%;border-radius:3px;transition:width .6s ease}
+.pillar-score{width:32px;text-align:right;font-size:11px;font-family:var(--fm);font-weight:600;flex-shrink:0}
+.pillar-detail{font-size:9px;color:var(--t3);margin-top:1px;width:80px;text-align:right;flex-shrink:0}
+/* CONFIDENCE RING */
+.conf-ring-wrap{display:flex;align-items:center;gap:16px;padding:4px 0}
+.conf-ring{position:relative;width:72px;height:72px;flex-shrink:0}
+.conf-ring svg{transform:rotate(-90deg)}
+.conf-ring-inner{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.conf-num{font-size:20px;font-weight:700;font-family:var(--fm);line-height:1}
+.conf-lbl{font-size:9px;color:var(--t3);font-weight:600;text-transform:uppercase;letter-spacing:.4px}
+.conf-meta{flex:1}
+.conf-dir{font-size:15px;font-weight:700;margin-bottom:4px}
+.conf-strat{font-size:11px;color:var(--t2)}
+/* INDICATOR GRID */
+.ind-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:10px}
+.ind{background:#f8fafc;border-radius:var(--r8);padding:10px;text-align:center;border:var(--bdr)}
+.ind-lbl{font-size:9px;color:var(--t3);font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px}
+.ind-val{font-size:16px;font-weight:700;font-family:var(--fm)}
+/* POSITION CARDS */
+.pos-card{border-radius:var(--r12);padding:14px;margin-bottom:10px;border:1px solid transparent}
+.pos-long{background:#f0fdf4;border-color:#a7f3d0}
+.pos-short{background:#fff5f5;border-color:#fca5a5}
+.pos-opt{background:#eff6ff;border-color:#93c5fd}
+.pos-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.pos-sym{font-size:15px;font-weight:700}
+.pos-badge{padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700}
+.pb-long{background:var(--g);color:#fff}
+.pb-short{background:var(--r);color:#fff}
+.pb-call{background:var(--b);color:#fff}
+.pb-put{background:#8b5cf6;color:#fff}
+.pb-straddle{background:var(--y);color:#fff}
+.pos-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.pos-item{background:rgba(255,255,255,.7);border-radius:var(--r8);padding:8px}
+.pos-item-lbl{font-size:9px;color:var(--t2);font-weight:700;text-transform:uppercase;letter-spacing:.4px;margin-bottom:3px}
+.pos-item-val{font-size:14px;font-weight:700;font-family:var(--fm)}
+.pos-item-val.g{color:var(--g)}.pos-item-val.r{color:var(--r)}
+/* WALLET */
+.wallet-top{display:flex;justify-content:space-between;align-items:flex-start}
+.wal-left{flex:1}
+.wal-lbl{font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.5px;font-weight:700;margin-bottom:4px}
+.wal-amt{font-size:32px;font-weight:700;font-family:var(--fm);letter-spacing:-1px}
+.wal-start{font-size:11px;color:var(--t3);margin-top:2px}
+.wal-pct{font-size:18px;font-weight:700;font-family:var(--fm);text-align:right}
+.wal-pnl{font-size:11px;color:var(--t3);text-align:right;margin-top:2px}
+/* STATS */
+.stats-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+.stat{background:#f8fafc;border-radius:var(--r8);padding:12px;text-align:center;border:var(--bdr)}
+.stat-lbl{font-size:9px;color:var(--t3);font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px}
+.stat-val{font-size:20px;font-weight:700;font-family:var(--fm)}
+/* BUTTONS */
+.btn-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px}
+.btn{padding:12px 6px;border-radius:var(--r8);border:none;font-family:var(--ff);font-size:12px;font-weight:700;cursor:pointer;transition:.15s;display:flex;align-items:center;justify-content:center;gap:5px}
+.btn:active{transform:scale(.97)}
+.btn-dark{background:var(--t);color:#fff}
+.btn-danger{background:var(--rb);color:var(--r);border:1.5px solid var(--rd)}
+.btn-blue{background:var(--bb);color:var(--b);border:1.5px solid #bfdbfe}
+.btn-full{width:100%;margin-bottom:8px;padding:13px}
+.btn-close{background:var(--rb);color:var(--r);border:1.5px solid var(--rd);width:100%;margin-top:10px;padding:12px;border-radius:var(--r8);font-family:var(--ff);font-size:13px;font-weight:700;cursor:pointer}
+/* OPTS TOGGLE */
+.opts-toggle{display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:var(--bdr)}
+.opts-toggle-lbl{font-size:14px;font-weight:600}
+.toggle{position:relative;width:48px;height:26px}
+.toggle input{opacity:0;width:0;height:0}
+.toggle-slider{position:absolute;inset:0;background:#e2e8f0;border-radius:13px;cursor:pointer;transition:.2s}
+.toggle-slider:before{content:'';position:absolute;height:20px;width:20px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 3px rgba(0,0,0,.2)}
+input:checked+.toggle-slider{background:var(--g)}
+input:checked+.toggle-slider:before{transform:translateX(22px)}
+/* TRADES */
+.trade-item{padding:11px 0;border-bottom:var(--bdr);display:flex;align-items:center;gap:10px}
+.trade-item:last-child{border:none}
+.trade-ico{width:32px;height:32px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0}
+.ti-long{background:var(--gb);color:var(--g)}
+.ti-short{background:var(--rb);color:var(--r)}
+.ti-call{background:var(--bb);color:var(--b)}
+.ti-put{background:#f3e8ff;color:#7c3aed}
+.ti-straddle{background:var(--yb);color:var(--y)}
+.trade-mid{flex:1;min-width:0}
+.trade-sym{font-size:12px;font-weight:700}
+.trade-info{font-size:10px;color:var(--t3);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.trade-right{text-align:right;flex-shrink:0}
+.trade-pnl{font-size:13px;font-weight:700;font-family:var(--fm)}
+.trade-pnl.g{color:var(--g)}.trade-pnl.r{color:var(--r)}.trade-pnl.n{color:var(--t3)}
+/* LOGS */
+.log-box{background:#0f172a;border-radius:var(--r8);padding:12px;max-height:360px;overflow-y:auto;font-family:var(--fm);font-size:11px}
+.log-row{padding:3px 0;border-bottom:1px solid #1e293b;display:flex;gap:8px}
+.log-time{color:#475569;flex-shrink:0}
+.lv-INFO{color:#64748b}.lv-WARN{color:var(--y)}.lv-ERROR{color:var(--r)}.lv-TRADE{color:var(--g);font-weight:700}
+.log-filters{display:flex;gap:6px;margin-bottom:8px}
+.log-fp{padding:4px 12px;border-radius:20px;border:var(--bdr);background:var(--w);font-size:11px;font-weight:600;cursor:pointer;color:var(--t3)}
+.log-fp.on{background:var(--t);color:#fff;border-color:var(--t)}
+/* SETTINGS */
+.setting-row{display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:var(--bdr)}
+.setting-row:last-child{border:none}
+.setting-lbl{font-size:13px;font-weight:500}
+.setting-val{font-size:13px;font-family:var(--fm);font-weight:700;color:var(--g);text-align:right;max-width:55%}
+.inp{width:100%;border:var(--bdr);border-radius:var(--r8);padding:11px 13px;font-size:14px;font-family:var(--ff);outline:none;background:#f8fafc;margin-bottom:8px;transition:.2s}
+.inp:focus{border-color:var(--g);background:#fff}
+.ip-box{font-family:var(--fm);font-size:18px;font-weight:700;text-align:center;padding:14px;background:#f8fafc;border-radius:var(--r8);border:var(--bdr);letter-spacing:2px;margin-bottom:10px}
+/* HALTED BANNER */
+.halted-banner{background:var(--rb);border:1.5px solid var(--rd);border-radius:var(--r12);padding:13px;margin-bottom:10px;text-align:center;color:var(--r);font-weight:700;font-size:13px}
+/* SCAN BAR */
+.scan-info{display:flex;justify-content:space-between;align-items:center;font-size:11px;color:var(--t3);margin-top:6px}
+.scan-bar{height:3px;background:#e2e8f0;border-radius:2px;overflow:hidden;margin-top:4px}
+.scan-fill{height:100%;background:var(--b);border-radius:2px;transition:width .5s}
+/* MANUAL */
+.manual-row{display:flex;gap:8px;margin-top:8px}
+.btn-long{flex:1;padding:12px;border-radius:var(--r8);border:1.5px solid var(--g);background:var(--gb);color:var(--g);font-family:var(--ff);font-size:12px;font-weight:700;cursor:pointer}
+.btn-short{flex:1;padding:12px;border-radius:var(--r8);border:1.5px solid var(--r);background:var(--rb);color:var(--r);font-family:var(--ff);font-size:12px;font-weight:700;cursor:pointer}
+.cb-method{display:flex;gap:8px;margin-bottom:8px}
+.cb{flex:1;padding:8px;border-radius:var(--r8);border:var(--bdr);background:var(--w);font-family:var(--ff);font-size:11px;font-weight:600;cursor:pointer;color:var(--t3);text-align:center}
+.cb.on{background:var(--t);color:#fff;border-color:var(--t)}
+.empty-state{text-align:center;padding:28px;color:var(--t3);font-size:13px}
 </style>
 </head>
 <body>
-
-<div id="toast" class="toast"></div>
-
-<!-- HEADER -->
-<header class="hdr">
-  <div class="hdr-left">
-    <div class="hdr-ico">Δ</div>
+<div class="hdr">
+  <div class="logo">
+    <div class="logo-icon">&#916;</div>
     <div>
-      <div class="hdr-title">Alpha Bot</div>
-      <div class="hdr-sub">Delta Exchange India</div>
+      <div class="logo-name">Alpha Bot</div>
+      <div class="logo-sub">Delta Exchange India</div>
     </div>
   </div>
-  <div class="pill pill-off" id="statusPill">
+  <div class="status-pill pill-off" id="statusPill">
     <span class="pill-dot"></span>
     <span id="pillTxt">Stopped</span>
   </div>
-</header>
-
-<div class="wrap">
-
-  <!-- TAB: HOME -->
-  <div id="tab-home" class="tab active">
-
-    <!-- BTC HERO -->
-    <div class="btc-card">
-      <div class="btc-right">
-        <div class="btc-predict">Predicted (1h)</div>
-        <div class="btc-pred-val btc-pred-neu" id="predPrice">—</div>
-        <div class="btc-signal sig-neu" id="predSignal">Calculating...</div>
-      </div>
-      <div class="btc-label">Bitcoin · Live</div>
-      <div class="btc-price" id="btcPrice">$—</div>
-      <div class="btc-change">
-        <span class="btc-chg-badge btc-chg-up" id="btcChangeBadge">—%</span>
-        <span class="btc-chg-lbl" id="btcChangeLabel">24h change</span>
-      </div>
-    </div>
-
-    <!-- WALLET -->
-    <div class="wallet-card">
-      <div class="wc-top">
-        <div>
-          <div class="wc-lbl">Wallet Balance</div>
-          <div class="wc-amount" id="walletAmt">$—</div>
-          <div class="wc-start">Started at <span id="walletStart" style="font-family:'DM Mono';font-weight:600">$—</span></div>
-        </div>
-        <div class="wc-pnl">
-          <div class="wc-pnl-pct pnl-neu" id="walletPct">—%</div>
-          <div class="wc-pnl-abs" id="walletPnlAbs">P&L: $—</div>
-        </div>
-      </div>
-      <div class="wc-breakdown" id="walletBreakdown">
-        <span class="wc-chip">Syncing...</span>
-      </div>
-      <div class="sync-row">
-        <span class="sync-status" id="syncStatus">Not synced</span>
-        <button class="sync-btn" onclick="syncWallet()">⟳ Sync Wallet</button>
-      </div>
-    </div>
-
-    <!-- STATS ROW -->
-    <div class="stats-row">
-      <div class="stat-card">
-        <div class="stat-lbl">Win Rate</div>
-        <div class="stat-val blue" id="statWR">—%</div>
-        <div class="stat-sub" id="statTrades">0 trades</div>
-        <div class="stat-badge sb-blue" id="wrBadge">—</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-lbl">Streak</div>
-        <div class="stat-val" id="statStreak">—</div>
-        <div class="stat-sub">Kelly: <b id="statKelly">—</b>%</div>
-        <div class="stat-badge sb-green" id="bufBadge">Buffer: $—</div>
-      </div>
-    </div>
-
-    <!-- BOT STATUS -->
-    <div class="status-card" id="statusCard">
-      <div class="status-ico stopped" id="statusIco">⏸</div>
-      <div>
-        <div class="status-text" id="statusText">Bot is stopped</div>
-        <div class="status-time" id="statusTime">—</div>
-      </div>
-    </div>
-
-    <!-- CONTROLS -->
-    <div class="controls">
-      <button class="ctrl-btn ctrl-start" onclick="botAction('start')">▶ Start</button>
-      <button class="ctrl-btn ctrl-stop" onclick="botAction('stop')">■ Stop</button>
-      <button class="ctrl-btn ctrl-run" onclick="botAction('run_now')">⚡ Run</button>
-    </div>
-
-    <!-- LAST TRADES -->
-    <div class="trade-card">
-      <div class="tc-header">
-        <span class="tc-title">Recent Trades</span>
-        <button class="tc-viewall" onclick="showTab('trades',document.querySelectorAll('.bnav-btn')[1])">View all →</button>
-      </div>
-      <div id="recentTrades"><div class="empty-trades">No trades yet. Bot is ready.</div></div>
-    </div>
-
-    <!-- DANGER -->
-    <button class="danger-btn" onclick="closeAll()">⚠ Close All Positions</button>
-
-  </div>
-
-  <!-- TAB: TRADES -->
-  <div id="tab-trades" class="tab">
-    <div class="trade-card" style="margin-top:4px">
-      <div class="tc-header">
-        <span class="tc-title">All Trades</span>
-        <span id="allTradeCount" style="font-size:11px;color:var(--text3);font-family:'DM Mono'">0 trades</span>
-      </div>
-      <div id="allTrades"><div class="empty-trades">No trades yet.</div></div>
-    </div>
-  </div>
-
-  <!-- TAB: PREDICTION -->
-  <div id="tab-pred" class="tab">
-    <div class="pred-card" style="margin-top:4px">
-      <div class="pred-header">
-        <span class="tc-title" style="font-size:12px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.5px">Price Prediction</span>
-        <span class="pred-updated" id="predUpdated">—</span>
-      </div>
-      <div class="pred-row" id="predRow">
-        <div class="pred-item"><div class="pred-horizon">1 Hour</div><div class="pred-price" id="p1h">—</div><div class="pred-dir pred-neu" id="d1h">—</div><div class="pred-confidence" id="c1h">—</div></div>
-        <div class="pred-item"><div class="pred-horizon">4 Hours</div><div class="pred-price" id="p4h">—</div><div class="pred-dir pred-neu" id="d4h">—</div><div class="pred-confidence" id="c4h">—</div></div>
-        <div class="pred-item"><div class="pred-horizon">24 Hours</div><div class="pred-price" id="p24h">—</div><div class="pred-dir pred-neu" id="d24h">—</div><div class="pred-confidence" id="c24h">—</div></div>
-      </div>
-      <!-- Bull/Bear sentiment bar -->
-      <div class="sentiment-row">
-        <span class="sent-lbl" style="color:var(--green);font-weight:600">Bull</span>
-        <div class="sent-bar"><div class="sent-fill" id="sentFill" style="background:var(--green);width:50%"></div></div>
-        <span class="sent-lbl" style="color:var(--red);font-weight:600">Bear</span>
-      </div>
-      <div style="text-align:center;margin-top:6px;font-size:10px;color:var(--text3)" id="sentText">Calculating market sentiment...</div>
-    </div>
-
-    <!-- Confidence Pillars — clean version -->
-    <div class="trade-card">
-      <div class="tc-header"><span class="tc-title">Signal Strength</span><span id="confScore" style="font-size:13px;font-family:'DM Mono';font-weight:700;color:var(--text)">— / 100</span></div>
-      <div id="pillarRows"></div>
-    </div>
-  </div>
-
-  <!-- TAB: SETTINGS -->
-  <div id="tab-settings" class="tab">
-    <div class="trade-card" style="margin-top:4px">
-      <div class="tc-header"><span class="tc-title">Bot Configuration</span></div>
-      <div style="display:flex;flex-direction:column;gap:14px;padding:4px 0">
-        <div>
-          <div style="font-size:11px;color:var(--text3);margin-bottom:5px;font-weight:500">Min Confidence Threshold</div>
-          <div style="display:flex;gap:8px;align-items:center">
-            <input type="range" id="confSlider" min="50" max="90" value="65" style="flex:1;accent-color:var(--text)" oninput="document.getElementById('confVal').textContent=this.value">
-            <span id="confVal" style="font-family:'DM Mono';font-weight:700;font-size:14px;width:28px">65</span>
-          </div>
-          <div style="font-size:10px;color:var(--text3);margin-top:3px">Higher = fewer trades, better quality</div>
-        </div>
-        <div>
-          <div style="font-size:11px;color:var(--text3);margin-bottom:5px;font-weight:500">Max Risk Per Trade (%)</div>
-          <div style="display:flex;gap:8px;align-items:center">
-            <input type="range" id="riskSlider" min="0.5" max="5" step="0.5" value="2" style="flex:1;accent-color:var(--text)" oninput="document.getElementById('riskVal').textContent=this.value+'%'">
-            <span id="riskVal" style="font-family:'DM Mono';font-weight:700;font-size:14px;width:36px">2%</span>
-          </div>
-        </div>
-        <button onclick="saveConfig()" style="background:var(--text);color:white;border:none;border-radius:var(--radius-xs);padding:12px;font-size:13px;font-weight:600;cursor:pointer;font-family:'DM Sans'">Save Settings</button>
-      </div>
-    </div>
-    <div class="trade-card">
-      <div class="tc-header"><span class="tc-title">v5 Fixes Active</span></div>
-      <div style="display:flex;flex-direction:column;gap:8px">
-        ${['RSI regime bug fixed','Live wallet sync','MACD divergence detection','Hard vetoes (ADX/HTF/macro)','Time-of-day filter','Kelly position sizing'].map(f=>`
-        <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">
-          <div style="width:20px;height:20px;background:var(--green-bg);border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:11px;flex-shrink:0">✓</div>
-          <span style="font-size:13px;color:var(--text)">${f}</span>
-        </div>`).join('')}
-      </div>
-    </div>
-  </div>
-
 </div>
 
-<!-- BOTTOM NAV -->
-<nav class="bnav">
-  <button class="bnav-btn active" onclick="showTab('home',this)"><span class="nb-ico">🏠</span><span class="nb-lbl">Home</span></button>
-  <button class="bnav-btn" onclick="showTab('trades',this)"><span class="nb-ico">📋</span><span class="nb-lbl">Trades</span></button>
-  <button class="bnav-btn" onclick="showTab('pred',this)"><span class="nb-ico">📈</span><span class="nb-lbl">Signals</span></button>
-  <button class="bnav-btn" onclick="showTab('settings',this)"><span class="nb-ico">⚙️</span><span class="nb-lbl">Settings</span></button>
+<div class="wrap">
+<!-- HOME -->
+<div id="tab-home" class="tab-c active">
+  <div id="haltBanner" class="halted-banner" style="display:none"></div>
+  <div class="hero">
+    <div class="hero-lbl">Bitcoin &bull; Live</div>
+    <div class="hero-price" id="heroPrice">$&#8212;</div>
+    <div class="hero-row">
+      <span class="hero-chip hc-n" id="regimeChip">Loading...</span>
+      <span class="hero-strat hs-neu" id="stratChip">&#8212;</span>
+    </div>
+  </div>
+  <div class="regime r-n" id="regimeBanner">&#9679; Scanning...</div>
+  <div class="card">
+    <div class="card-hd">
+      <span class="card-title">Confidence Score</span>
+      <span id="confMeta" style="font-size:10px;color:var(--t3)">Calculating...</span>
+    </div>
+    <div class="conf-ring-wrap">
+      <div class="conf-ring">
+        <svg viewBox="0 0 72 72" width="72" height="72">
+          <circle cx="36" cy="36" r="30" fill="none" stroke="#f1f5f9" stroke-width="6"/>
+          <circle cx="36" cy="36" r="30" fill="none" id="confArc"
+            stroke="#00c896" stroke-width="6" stroke-linecap="round"
+            stroke-dasharray="188.5" stroke-dashoffset="188.5"/>
+        </svg>
+        <div class="conf-ring-inner">
+          <div class="conf-num" id="confNum">&#8212;</div>
+          <div class="conf-lbl">/100</div>
+        </div>
+      </div>
+      <div class="conf-meta">
+        <div class="conf-dir" id="confDir">WAIT</div>
+        <div class="conf-strat" id="confStrat">Gathering data...</div>
+        <div style="font-size:10px;color:var(--t3);margin-top:4px" id="confVol"></div>
+      </div>
+    </div>
+    <div class="pillars" id="pillarsEl" style="margin-top:10px"></div>
+    <div class="ind-grid">
+      <div class="ind"><div class="ind-lbl">ADX</div><div class="ind-val" id="adxV">&#8212;</div></div>
+      <div class="ind"><div class="ind-lbl">BB Width</div><div class="ind-val" id="bwV">&#8212;</div></div>
+      <div class="ind"><div class="ind-lbl">ATR%</div><div class="ind-val" id="atrV">&#8212;</div></div>
+    </div>
+    <div class="scan-bar"><div class="scan-fill" id="scanFill" style="width:0"></div></div>
+    <div class="scan-info">
+      <span id="scanStatus">Not started</span>
+      <span id="countdown" style="font-family:var(--fm);font-weight:600;color:var(--b)">&#8212;</span>
+    </div>
+  </div>
+  <div id="openPositions"></div>
+  <div id="optsPositions"></div>
+  <div class="card">
+    <div class="card-title" style="margin-bottom:14px">Wallet Balance</div>
+    <div class="wallet-top">
+      <div class="wal-left">
+        <div class="wal-lbl">Available</div>
+        <div class="wal-amt" id="walAmt">$&#8212;</div>
+        <div class="wal-start" id="walStart"></div>
+      </div>
+      <div>
+        <div class="wal-pct" id="walPct">&#8212;</div>
+        <div class="wal-pnl" id="walPnl">P&L $&#8212;</div>
+      </div>
+    </div>
+  </div>
+  <div class="stats-grid" style="margin-bottom:10px">
+    <div class="stat"><div class="stat-lbl">Win Rate</div><div class="stat-val" id="winRate">&#8212;</div></div>
+    <div class="stat"><div class="stat-lbl">Trades</div><div class="stat-val" id="trCount">0</div></div>
+    <div class="stat"><div class="stat-lbl">Scan</div><div class="stat-val" style="color:var(--b)" id="scanN">0</div></div>
+  </div>
+  <div class="btn-row">
+    <button class="btn btn-dark" id="btnStart">&#9654; Start</button>
+    <button class="btn btn-danger" id="btnStop">&#9646; Stop</button>
+    <button class="btn btn-blue" id="btnScan">&#9889; Run</button>
+  </div>
+  <!-- OPTIONS mode toggle -->
+  <div class="card">
+    <div class="opts-toggle">
+      <div>
+        <div class="opts-toggle-lbl">Options Mode</div>
+        <div style="font-size:11px;color:var(--t3);margin-top:2px">Buy calls/puts + straddles</div>
+      </div>
+      <label class="toggle"><input type="checkbox" id="optsToggle"><span class="toggle-slider"></span></label>
+    </div>
+    <div id="optsMode" style="margin-top:10px;display:none">
+      <div class="cb-method">
+        <div class="cb on" id="cbATM" onclick="setMon('ATM')">ATM</div>
+        <div class="cb" id="cbITM" onclick="setMon('ITM')">ITM (higher delta)</div>
+        <div class="cb" id="cbST" onclick="setMon('STRADDLE')">Straddle</div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-size:11px;color:var(--t2);text-align:center;padding:8px 0;border-top:var(--bdr)">
+        <div><b style="color:var(--g)">+80%</b><br>Take Profit</div>
+        <div><b style="color:var(--r)">-50%</b><br>Stop Loss</div>
+        <div><b style="color:var(--b)">-30%</b><br>Floor Trail</div>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button class="btn btn-blue" style="flex:1;font-size:11px" onclick="checkOption('call')">Check CALL</button>
+        <button class="btn btn-danger" style="flex:1;font-size:11px" onclick="checkOption('put')">Check PUT</button>
+        <button class="btn btn-dark" style="flex:1;font-size:11px" onclick="checkStraddle()">Straddle</button>
+      </div>
+      <div id="optFindResult" style="margin-top:8px;font-size:11px;padding:10px;background:#f8fafc;border-radius:var(--r8);display:none;line-height:1.7"></div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title" style="margin-bottom:10px">Manual Trade</div>
+    <input class="inp" id="manualLots" type="number" placeholder="Lots (default 1)" min="1">
+    <div class="manual-row">
+      <button class="btn-long" id="btnBuyLong">&#8593; Buy Long</button>
+      <button class="btn-short" id="btnSellShort">&#8595; Sell Short</button>
+    </div>
+  </div>
+  <button class="btn-close" id="btnCloseAll">&#9888; Close All Positions</button>
+</div>
+
+<!-- TRADES -->
+<div id="tab-trades" class="tab-c">
+  <div class="card">
+    <div class="card-hd"><span class="card-title">All Trades</span><span id="tradeCountEl" style="font-size:11px;color:var(--t3)">0 trades</span></div>
+    <div id="tradesList"><div class="empty-state">No trades yet</div></div>
+  </div>
+</div>
+
+<!-- LOGS -->
+<div id="tab-logs" class="tab-c">
+  <div class="log-filters">
+    <div class="log-fp on" id="lf-all">All</div>
+    <div class="log-fp" id="lf-TRADE">Trades</div>
+    <div class="log-fp" id="lf-WARN">Warn</div>
+    <div class="log-fp" id="lf-ERROR">Error</div>
+  </div>
+  <div class="log-box" id="logBox"></div>
+</div>
+
+<!-- SETTINGS -->
+<div id="tab-settings" class="tab-c">
+  <div class="card">
+    <div class="card-title" style="margin-bottom:12px">Connect to Delta Exchange</div>
+    <input class="inp" id="apiKey" type="text" placeholder="API Key">
+    <input class="inp" id="apiSecret" type="password" placeholder="API Secret">
+    <button class="btn btn-dark btn-full" id="btnConnect">Connect</button>
+    <div id="connMsg" style="text-align:center;font-size:12px;margin-top:6px;line-height:1.6"></div>
+  </div>
+  <div class="card">
+    <div class="card-title" style="margin-bottom:10px">Server IP &mdash; Whitelist on Delta</div>
+    <div class="ip-box" id="serverIp">Loading...</div>
+    <div style="font-size:11px;color:var(--t3);line-height:1.9">
+      1. Copy IP above &rarr; Delta &rarr; Account &rarr; API Keys &rarr; Edit<br>
+      2. Paste into IP Whitelist &rarr; Save
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title" style="margin-bottom:2px">Active Guardrails</div>
+    <div id="guardrailsList"></div>
+  </div>
+</div>
+</div><!-- wrap -->
+
+<nav class="nav">
+  <button class="nav-btn active" id="nb-home" onclick="switchTab('home')"><span class="nav-ico">&#127968;</span><span class="nav-lbl">Home</span></button>
+  <button class="nav-btn" id="nb-trades" onclick="switchTab('trades')"><span class="nav-ico">&#128203;</span><span class="nav-lbl">Trades</span></button>
+  <button class="nav-btn" id="nb-logs"   onclick="switchTab('logs')"><span class="nav-ico">&#128220;</span><span class="nav-lbl">Logs</span></button>
+  <button class="nav-btn" id="nb-settings" onclick="switchTab('settings')"><span class="nav-ico">&#9881;</span><span class="nav-lbl">Settings</span></button>
 </nav>
 
 <script>
-// ── State ─────────────────────────────────────────────────────────────────────
-let btcPrice=0,btcPrev=0,lastRefresh=0;
+var allLogs=[], logFilter='', currentTrades=[], nextScanAt=null, scanSecs=300, prefMon='ATM';
 
-// ── Navigation ────────────────────────────────────────────────────────────────
-function showTab(name,btn){
-  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-  document.querySelectorAll('.bnav-btn').forEach(b=>b.classList.remove('active'));
-  document.getElementById('tab-'+name).classList.add('active');
-  if(btn) btn.classList.add('active');
+function switchTab(t){
+  ['home','trades','logs','settings'].forEach(function(n){
+    document.getElementById('tab-'+n).classList.toggle('active',n===t);
+    document.getElementById('nb-'+n).classList.toggle('active',n===t);
+  });
+  if(t==='logs') renderLogs();
+  if(t==='trades') renderTrades();
 }
 
-// ── Toast ─────────────────────────────────────────────────────────────────────
-function toast(msg){
-  const el=document.getElementById('toast');
-  el.textContent=msg;el.classList.add('show');
-  setTimeout(()=>el.classList.remove('show'),2500);
+function api(url,body){
+  var opt = body!==undefined ? {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)} : {};
+  return fetch(url,opt).then(function(r){return r.json();}).catch(function(){return null;});
 }
 
-// ── API ───────────────────────────────────────────────────────────────────────
-async function api(path,method='GET',body=null){
-  try{
-    const opts={method,headers:{'Content-Type':'application/json'}};
-    if(body) opts.body=JSON.stringify(body);
-    const r=await fetch(path,opts);
-    return await r.json();
-  }catch(e){return null}
-}
+// ── PILLAR COLORS ────────────────────────────────────────────────
+var pillarColors = {
+  'Regime':'#3b82f6','MTF Align':'#00c896',
+  'RSI':'#f59e0b','MACD':'#8b5cf6',
+  'Volatility':'#ec4899','Volume':'#f04b4b','Session':'#14b8a6'
+};
 
-// ── Main Refresh ──────────────────────────────────────────────────────────────
-async function refresh(){
-  const [state,trades,ticker]=await Promise.all([
-    api('/api/status'),
-    api('/api/trades'),
-    api('/api/ticker')
-  ]);
-  if(state) renderState(state);
-  if(trades) renderTrades(trades);
-  if(ticker) renderTicker(ticker);
-  computePrediction();
-}
-
-// ── Ticker ────────────────────────────────────────────────────────────────────
-function renderTicker(t){
-  const price=parseFloat(t.mark_price||t.last_price||0);
-  if(!price) return;
-  btcPrev=btcPrice||price;
-  btcPrice=price;
-  document.getElementById('btcPrice').textContent='$'+price.toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0});
-  // Mock 24h change from mark vs index
-  const idx=parseFloat(t.index_price||price);
-  const chg=((price-idx)/idx*100);
-  const badge=document.getElementById('btcChangeBadge');
-  badge.textContent=(chg>=0?'+':'')+chg.toFixed(2)+'%';
-  badge.className='btc-chg-badge '+(chg>=0?'btc-chg-up':'btc-chg-dn');
-}
-
-// ── Prediction Engine (EMA + RSI-based projection) ────────────────────────────
-function computePrediction(){
-  if(!btcPrice) return;
-  // Simple projection using current price + momentum signal from state
-  const now=new Date();
-  document.getElementById('predUpdated').textContent='Updated '+now.toISOString().substr(11,5)+' UTC';
-
-  // Use a basic momentum-based prediction (actual prediction comes from bot analysis)
-  // 1h: small range based on ATR estimate (~0.5-1.5%)
-  const atrEst=btcPrice*0.008; // ~0.8% ATR estimate
-  const bullBias=Math.random()>0.5; // In production this comes from bot confidence score
-
-  const p1h=btcPrice+(bullBias?1:-1)*(atrEst*0.6);
-  const p4h=btcPrice+(bullBias?1:-1)*(atrEst*1.2);
-  const p24h=btcPrice+(bullBias?1:-1)*(atrEst*2.1);
-
-  function fmt(p){return '$'+Math.round(p).toLocaleString()}
-  function dir(p,base){
-    const pct=((p-base)/base*100);
-    const cls=pct>0?'pred-up':pct<0?'pred-dn':'pred-neu';
-    return {pct,cls,txt:(pct>0?'▲ +':pct<0?'▼ ':'')+Math.abs(pct).toFixed(2)+'%'};
-  }
-
-  const d1h=dir(p1h,btcPrice),d4h=dir(p4h,btcPrice),d24h=dir(p24h,btcPrice);
-
-  document.getElementById('p1h').textContent=fmt(p1h);
-  document.getElementById('d1h').textContent=d1h.txt;
-  document.getElementById('d1h').className='pred-dir '+d1h.cls;
-  document.getElementById('c1h').textContent='Moderate confidence';
-
-  document.getElementById('p4h').textContent=fmt(p4h);
-  document.getElementById('d4h').textContent=d4h.txt;
-  document.getElementById('d4h').className='pred-dir '+d4h.cls;
-  document.getElementById('c4h').textContent='Based on EMA trend';
-
-  document.getElementById('p24h').textContent=fmt(p24h);
-  document.getElementById('d24h').textContent=d24h.txt;
-  document.getElementById('d24h').className='pred-dir '+d24h.cls;
-  document.getElementById('c24h').textContent='Multi-timeframe';
-
-  // Hero card prediction
-  document.getElementById('predPrice').textContent=fmt(p1h);
-  document.getElementById('predPrice').className='btc-pred-val '+(d1h.pct>0?'btc-pred-up':'btc-pred-dn');
-  document.getElementById('predSignal').textContent=bullBias?'↑ Bullish bias':'↓ Bearish bias';
-  document.getElementById('predSignal').className='btc-signal '+(bullBias?'sig-bull':'sig-bear');
-
-  // Sentiment bar
-  const bullPct=bullBias?62:38;
-  document.getElementById('sentFill').style.width=bullPct+'%';
-  document.getElementById('sentFill').style.background=bullPct>50?'var(--green)':'var(--red)';
-  document.getElementById('sentText').textContent=
-    `Market leans ${bullPct>50?'bullish':'bearish'} — ${bullPct}% bull / ${100-bullPct}% bear`;
-}
-
-// ── State Render ──────────────────────────────────────────────────────────────
-function renderState(s){
+function render(s){
+  if(!s) return;
   // Header pill
-  const pill=document.getElementById('statusPill');
-  pill.className='pill '+(s.running?'pill-on':'pill-off');
-  document.getElementById('pillTxt').textContent=s.running?'Live':'Stopped';
-
+  var ok = s.connected && !s.halted;
+  var pill = document.getElementById('statusPill');
+  pill.className = 'status-pill ' + (ok?'pill-live':'pill-off');
+  document.getElementById('pillTxt').textContent = s.halted?'HALTED':s.connected?'Live':'Stopped';
+  // Halt banner
+  var hb = document.getElementById('haltBanner');
+  hb.style.display = s.halted?'block':'none';
+  if(s.halted) hb.textContent = 'BOT HALTED: '+s.halt_msg;
+  // Hero price
+  document.getElementById('heroPrice').textContent = s.price?'$'+s.price.toLocaleString():'$\u2014';
+  // Regime chip
+  var rc = document.getElementById('regimeChip');
+  var rg = s.regime||'';
+  rc.textContent = rg||'\u2014';
+  rc.className = 'hero-chip ' + (rg.includes('BULL')?'hc-g':rg.includes('BEAR')?'hc-r':'hc-n');
+  // Strat chip
+  var sc2 = document.getElementById('stratChip');
+  var st = s.strategy||'';
+  sc2.textContent = st;
+  sc2.className = 'hero-strat ' + (st==='SCALP'?'hs-bull':st==='SWING'?'hs-bull':st==='STRADDLE'?'hs-neu':st==='WAIT'?'hs-neu':'hs-neu');
+  // Regime banner
+  var rb = document.getElementById('regimeBanner');
+  var rgClass = {'STRONG_BULL':'r-sb','BULL':'r-b','NEUTRAL':'r-n','BEAR':'r-be','STRONG_BEAR':'r-sb2','SIDEWAYS':'r-sw','UNKNOWN':'r-n'}[rg]||'r-n';
+  rb.className = 'regime '+rgClass;
+  var rgIcon = {'STRONG_BULL':'&#128308;&#128308;','BULL':'&#128308;','NEUTRAL':'&#9898;','BEAR':'&#128309;','STRONG_BEAR':'&#128309;&#128309;','SIDEWAYS':'&#8596;'}[rg]||'&#9898;';
+  var rgDesc = {'STRONG_BULL':'Strong uptrend — EMA stacked, ADX>25','BULL':'Moderate uptrend','NEUTRAL':'No clear direction','BEAR':'Moderate downtrend','STRONG_BEAR':'Strong downtrend — EMA stacked, ADX>25','SIDEWAYS':'Ranging — potential breakout'}[rg]||'Scanning...';
+  rb.innerHTML = rgIcon+' <b>'+rg+'</b> &nbsp;&#183;&nbsp; <span style="font-size:11px;font-weight:400">'+rgDesc+'</span>';
+  // Confidence ring
+  var score = s.conf_long||0;
+  document.getElementById('confNum').textContent = score||'\u2014';
+  var arc = document.getElementById('confArc');
+  var circumference = 188.5;
+  var offset = circumference - (score/100)*circumference;
+  arc.style.strokeDashoffset = offset;
+  arc.style.stroke = score>=70?'var(--g)':score>=50?'var(--y)':'var(--r)';
+  document.getElementById('confNum').style.color = score>=70?'var(--g)':score>=50?'var(--y)':'var(--r)';
+  document.getElementById('confMeta').textContent = (s.vol_regime||'')+' vol | ADX='+(s.adx||0);
+  // Direction
+  var dEl = document.getElementById('confDir');
+  var stEl = document.getElementById('confStrat');
+  var dir = s.strategy==='WAIT'?'WAIT':(score>=(s.conf_long||0)&&score>0?'READY':'WAIT');
+  dEl.textContent = s.strategy||'WAIT';
+  dEl.style.color = s.strategy==='WAIT'||s.strategy==='WAIT'?'var(--t2)':s.strategy==='STRADDLE'?'var(--y)':'var(--g)';
+  stEl.textContent = 'Conf '+score+'/100 | '+rg;
+  document.getElementById('confVol').textContent = 'Vol: '+s.vol_regime+' | BW='+s.bw+' | ATR='+s.atr_pct+'%';
+  // Pillars
+  var pillars = s.pillars||{};
+  var pEl = document.getElementById('pillarsEl');
+  pEl.innerHTML = Object.entries(pillars).map(function(kv){
+    var k=kv[0],v=kv[1];
+    var pct = v.m>0 ? Math.round(v.s/v.m*100) : 0;
+    var col = pillarColors[k]||'var(--g)';
+    return '<div class="pillar">'+
+      '<div class="pillar-name">'+k+'</div>'+
+      '<div class="pillar-bar"><div class="pillar-fill" style="width:'+pct+'%;background:'+col+'"></div></div>'+
+      '<div class="pillar-score" style="color:'+col+'">'+v.s+'/'+v.m+'</div>'+
+      '</div>';
+  }).join('');
+  // Indicators
+  document.getElementById('adxV').textContent = s.adx||'\u2014';
+  document.getElementById('bwV').textContent  = s.bw ?s.bw+'%':'\u2014';
+  document.getElementById('atrV').textContent = s.atr_pct?s.atr_pct+'%':'\u2014';
+  // Scan countdown
+  document.getElementById('scanStatus').textContent = s.status||'\u2014';
+  document.getElementById('scanN').textContent = s.scan_n||0;
+  if(s.next_scan){ nextScanAt=new Date(s.next_scan); }
+  if(s.scan_interval) scanSecs=s.scan_interval;
+  // Open perp positions
+  var ops = s.open_pos||[];
+  var opEl = document.getElementById('openPositions');
+  opEl.innerHTML = ops.map(function(p){
+    var neg=p.upnl<0;
+    var uSgn=p.upnl>=0?'+':'';
+    var pSgn=p.pct>=0?'+':'';
+    return '<div class="pos-card pos-'+p.side+'">'+
+      '<div class="pos-head"><span class="pos-sym">'+p.sym+'</span>'+
+      '<span class="pos-badge pb-'+p.side+'">'+p.side.toUpperCase()+'</span></div>'+
+      '<div class="pos-grid">'+
+      '<div class="pos-item"><div class="pos-item-lbl">Entry</div><div class="pos-item-val">$'+p.entry.toLocaleString()+'</div></div>'+
+      '<div class="pos-item"><div class="pos-item-lbl">Lots</div><div class="pos-item-val">'+p.lots+'</div></div>'+
+      '<div class="pos-item"><div class="pos-item-lbl">UPL</div><div class="pos-item-val '+(neg?'r':'g')+'">'+uSgn+'$'+p.upnl+' ('+pSgn+p.pct+'%)</div></div>'+
+      '<div class="pos-item"><div class="pos-item-lbl">Mark</div><div class="pos-item-val">$'+(p.mark||p.entry).toLocaleString()+'</div></div>'+
+      '<div class="pos-item"><div class="pos-item-lbl">Stop</div><div class="pos-item-val r">$'+p.stop.toLocaleString()+'</div></div>'+
+      '<div class="pos-item"><div class="pos-item-lbl">TP</div><div class="pos-item-val g">$'+p.tp.toLocaleString()+'</div></div>'+
+      '</div></div>';
+  }).join('');
+  // Open options positions
+  var oopos = s.opts_pos||[];
+  var ooEl = document.getElementById('optsPositions');
+  ooEl.innerHTML = oopos.map(function(p){
+    var neg=p.pct<0;
+    var isCall=p.type==='CALL';
+    return '<div class="pos-card pos-opt">'+
+      '<div class="pos-head"><span class="pos-sym" style="font-size:12px">'+p.sym+'</span>'+
+      '<span class="pos-badge '+(isCall?'pb-call':'pb-put')+'">'+p.type+'</span></div>'+
+      '<div class="pos-grid">'+
+      '<div class="pos-item"><div class="pos-item-lbl">Entry</div><div class="pos-item-val">$'+p.entry+'</div></div>'+
+      '<div class="pos-item"><div class="pos-item-lbl">Mark</div><div class="pos-item-val">$'+p.mark+'</div></div>'+
+      '<div class="pos-item"><div class="pos-item-lbl">UPL</div><div class="pos-item-val '+(neg?'r':'g')+'">'+(p.pct>=0?'+':'')+p.pct+'%</div></div>'+
+      '<div class="pos-item"><div class="pos-item-lbl">Peak</div><div class="pos-item-val g">$'+p.peak+'</div></div>'+
+      '</div></div>';
+  }).join('');
   // Wallet
-  const cap=s.capital||0,sc=s.starting_capital||0,pnl=s.total_pnl||0,pct=s.pnl_pct||0;
-  document.getElementById('walletAmt').textContent='$'+cap.toFixed(2);
-  document.getElementById('walletStart').textContent='$'+sc.toFixed(2);
-  const pctEl=document.getElementById('walletPct');
-  pctEl.textContent=(pct>=0?'+':'')+pct.toFixed(2)+'%';
-  pctEl.className='wc-pnl-pct '+(pct>0?'pnl-up':pct<0?'pnl-dn':'pnl-neu');
-  document.getElementById('walletPnlAbs').textContent='P&L: $'+(pnl>=0?'+':'')+pnl.toFixed(2);
-
-  // Breakdown chips
-  const chips=[];
-  if(s.wallet_usdt>0) chips.push(`USDT ${s.wallet_usdt.toFixed(2)}`);
-  if(s.wallet_inr>0)  chips.push(`INR ${s.wallet_inr.toFixed(0)}`);
-  if(s.wallet_btc>0)  chips.push(`BTC ${s.wallet_btc.toFixed(6)}`);
-  document.getElementById('walletBreakdown').innerHTML=
-    (chips.length?chips:['No balance data']).map(c=>`<span class="wc-chip">${c}</span>`).join('');
-
-  // Sync status
-  const ss=document.getElementById('syncStatus');
-  if(s.wallet_synced){ss.textContent='✓ Synced from Delta Exchange';ss.className='sync-status ok';}
-  else{ss.textContent='⚠ Wallet not synced — check API keys';ss.className='sync-status warn';}
-
+  document.getElementById('walAmt').textContent = s.capital?'$'+s.capital.toFixed(2):'$\u2014';
+  var pp=s.pnl_pct||0;
+  var wpEl=document.getElementById('walPct');
+  wpEl.textContent=(pp>=0?'+':'')+pp.toFixed(2)+'%';
+  wpEl.style.color=pp>=0?'var(--g)':'var(--r)';
+  document.getElementById('walPnl').textContent='P&L: $'+(pp>=0?'+':'')+((s.capital-s.start_cap)||0).toFixed(2);
+  document.getElementById('walStart').textContent=s.start_cap?'Started: $'+s.start_cap.toFixed(2):'';
   // Stats
-  const wr=s.win_rate||0;
-  document.getElementById('statWR').textContent=wr.toFixed(1)+'%';
-  document.getElementById('statTrades').textContent=(s.total_trades||0)+' trades';
-  const wrB=document.getElementById('wrBadge');
-  wrB.textContent=wr>=60?'Strong':wr>=50?'Good':'Building';
-  wrB.className='stat-badge '+(wr>=60?'sb-green':wr>=50?'sb-blue':'sb-orange');
-
-  const sk=s.streak||0;
-  const skEl=document.getElementById('statStreak');
-  skEl.textContent=(sk>0?'+':'')+sk+(sk>2?' 🔥':sk<-2?' 🧊':'');
-  skEl.className='stat-val '+(sk>0?'green':sk<0?'red':'');
-  document.getElementById('statKelly').textContent=(s.kelly_fraction||0).toFixed(2);
-  document.getElementById('bufBadge').textContent='Buffer: $'+(s.profit_buffer||0).toFixed(0);
-
-  // Status card
-  const running=s.running;
-  const ico=document.getElementById('statusIco');
-  ico.className='status-ico '+(running?'running':'stopped');
-  ico.textContent=running?'▶':'⏸';
-  document.getElementById('statusText').textContent=s.status||'—';
-  document.getElementById('statusTime').textContent=new Date().toISOString().substr(0,19).replace('T',' ')+' UTC';
-
-  // Confidence pillars (signals tab)
-  const recent=s.recent_trades||[];
-  const last=recent[recent.length-1];
-  const conf=last?.confidence||0;
-  document.getElementById('confScore').textContent=conf+' / 100';
-  const pillars=[
-    {n:'Market Regime',w:25,c:'#0066ff'},{n:'HTF Alignment',w:20,c:'#00c896'},
-    {n:'Momentum',w:15,c:'#ff9f00'},{n:'Volume',w:10,c:'#ff6b6b'},
-    {n:'Volatility',w:10,c:'#a29bfe'},{n:'Session Time',w:10,c:'#74b9ff'},
-    {n:'Funding Rate',w:10,c:'#fd79a8'}
-  ];
-  document.getElementById('pillarRows').innerHTML=pillars.map(p=>`
-    <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">
-      <div style="width:110px;font-size:12px;color:var(--text2);font-weight:500">${p.n}</div>
-      <div style="flex:1;height:6px;background:var(--bg2);border-radius:3px;overflow:hidden">
-        <div style="height:100%;width:${p.w*4}%;background:${p.c};border-radius:3px;transition:width .6s"></div>
-      </div>
-      <div style="width:28px;text-align:right;font-size:11px;font-family:'DM Mono';font-weight:600;color:${p.c}">${p.w}</div>
-    </div>`).join('');
-}
-
-// ── Trade Render ──────────────────────────────────────────────────────────────
-function renderTrades(trades){
-  if(!trades||!trades.length){
-    document.getElementById('recentTrades').innerHTML='<div class="empty-trades">No trades yet. Bot is ready.</div>';
-    document.getElementById('allTrades').innerHTML='<div class="empty-trades">No trades yet.</div>';
-    return;
+  document.getElementById('winRate').textContent  = s.win_rate!=null?s.win_rate+'%':'\u2014';
+  document.getElementById('trCount').textContent  = s.total_trades||0;
+  // Opts toggle
+  var ot=document.getElementById('optsToggle');
+  if(ot) ot.checked=!!s.opts_mode;
+  var om=document.getElementById('optsMode');
+  if(om) om.style.display=s.opts_mode?'block':'none';
+  // Guards
+  if(s.guardrails){
+    document.getElementById('guardrailsList').innerHTML=
+      Object.entries(s.guardrails).map(function(kv){
+        return '<div class="setting-row"><span class="setting-lbl">'+kv[0]+'</span><span class="setting-val">'+kv[1]+'</span></div>';
+      }).join('');
   }
-  document.getElementById('allTradeCount').textContent=trades.length+' trades';
+  // Logs + trades
+  if(s.logs) allLogs=s.logs;
+  if(s.trades) currentTrades=s.trades;
+  if(document.getElementById('tab-logs').classList.contains('active')) renderLogs();
+  if(document.getElementById('tab-trades').classList.contains('active')) renderTrades();
+}
 
-  function makeRow(t){
-    const isClose=t.action==='CLOSE';
-    const won=t.pnl_pct>0;
-    const side=t.side||'';
-    let icoCls=side==='long'?'ti-long':side==='short'?'ti-short':'ti-open';
-    let icoTxt=side==='long'?'↑':side==='short'?'↓':'○';
-    if(isClose) icoTxt=won?'+−':'−';
-    const pnlTxt=isClose?((won?'+':'')+t.pnl_pct?.toFixed(2)+'%'):'Open';
-    const pnlCls=isClose?(won?'up':'dn'):'neu';
-    const timeStr=t.time?t.time.substr(5,11).replace('T',' '):'—';
-    return `<div class="trade-row">
-      <div class="trade-left">
-        <div class="trade-icon ${icoCls}">${icoTxt}</div>
-        <div class="trade-info">
-          <div class="t-sym">${t.symbol||'BTC-OPT'} · ${side.toUpperCase()}</div>
-          <div class="t-time">${timeStr} · ${t.reason||t.action}</div>
-        </div>
-      </div>
-      <div class="trade-right">
-        <div class="t-pnl ${pnlCls}">${pnlTxt}</div>
-        <div class="t-price">$${t.price?.toFixed(0)||'—'} · C:${t.confidence||'—'}</div>
-      </div>
-    </div>`;
+function renderLogs(){
+  var f = logFilter?allLogs.filter(function(e){return e.l===logFilter;}):allLogs;
+  document.getElementById('logBox').innerHTML = f.slice(0,120).map(function(e){
+    return '<div class="log-row"><span class="log-time">'+e.t+'</span><span class="lv-'+e.l+'">'+e.m+'</span></div>';
+  }).join('');
+}
+function setLogFilter(f){
+  logFilter=f;
+  ['all','TRADE','WARN','ERROR'].forEach(function(x){
+    var id='lf-'+(x);
+    var el=document.getElementById(id);
+    if(el) el.classList.toggle('on',f===(x==='all'?'':x));
+  });
+  renderLogs();
+}
+
+function renderTrades(){
+  var el=document.getElementById('tradesList');
+  document.getElementById('tradeCountEl').textContent=currentTrades.length+' trades';
+  if(!currentTrades.length){el.innerHTML='<div class="empty-state">No trades yet</div>';return;}
+  el.innerHTML=currentTrades.map(function(t){
+    var open=t.exit==null;
+    var s=t.side||'';
+    var icoClass=s==='long'?'ti-long':s==='short'?'ti-short':s==='call'?'ti-call':s==='put'?'ti-put':'ti-straddle';
+    var ico=s==='long'?'\u2191':s==='short'?'\u2193':s==='call'?'C':s==='put'?'P':'S';
+    var pnlCls=open?'n':(t.won?'g':'r');
+    var pnlTxt=open?'Open\u2026':(t.won?'+':'')+(t.pnl||0).toFixed(4);
+    var tag=t.reason?(' \u00B7 '+t.reason):'';
+    var tm=t.time?t.time.substr(5,11).replace('T',' '):'';
+    return '<div class="trade-item">'+
+      '<div class="trade-ico '+icoClass+'">'+ico+'</div>'+
+      '<div class="trade-mid"><div class="trade-sym">'+(t.sym||'BTCUSD')+'</div>'+
+      '<div class="trade-info">'+tm+tag+'</div></div>'+
+      '<div class="trade-right"><div class="trade-pnl '+pnlCls+'">$'+pnlTxt+'</div>'+
+      '<div style="font-size:10px;color:var(--t3)">'+(t.entry?'@$'+t.entry:'')+'</div></div>'+
+      '</div>';
+  }).join('');
+}
+
+// Countdown timer
+setInterval(function(){
+  if(!nextScanAt) return;
+  var diff=Math.max(0,Math.round((nextScanAt-Date.now())/1000));
+  var m=Math.floor(diff/60); var s=diff%60;
+  document.getElementById('countdown').textContent=diff>0?(m+'m '+s+'s'):'Now';
+  document.getElementById('scanFill').style.width=Math.max(0,100-diff/scanSecs*100)+'%';
+},1000);
+
+// Options mode UI
+document.getElementById('optsToggle').addEventListener('change',function(){
+  api('/api/opts/toggle',{enabled:this.checked}).then(function(r){
+    document.getElementById('optsMode').style.display=r&&r.opts_mode?'block':'none';
+  });
+});
+
+var selectedMon='ATM';
+function setMon(m){
+  selectedMon=m;
+  ['ATM','ITM','STRADDLE'].forEach(function(x){
+    document.getElementById('cb'+x).classList.toggle('on',x===m);
+  });
+}
+
+async function checkOption(t){
+  var el=document.getElementById('optFindResult');
+  el.style.display='block'; el.textContent='Checking...';
+  var r=await api('/api/opts/find',{type:t,itm:selectedMon==='ITM'});
+  if(r&&r.found){
+    el.innerHTML='<b>'+r.symbol+'</b><br>Strike $'+(r.strike||0).toLocaleString()+
+      ' | Mark $'+(r.mark||0).toFixed(2)+' | Premium $'+(r.premium_usd||0).toFixed(2)+
+      ' | '+r.moneyness+'<br>Expiry Friday '+r.expiry;
+  } else {
+    el.textContent='No '+t+' option found. Expiry: '+(r&&r.expiry||'?');
   }
-
-  const rev=[...trades].reverse();
-  document.getElementById('recentTrades').innerHTML=rev.slice(0,5).map(makeRow).join('');
-  document.getElementById('allTrades').innerHTML=rev.map(makeRow).join('');
+}
+async function checkStraddle(){
+  var el=document.getElementById('optFindResult');
+  el.style.display='block'; el.textContent='Checking straddle...';
+  var r=await api('/api/opts/straddle',{});
+  if(r&&r.found){
+    el.innerHTML='<b>Straddle</b><br>Call: '+r.call.symbol+' | Put: '+r.put.symbol+
+      '<br>Total Premium: $'+(r.total_premium_usd||0).toFixed(2)+
+      '<br>Break-even UP: $'+Math.round(r.breakeven_up||0).toLocaleString()+
+      ' | DOWN: $'+Math.round(r.breakeven_down||0).toLocaleString();
+  } else {
+    el.textContent='Could not build straddle.';
+  }
 }
 
-// ── Actions ───────────────────────────────────────────────────────────────────
-async function botAction(action){
-  const r=await api('/api/bot/'+action,'POST');
-  toast(r?.message||(action+' OK'));
-  setTimeout(refresh,1500);
-}
+// Button wiring
+document.addEventListener('DOMContentLoaded',function(){
+  document.getElementById('btnStart').onclick=function(){api('/api/bot/start',{});};
+  document.getElementById('btnStop').onclick=function(){api('/api/bot/stop',{});};
+  document.getElementById('btnScan').onclick=function(){api('/api/bot/run_now',{});};
+  document.getElementById('btnCloseAll').onclick=function(){
+    if(!confirm('Close ALL open positions (perps + options)?')) return;
+    api('/api/close_all',{}).then(function(r){alert('Closed: '+(r?r.closed:0));});
+  };
+  document.getElementById('btnBuyLong').onclick=function(){
+    var lots=parseInt(document.getElementById('manualLots').value)||1;
+    api('/api/manual_trade',{direction:'long',lots:lots}).then(function(r){
+      if(r&&r.success) alert('LONG '+lots+'L\nEntry $'+r.entry+'\nStop $'+r.stop+'\nTP $'+r.tp);
+      else alert('Failed: '+(r?r.message:'check logs'));
+    });
+  };
+  document.getElementById('btnSellShort').onclick=function(){
+    var lots=parseInt(document.getElementById('manualLots').value)||1;
+    api('/api/manual_trade',{direction:'short',lots:lots}).then(function(r){
+      if(r&&r.success) alert('SHORT '+lots+'L\nEntry $'+r.entry+'\nStop $'+r.stop+'\nTP $'+r.tp);
+      else alert('Failed: '+(r?r.message:'check logs'));
+    });
+  };
+  document.getElementById('btnConnect').onclick=function(){
+    var k=document.getElementById('apiKey').value.trim();
+    var s=document.getElementById('apiSecret').value.trim();
+    if(!k||!s){document.getElementById('connMsg').innerHTML='<span style="color:var(--r)">Enter both fields</span>';return;}
+    document.getElementById('connMsg').textContent='Connecting...';
+    api('/api/connect',{api_key:k,api_secret:s}).then(function(r){
+      document.getElementById('connMsg').innerHTML=r&&r.success
+        ?'<span style="color:var(--g)">\u2713 Connected &mdash; $'+(r.balance||0).toFixed(2)+'</span>'
+        :'<span style="color:var(--r)">\u2717 '+(r?r.message:'Failed')+(r&&r.server_ip?'<br><small>IP: '+r.server_ip+'</small>':'')+'</span>';
+    });
+  };
+  document.getElementById('lf-all').onclick=function(){setLogFilter('');};
+  document.getElementById('lf-TRADE').onclick=function(){setLogFilter('TRADE');};
+  document.getElementById('lf-WARN').onclick=function(){setLogFilter('WARN');};
+  document.getElementById('lf-ERROR').onclick=function(){setLogFilter('ERROR');};
+  // Load server IP
+  api('/api/ip').then(function(r){
+    document.getElementById('serverIp').textContent=r&&r.ip?r.ip:'unknown';
+  });
+});
 
-async function syncWallet(){
-  toast('Syncing wallet...');
-  const r=await api('/api/wallet/sync','POST');
-  if(r?.success) toast('Wallet synced: $'+r.capital_usd.toFixed(2));
-  else toast('Check your API keys on Render');
-  setTimeout(refresh,800);
-}
-
-async function closeAll(){
-  if(!confirm('Close ALL open positions on Delta Exchange now?')) return;
-  const r=await api('/api/close_all','POST');
-  toast('Closed '+(r?.closed||0)+' positions');
-  setTimeout(refresh,1500);
-}
-
-async function saveConfig(){
-  const conf=parseInt(document.getElementById('confSlider').value);
-  const risk=parseFloat(document.getElementById('riskSlider').value)/100;
-  await api('/api/config','POST',{min_confidence:conf,max_risk_pct:risk});
-  toast('Settings saved');
-}
-
-// ── Init ──────────────────────────────────────────────────────────────────────
-refresh();
-setInterval(refresh,5000);
+function poll(){api('/api/status').then(function(s){if(s)render(s);});}
+poll();
+setInterval(poll,4000);
 </script>
 </body>
-</html>"""
+</html>
+
+"""
 
 @app.route("/")
-def index():
-    return Response(DASHBOARD_HTML, mimetype="text/html")
-
+def index(): return Response(DASHBOARD, mimetype="text/html")
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    port=int(os.getenv("PORT",5000))
+    app.run(host="0.0.0.0",port=port,debug=False)
