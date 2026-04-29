@@ -1407,6 +1407,32 @@ class AlphaBot:
         self._log_max        = 200  # keep last 200 log lines
 
         self._sync_wallet(startup=True)
+        self._detect_btc_product_id()
+
+    # ── Auto-detect BTC product ID on startup ────────────────────────────────
+    def _detect_btc_product_id(self):
+        """Find the correct product ID for BTCUSD perpetual on Delta India."""
+        try:
+            d = self.api._get("/v2/products", {
+                "contract_type": "perpetual_futures",
+                "state": "live", "page_size": 50
+            })
+            if d and d.get("success"):
+                for p in d.get("result", []):
+                    sym = str(p.get("symbol","")).upper()
+                    if sym in ("BTCUSD", "BTC_USDT", "BTCUSDT", "BTC-USDT"):
+                        old_id = Cfg.BTC_PRODUCT_ID
+                        Cfg.BTC_PRODUCT_ID = p.get("id", Cfg.BTC_PRODUCT_ID)
+                        self._emit("INFO",
+                            f"BTC Perp: {sym} product_id={Cfg.BTC_PRODUCT_ID} "
+                            f"(was {old_id}) tick={p.get('tick_size')} "
+                            f"min_size={p.get('min_size')}")
+                        return
+                # Log all available perps if BTC not found
+                all_syms = [p.get("symbol") for p in d.get("result", [])]
+                self._emit("WARN", f"BTC perp not found. Available: {all_syms[:10]}")
+        except Exception as e:
+            self._emit("WARN", f"Product ID detection failed: {e}")
 
     # ── Server IP helper ─────────────────────────────────────────────────────
     def _get_server_ip(self) -> str:
@@ -1765,7 +1791,12 @@ class AlphaBot:
         else:
             # Fallback to perpetual
             side      = "buy" if direction == "long" else "sell"
-            contracts = max(1, int(size_usd / price * 1000))
+            # Delta India BTCUSD perp: 1 contract = $1 USD value
+            # Min order is typically 1 contract. size_usd/price*1000 can be < 1
+            contracts = max(1, round(size_usd))  # $1 per contract, min 1
+            self._emit("INFO",
+                f"Placing {side} {contracts} contracts BTCUSD_PERP "
+                f"product_id={Cfg.BTC_PRODUCT_ID} size_usd=${size_usd:.2f}")
             result    = self.api.place_order(Cfg.BTC_PRODUCT_ID, side, contracts)
             if result.get("success"):
                 pos = Position(Cfg.BTC_PRODUCT_ID, direction, price, size_usd,
@@ -1775,7 +1806,10 @@ class AlphaBot:
                 self.status_msg = f"✅ {direction.upper()} PERP @ ${price:,.0f}"
                 self._emit("TRADE", self.status_msg)
             else:
-                self.status_msg = "No option + perp order also failed"
+                self.status_msg = f"Order failed — check /api/products/debug for correct product IDs"
+                self._emit("ERROR", f"Perp order failed for product_id={Cfg.BTC_PRODUCT_ID} "
+                           f"size={contracts} side={'buy' if direction=='long' else 'sell'} "
+                           f"result={result}")
 
     def _manage_positions(self, price: float):
         for pos in self.positions:
@@ -2105,6 +2139,50 @@ def wallet_debug():
         })
     except Exception as e:
         return jsonify({"error": str(e), "api_key_set": bool(bot.api.key)})
+
+
+@app.route("/api/products/debug")
+def products_debug():
+    """Find correct product IDs for BTC perpetual and options on Delta India."""
+    # Get all BTC products
+    perps   = bot.api._get("/v2/products", {"contract_type": "perpetual_futures",
+                                             "state": "live", "page_size": 20})
+    options = bot.api._get("/v2/products", {"contract_type": "call_options,put_options",
+                                             "underlying_asset_symbol": "BTC",
+                                             "state": "live", "page_size": 10})
+    perp_list = []
+    if perps and perps.get("success"):
+        for p in perps.get("result", []):
+            if "BTC" in str(p.get("symbol","")).upper():
+                perp_list.append({
+                    "id":     p.get("id"),
+                    "symbol": p.get("symbol"),
+                    "type":   p.get("contract_type"),
+                    "active": p.get("trading_status"),
+                    "tick":   p.get("tick_size"),
+                    "min_size": p.get("min_size"),
+                })
+
+    opt_list = []
+    if options and options.get("success"):
+        for o in options.get("result", [])[:5]:
+            opt_list.append({
+                "id":      o.get("id"),
+                "symbol":  o.get("symbol"),
+                "strike":  o.get("strike_price"),
+                "expiry":  o.get("settlement_time","")[:10],
+                "mark":    o.get("mark_price"),
+                "oi":      o.get("open_interest"),
+                "bid":     o.get("best_bid_price"),
+                "ask":     o.get("best_ask_price"),
+            })
+
+    return jsonify({
+        "btc_perpetuals":  perp_list,
+        "btc_options_sample": opt_list,
+        "current_cfg_product_id": Cfg.BTC_PRODUCT_ID,
+        "hint": "Check 'id' field of BTCUSD perpetual — update Cfg.BTC_PRODUCT_ID if different"
+    })
 
 
 @app.route("/api/candles/debug")
