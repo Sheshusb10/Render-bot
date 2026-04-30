@@ -453,7 +453,13 @@ class ConfidenceEngine:
         p7 = self._pillar_session(hour)
         pillars["Session"] = p7
 
-        total = sum(v["score"] for v in pillars.values()) + _lead_bonus
+        # ── Binance lead bonus (must be before total) ───────────────
+        bnc_lead   = candles.get("binance_lead", "neutral")
+        lead_bonus = 0
+        if direction == "long"  and bnc_lead == "binance_leading_bull": lead_bonus = 8
+        if direction == "short" and bnc_lead == "binance_leading_bear": lead_bonus = 8
+
+        total = sum(v["score"] for v in pillars.values()) + lead_bonus
         total = min(total, 100)
 
         # ── Detect volatility regime for options strategy ─────────
