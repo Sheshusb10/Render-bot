@@ -6,18 +6,8 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Deploy
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: 13.206.91.12
-          username: ubuntu
-          key: ${{ secrets.SSH_KEY }}
-          port: 22
-          timeout: 60s
-          script: |
-            cd ~/alphabot
-            pkill -f server.py || true
-            wget https://raw.githubusercontent.com/Sheshusb10/Render-bot/main/server.py -O server.py
-            nohup python3 server.py > bot.log 2>&1 &
-            echo "Deployed"
+      - name: Trigger self-update
+        run: |
+          curl -s -X POST http://13.206.91.12:5000/api/self_update \
+            -H "Content-Type: application/json" \
+            -d '{"token":"alphabot2025deploy"}'
