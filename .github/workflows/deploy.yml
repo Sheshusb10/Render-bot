@@ -6,13 +6,15 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Deploy
-        uses: appleboy/ssh-action@master
+        uses: appleboy/ssh-action@v1.0.3
         with:
           host: 13.206.91.12
           username: ubuntu
           key: ${{ secrets.SSH_KEY }}
+          port: 22
+          timeout: 60s
           script: |
             cd ~/alphabot
             pkill -f server.py || true
