@@ -453,7 +453,7 @@ class ConfidenceEngine:
         p7 = self._pillar_session(hour)
         pillars["Session"] = p7
 
-        total = sum(v["score"] for v in pillars.values()) + lead_bonus
+        total = sum(v["score"] for v in pillars.values()) + _lead_bonus
         total = min(total, 100)
 
         # ── Detect volatility regime for options strategy ─────────
@@ -1468,6 +1468,7 @@ def api_debug():
     except Exception as e: out["ticker_err"]=str(e)
     bal,raw,err=bot.delta.balance(); out["balance"]=bal; out["err"]=err
     return jsonify(out)
+
 
 
 
