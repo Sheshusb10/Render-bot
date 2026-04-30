@@ -7,7 +7,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - name: Deploy via SSH
+      - name: Deploy
         uses: appleboy/ssh-action@master
         with:
           host: 13.206.91.12
@@ -18,3 +18,4 @@ jobs:
             pkill -f server.py || true
             wget https://raw.githubusercontent.com/Sheshusb10/Render-bot/main/server.py -O server.py
             nohup python3 server.py > bot.log 2>&1 &
+            echo "Deployed"
