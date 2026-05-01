@@ -1085,6 +1085,7 @@ if C.KEY and C.SECRET:
     threading.Thread(target=lambda:get_bot("env").connect(C.KEY,C.SECRET),daemon=True).start()
 
 intel.start(bots)
+_auto_setup()  # runs on import too (for gunicorn/production)
 
 @app.after_request
 def _h(r):
@@ -1302,8 +1303,20 @@ _DASH = _b64.b64decode("PCFET0NUWVBFIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KPGhlYWQ+Cjxt
 @app.route("/login")
 def index(): return Response(_DASH, mimetype="text/html")
 
+def _auto_setup():
+    """Auto-create admin on first boot if no users exist. Never wipes existing users."""
+    if not um.db["users"]:
+        pw = os.getenv("ADMIN_PASSWORD","Admin123")
+        ok,_ = um.setup_admin("admin", pw)
+        if ok:
+            log.info(f"✅ Auto-created admin | password: {pw}")
+            for _ in range(4):
+                code,_ = um.gen_invite()
+                log.info(f"📧 Invite code: {code}")
+
 if __name__ == "__main__":
     if "--setup" in sys.argv:
         code,_=um.gen_invite(); print(f"Invite: {code}"); sys.exit()
+    _auto_setup()
     port=int(os.getenv("PORT",5000))
     app.run(host="0.0.0.0",port=port,debug=False)
