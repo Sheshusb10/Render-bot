@@ -57,13 +57,16 @@ class C:
     PRIME_SHORT= [13,14,15,16]     # US open + data window
 
     # ── Infrastructure ─────────────────────────────────────────────
-    STATE  = "/tmp/ab.json"
+    STATE  = os.path.expanduser("~/alphabot/data/ab.json")
     GITHUB = "https://raw.githubusercontent.com/Sheshusb10/Render-bot/main/server.py"
     DEPLOY_TOKEN = os.getenv("DEPLOY_TOKEN","alphabot2025deploy")
 
 MAX_USERS  = 5
 BOT_SECRET = os.getenv("BOT_SECRET", secrets.token_hex(32))
-USERS_FILE = "/tmp/ab_users.json"
+# Ensure data directory exists
+_DATA_DIR = os.path.expanduser("~/alphabot/data")
+os.makedirs(_DATA_DIR, exist_ok=True)
+USERS_FILE = os.path.join(_DATA_DIR, "ab_users.json")
 
 def pid_int(v):
     try: return int(v)
@@ -120,7 +123,7 @@ um=UserManager(); bots={}
 def get_bot(uid):
     if uid not in bots:
         b=Bot()
-        b._sf=f"/tmp/ab_{uid}.json"   # isolated state per user
+        b._sf=os.path.join(_DATA_DIR, f"ab_{uid}.json")  # isolated state per user
         bots[uid]=b
     return bots[uid]
 
