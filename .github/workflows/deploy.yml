@@ -8,6 +8,14 @@ jobs:
     steps:
       - name: Trigger self-update
         run: |
-          curl -s -X POST http://13.206.91.12:5000/api/self_update \
+          response=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://13.206.91.12:5000/api/self_update \
             -H "Content-Type: application/json" \
-            -d '{"token":"alphabot2025deploy"}'
+            -d '{"token":"alphabot2025deploy"}')
+          echo "Response: $response"
+          if [ "$response" = "200" ]; then
+            echo "Self-update triggered successfully"
+          else
+            echo "Self-update endpoint not available (old server running)"
+            echo "Manual update needed via Lightsail browser SSH"
+            exit 0
+          fi
