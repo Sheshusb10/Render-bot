@@ -325,10 +325,26 @@ PCOLS={"Regime":"#3b82f6","MTF Align":"#00b386","RSI":"#f59e0b","MACD":"#8b5cf6"
        "Volatility":"#ec4899","Volume":"#e74c3c","Session":"#14b8a6"}
 
 def score(candles,direction,hour):
+    """
+    TOP-DOWN TRADING LOGIC (how a real trader thinks):
+    Daily/4H → sets DIRECTION
+    1H       → confirms BIAS
+    5m/1m    → finds ENTRY POINT only
+    
+    5m ADX being low does NOT block a trade when higher timeframes confirm trend.
+    """
     c5m=candles.get("5m",[]); c1m=candles.get("1m",[]); c15m=candles.get("15m",[])
     if len(c5m)<30:
         return {"total":0,"veto":f"need_30_have_{len(c5m)}","regime":"UNKNOWN",
                 "strategy":"WAIT","pillars":{},"vol_regime":"UNKNOWN","adx":0,"bw":0,"atr_pct":0,"div":False}
+
+    # Get macro trends (set direction)
+    h1_trend =candles.get("h1_trend","neutral")
+    h4_trend =candles.get("h4_trend","neutral")
+    d_trend  =candles.get("d_trend","neutral")
+    macro_bull = sum(1 for t in [h1_trend,h4_trend,d_trend] if t=="bull")
+    macro_bear = sum(1 for t in [h1_trend,h4_trend,d_trend] if t=="bear")
+    macro_bias = "bull" if macro_bull>=2 else "bear" if macro_bear>=2 else "neutral"
     cl=[c["c"] for c in c5m]; hi=[c["h"] for c in c5m]
     lo=[c["l"] for c in c5m]; vo=[c["v"] for c in c5m]
     cl1=[c["c"] for c in c1m]  if len(c1m) >=20 else cl
@@ -337,7 +353,8 @@ def score(candles,direction,hour):
     lo15=[c["l"] for c in c15m] if len(c15m)>=21 else lo
     price=cl[-1]; p={}
 
-    # P1: Regime (25pts) — STRONG requires ALL confirmations
+    # P1: Regime (25pts)
+    # When macro (Daily+4H+1H) confirms direction, 5m regime gets a boost
     adx_v,pdi,ndi=adx_calc(hi,lo,cl)
     e8=ema(cl,8)[-1]; e21=ema(cl,21)[-1]; e55=ema(cl,55)[-1] if len(cl)>=55 else cl[0]
     r5=rsi(cl)
@@ -345,10 +362,14 @@ def score(candles,direction,hour):
     bull        =price>e8>e21       and adx_v>18 and pdi>ndi
     strong_bear =price<e8<e21<e55   and adx_v>25 and ndi>pdi and r5<45
     bear        =price<e8<e21       and adx_v>18 and ndi>pdi
-    if   direction=="long"  and strong_bull: rs,rd=25,"STRONG_BULL"
-    elif direction=="long"  and bull:        rs,rd=17,"Bull"
-    elif direction=="short" and strong_bear: rs,rd=25,"STRONG_BEAR"
-    elif direction=="short" and bear:        rs,rd=17,"Bear"
+
+    if   direction=="long"  and strong_bull: rs,rd=25,"STRONG_BULL ✓"
+    elif direction=="long"  and bull:        rs,rd=17,"Bull ✓"
+    elif direction=="short" and strong_bear: rs,rd=25,"STRONG_BEAR ✓"
+    elif direction=="short" and bear:        rs,rd=17,"Bear ✓"
+    # KEY FIX: If macro is aligned, give regime score even with low 5m ADX
+    elif direction=="long"  and macro_bias=="bull": rs,rd=14,"Macro bull (5m flat)"
+    elif direction=="short" and macro_bias=="bear": rs,rd=14,"Macro bear (5m flat)"
     elif adx_v>15:                           rs,rd=8, "Weak trend"
     else:                                    rs,rd=2, "No trend"
     p["Regime"]={"score":rs,"max":25,"detail":rd}
@@ -440,15 +461,39 @@ def score(candles,direction,hour):
     else:             regime="NEUTRAL"
     vol_regime="LOW" if bw<1.5 and adx_v<18 else "HIGH" if bw>5 or atr_pct>0.8 else "NORMAL"
 
-    # Hard vetoes (non-negotiable per autopsy)
+    # Hard vetoes
     veto=""
     if hour in C.DEAD_ZONE: veto="dead_zone"
-    if adx_v<C.ADX_MIN and vol_regime=="NORMAL": veto=f"ADX={adx_v}<{C.ADX_MIN}"
-    if direction=="long"  and r5<35 and not strong_bull: veto="RSI<35_downtrend_trap"
-    if direction=="short" and r5>65 and not strong_bear: veto="RSI>65_uptrend_trap"
+
+    # ADX veto logic — top-down approach:
+    # If 2+ macro timeframes confirm direction → NO ADX requirement
+    # If only 1H confirms → ADX floor = 12 (very relaxed)
+    # If no macro confirmation → ADX floor = 22 (strict)
+    macro_confirms = (macro_bias=="bull" and direction=="long") or                      (macro_bias=="bear" and direction=="short")
+    h1_confirms = (h1_trend=="bull" and direction=="long") or                   (h1_trend=="bear" and direction=="short")
+
+    if macro_confirms:
+        adx_floor = 0   # NO ADX requirement when Daily+4H+1H agree
+    elif h1_confirms:
+        adx_floor = 12  # relaxed when only 1H confirms
+    else:
+        adx_floor = C.ADX_MIN  # strict 22 when no confirmation
+
+    if adx_v<adx_floor and vol_regime=="NORMAL":
+        veto=f"ADX={adx_v:.0f}<{adx_floor}"
+
+    # RSI trap vetoes — always apply regardless of macro
+    if direction=="long"  and r5<35 and not strong_bull and not macro_confirms:
+        veto="RSI<35_downtrend_trap"
+    if direction=="short" and r5>65 and not strong_bear and not macro_confirms:
+        veto="RSI>65_uptrend_trap"
+    # Divergence always overrides ADX veto
+    if p.get("MACD",{}).get("div") and "ADX" in veto: veto=""
 
     if veto: strategy="WAIT"
-    elif regime=="SIDEWAYS" and vol_regime in ("LOW","NORMAL") and bw<1.5: strategy="STRADDLE"
+    elif macro_confirms and total>=50: strategy="SWING"  # macro aligned = hold longer
+    elif regime=="SIDEWAYS" and vol_regime in ("LOW","NORMAL") and bw<1.5 and not macro_confirms:
+        strategy="STRADDLE"
     elif div: strategy="SWING"
     elif vol_regime=="HIGH" and total>=C.CONF_TRADE: strategy="SCALP"
     elif total>=C.CONF_TRADE and regime in ("STRONG_BULL","STRONG_BEAR"): strategy="SWING"
@@ -456,9 +501,13 @@ def score(candles,direction,hour):
     else: strategy="WAIT"
 
     if strategy=="STRADDLE": fd="straddle"
-    elif total<C.CONF_TRADE or veto: fd="wait"
-    elif direction=="long"  and regime in ("BULL","STRONG_BULL"):  fd="long"
-    elif direction=="short" and regime in ("BEAR","STRONG_BEAR"):  fd="short"
+    elif veto: fd="wait"
+    # Macro confirmed — enter at lower confidence (50 vs 62)
+    elif macro_confirms and total>=50:
+        fd="long" if direction=="long" else "short"
+    elif total<C.CONF_TRADE: fd="wait"
+    elif direction=="long"  and regime in ("BULL","STRONG_BULL","NEUTRAL"):  fd="long"
+    elif direction=="short" and regime in ("BEAR","STRONG_BEAR","NEUTRAL"):  fd="short"
     else: fd="wait"
 
     return {"total":total,"pillars":p,"veto":veto,"regime":regime,"volatility_regime":vol_regime,
@@ -790,28 +839,59 @@ class Bot:
         d5m=_parse(self.api.candles("5m")); b5m=bnc("5m")
         d1m=_parse(self.api.candles("1m")); b1m=bnc("1m")
         d15m=_parse(self.api.candles("15m",60))
-        # 1H candles — the REAL trend direction
+        # Multi-timeframe: 1H trend + 4H macro + Daily macro
         d1h=_parse(self.api.candles("1h",48) if hasattr(self.api,"candles") else [])
-        b1h=bnc("1h",48)
+        b1h=bnc("1h",48); b4h=bnc("4h",30); b1d=bnc("1d",14)
         c5m=d5m if len(d5m)>=55 else b5m
         c1m=d1m if len(d1m)>=20 else b1m
         c1h=d1h if len(d1h)>=24 else b1h
+        c4h=b4h; c1d=b1d
         bnc_lead="neutral"
         if len(b1m)>=16 and len(d1m)>=16:
             diff=rsi([c["c"] for c in b1m])-rsi([c["c"] for c in d1m])
             if diff>8:   bnc_lead="binance_leading_bull"
             elif diff<-8: bnc_lead="binance_leading_bear"
-        # 1H trend: what the REAL market is doing
+        # 1H trend
         h1_trend="neutral"
         if len(c1h)>=21:
             cl1h=[c["c"] for c in c1h]; hi1h=[c["h"] for c in c1h]; lo1h=[c["l"] for c in c1h]
             e8h=ema(cl1h,8)[-1]; e21h=ema(cl1h,21)[-1]
             adx1h,pdi1h,ndi1h=adx_calc(hi1h,lo1h,cl1h)
-            p=cl1h[-1]
-            if p>e8h>e21h and adx1h>18 and pdi1h>ndi1h: h1_trend="bull"
-            elif p<e8h<e21h and adx1h>18 and ndi1h>pdi1h: h1_trend="bear"
-            log.info(f"1H trend: {h1_trend} | EMA8={e8h:.0f} EMA21={e21h:.0f} ADX={adx1h:.1f}")
-        return {"5m":c5m,"1m":c1m,"15m":d15m,"1h":c1h,"binance_lead":bnc_lead,"h1_trend":h1_trend}
+            ph=cl1h[-1]
+            if ph>e8h>e21h and adx1h>15 and pdi1h>ndi1h: h1_trend="bull"
+            elif ph<e8h<e21h and adx1h>15 and ndi1h>pdi1h: h1_trend="bear"
+
+        # 4H macro trend — stronger signal
+        h4_trend="neutral"
+        if len(c4h)>=14:
+            cl4h=[c["c"] for c in c4h]; hi4h=[c["h"] for c in c4h]; lo4h=[c["l"] for c in c4h]
+            e8_4h=ema(cl4h,8)[-1]; e21_4h=ema(cl4h,14)[-1]
+            adx4h,pdi4h,ndi4h=adx_calc(hi4h,lo4h,cl4h)
+            p4=cl4h[-1]
+            if p4>e8_4h>e21_4h and pdi4h>ndi4h: h4_trend="bull"
+            elif p4<e8_4h<e21_4h and ndi4h>pdi4h: h4_trend="bear"
+
+        # Daily macro trend — biggest picture
+        d_trend="neutral"
+        if len(c1d)>=8:
+            cld=[c["c"] for c in c1d]; hid=[c["h"] for c in c1d]; lod=[c["l"] for c in c1d]
+            e8d=ema(cld,7)[-1]; e21d=ema(cld,min(len(cld),14))[-1]
+            pd=cld[-1]
+            if pd>e8d>e21d: d_trend="bull"
+            elif pd<e8d<e21d: d_trend="bear"
+
+        # Combined trend strength
+        trend_votes={"bull":0,"bear":0}
+        for t in [h1_trend,h4_trend,d_trend]:
+            if t in trend_votes: trend_votes[t]+=1
+        if trend_votes["bull"]>=2: h1_trend="bull"    # majority bull
+        elif trend_votes["bear"]>=2: h1_trend="bear"  # majority bear
+        else: h1_trend="neutral"
+
+        log.info(f"Trends: 1H={h1_trend} 4H={h4_trend} D={d_trend} → combined={h1_trend}")
+        return {"5m":c5m,"1m":c1m,"15m":d15m,"1h":c1h,
+                "binance_lead":bnc_lead,"h1_trend":h1_trend,
+                "h4_trend":h4_trend,"d_trend":d_trend}
 
     def scan(self):
         self.scan_n+=1; self.next_scan=(datetime.now(timezone.utc)+timedelta(seconds=C.SCAN)).isoformat()
@@ -936,7 +1016,16 @@ class Bot:
         lots=min(self.lot_size,max_affordable)
         r=self.api.order("buy" if direction=="long" else "sell",lots)
         if not r.get("success"): self.emit("ERROR",f"Order failed: {r.get('error','?')}"); return
-        dyn_tp,dyn_sl=atr_tp_sl(best.get("atr_pct",0))
+        # SWING trades get wider targets (1H ATR, not 5m ATR)
+        # 5m ATR is tiny — swing trades need room to breathe
+        atr_pct=best.get("atr_pct",0)
+        if strat=="SWING":
+            # Use 3x the 5m ATR as minimum, targeting 1.5-2% moves
+            swing_atr=max(atr_pct*3, 0.015)
+            dyn_tp=min(swing_atr*2.0, 0.04)   # target 1.5-4%
+            dyn_sl=min(swing_atr*0.8, 0.012)  # tight stop 0.8-1.2%
+        else:
+            dyn_tp,dyn_sl=atr_tp_sl(atr_pct)
         sp=self.price*(1-dyn_sl if direction=="long" else 1+dyn_sl)
         tp=self.price*(1+dyn_tp if direction=="long" else 1-dyn_tp)
         self.api.bracket("sell" if direction=="long" else "buy",lots,sp,tp)
