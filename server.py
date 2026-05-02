@@ -1289,8 +1289,12 @@ def api_self_update():
             if r.status_code!=200: return
             sf=os.path.abspath(__file__)
             with open(sf,"w") as f: f.write(r.text)
-            log.info("Self-update done. Restarting...")
+            log.info("Self-update done. Restarting in 3s...")
             time.sleep(3)
+            # Kill port before restart to avoid "Address already in use"
+            import subprocess
+            subprocess.run(["fuser","-k","5000/tcp"],capture_output=True,timeout=5)
+            time.sleep(2)
             os.execv(sys.executable,[sys.executable,sf]+sys.argv[1:])
         except Exception as e: log.error(f"update: {e}")
     threading.Thread(target=do_update,daemon=True).start()
