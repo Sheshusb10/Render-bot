@@ -1451,4 +1451,5 @@ if __name__ == "__main__":
     if "--setup" in sys.argv:
         code,_=um.gen_invite(); print(f"Invite: {code}"); sys.exit()
     port=int(os.getenv("PORT",5000))
-    app.run(host="0.0.0.0",port=port,debug=False)
+    # use_reloader=False prevents double-process on startup
+    app.run(host="0.0.0.0",port=port,debug=False,use_reloader=False,threaded=True)
