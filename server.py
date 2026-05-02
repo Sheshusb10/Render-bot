@@ -72,20 +72,33 @@ def pid_int(v):
 
 # ═══ USER MANAGER — never deletes users ══════════════════════════
 class UserManager:
+    BACKUP = os.path.expanduser("~/alphabot/users_backup.json")
+
     def __init__(self):
         self._lk=threading.Lock()
         self.db=self._load()
 
     def _load(self):
-        try:
-            if os.path.exists(USERS_FILE):
-                return json.load(open(USERS_FILE))
-        except: pass
+        # Try primary first
+        for path in [USERS_FILE, self.BACKUP]:
+            try:
+                if os.path.exists(path):
+                    data = json.load(open(path))
+                    if data.get("users"):  # only use if has actual users
+                        log.info(f"Loaded users from {path}: {len(data['users'])} users")
+                        return data
+            except Exception as e:
+                log.warning(f"Could not load {path}: {e}")
         return {"users":{},"invites":[]}
 
     def _save(self):
-        try: json.dump(self.db,open(USERS_FILE,"w"),indent=2)
-        except Exception as e: log.warning(f"save users: {e}")
+        """Save to BOTH locations — users are never lost."""
+        for path in [USERS_FILE, self.BACKUP]:
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                json.dump(self.db, open(path,"w"), indent=2)
+            except Exception as e:
+                log.warning(f"save users to {path}: {e}")
 
     def _hash(self,pw):
         return hashlib.pbkdf2_hmac("sha256",pw.encode(),b"alphabot2025",200000).hex()
@@ -132,15 +145,31 @@ class UserManager:
 um=UserManager(); bots={}
 
 def _auto_setup():
-    """Auto-create admin if no users exist. NEVER wipes existing users."""
-    if not um.db["users"]:
-        pw=os.getenv("ADMIN_PASSWORD","Admin123")
-        ok,_=um.setup_admin("admin",pw)
-        if ok:
-            log.info(f"Auto-created admin (password: {pw})")
-            for _ in range(4):
-                code,_=um.gen_invite()
-                log.info(f"Invite: {code}")
+    """
+    Auto-create admin ONLY if NO users exist anywhere.
+    Checks both primary and backup files before creating.
+    NEVER overwrites existing users.
+    """
+    # Check primary
+    for path in [USERS_FILE, um.BACKUP]:
+        try:
+            if os.path.exists(path):
+                data = json.load(open(path))
+                if data.get("users"):
+                    # Users exist — restore if needed and return
+                    if not um.db["users"]:
+                        um.db = data
+                        log.info(f"Restored {len(data['users'])} users from {path}")
+                    return
+        except: pass
+    # Only reach here if NO users found anywhere
+    pw=os.getenv("ADMIN_PASSWORD","Admin123")
+    ok,_=um.setup_admin("admin",pw)
+    if ok:
+        log.info(f"First run: created admin (password: {pw})")
+        for _ in range(4):
+            code,_=um.gen_invite()
+            log.info(f"Invite code: {code}")
 
 def get_bot(uid):
     if uid not in bots:
@@ -1090,6 +1119,7 @@ if C.KEY and C.SECRET:
 
 _auto_setup()
 intel.start(bots)
+_auto_setup()  # auto-create admin if needed
 
 @app.after_request
 def _h(r):
