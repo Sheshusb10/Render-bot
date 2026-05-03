@@ -242,13 +242,25 @@ class Intel:
 
     def ask_claude(self, trades, current_params):
         """
-        Ask Claude to analyze trade history and suggest parameter improvements.
+        Ask Claude to analyze trade history + bot logs and suggest improvements.
         Runs every 6 hours. Uses Anthropic API directly.
         """
         api_key = os.getenv("ANTHROPIC_API_KEY","")
-        if not api_key: return None
-        if len(trades) < 10:
-            log.info("Claude: need 10+ trades to analyze"); return None
+        if not api_key:
+            log.info("Claude: no API key set"); return None
+        if len(trades) < 3:
+            log.info(f"Claude: need 3+ trades, have {len(trades)}"); return None
+
+        # Read recent bot logs for error patterns
+        recent_logs = []
+        try:
+            log_file = os.path.expanduser("~/alphabot/bot.log")
+            with open(log_file) as lf:
+                lines = lf.readlines()
+                # Get last 50 lines with errors/warnings/trades
+                recent_logs = [l.strip() for l in lines[-100:]
+                    if any(x in l for x in ["ERROR","WARN","TRADE","veto","failed","HALT"])][-20:]
+        except: pass
         try:
             # Build trade summary
             wins  = [t for t in trades if t.get("won")]
@@ -291,13 +303,17 @@ Current parameters:
 Last 10 trades (most recent first):
 {chr(10).join(f"  {t.get('time','?')[:16]} {t.get('side','?')} {t.get('sym','?')} pnl=${t.get('pnl',0):+.4f} reason={t.get('reason','?')}" for t in sorted(trades,key=lambda x:x.get('time',''))[-10:][::-1])}
 
+Recent bot errors/warnings:
+{chr(10).join(recent_logs) if recent_logs else "None"}
+
 Respond ONLY with a JSON object (no markdown, no explanation):
 {{
-  "conf_base": <integer 48-75, suggested confidence threshold>,
+  "conf_base": <integer 45-75, suggested confidence threshold>,
   "dead_zone_utc": [<hours to avoid, list of integers 0-23>],
   "prime_long_utc": [<best hours for calls, list of integers>],
-  "insight": "<one sentence: what pattern you see>",
-  "action": "<one sentence: what to change and why>"
+  "insight": "<one sentence: what pattern you see in the trades and logs>",
+  "action": "<one sentence: the single most important change to make>",
+  "log_issue": "<one sentence: any critical error pattern spotted in logs, or null>"
 }}"""
 
             r = requests.post("https://api.anthropic.com/v1/messages",
@@ -342,9 +358,15 @@ Respond ONLY with a JSON object (no markdown, no explanation):
                 C.PRIME_LONG = new_pl
                 changed.append(f"prime={new_pl}")
         if changed:
-            log.info(f"Claude applied: {', '.join(changed)}")
+            log.info(f"🤖 Claude applied: {', '.join(changed)}")
+        log_issue = suggestions.get("log_issue","")
+        if log_issue and log_issue != "null":
+            log.warning(f"🤖 Claude log issue: {log_issue}")
+        log.info(f"🤖 Insight: {suggestions.get('insight','')}")
+        log.info(f"🤖 Action:  {suggestions.get('action','')}")
         self.data["last_claude_insight"] = suggestions.get("insight","")
         self.data["last_claude_action"]  = suggestions.get("action","")
+        self.data["last_claude_log_issue"] = log_issue
         self.data["last_claude_update"]  = datetime.now(timezone.utc).isoformat()
         self._save()
 
@@ -1634,6 +1656,24 @@ def _auto_reconnect_all():
     time.sleep(5)  # wait for Flask to start
     for uid in um.db.get("users",{}).keys():
         get_bot(uid)  # triggers auto-connect if keys saved
+    # Run Claude analysis immediately if trades exist and API key set
+    time.sleep(10)
+    if os.getenv("ANTHROPIC_API_KEY",""):
+        all_trades=[t for b in bots.values()
+                   for t in b.trades if t.get("won") is not None]
+        if len(all_trades)>=3:
+            log.info(f"Running startup Claude analysis on {len(all_trades)} trades...")
+            params={"capital":max((b.capital for b in bots.values()),default=0),
+                    "conf_base":C.CONF_BASE,"dead_zone":C.DEAD_ZONE,
+                    "prime_long":C.PRIME_LONG}
+            suggestions=intel.ask_claude(all_trades,params)
+            if suggestions:
+                intel.apply_claude_suggestions(suggestions)
+                log.info(f"Startup insight: {suggestions.get('insight','')}")
+        else:
+            log.info(f"Claude: waiting for more trades ({len(all_trades)}/3 so far)")
+    else:
+        log.info("Claude learning: set ANTHROPIC_API_KEY to enable")
 threading.Thread(target=_auto_reconnect_all,daemon=True).start()
 
 @app.after_request
