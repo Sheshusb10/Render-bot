@@ -943,21 +943,21 @@ def get_market_brain(candles):
 
     # ── FUNDING RATE VETO ─────────────────────────────────────────
     # This is the single most powerful filter from real BTC data
+    # Confidence threshold — must be defined before funding veto uses it
+    conf_needed=C.CONF_MACRO if macro_bias!="neutral" else C.CONF_BASE
+
     funding_bias=brain.get("funding_bias","neutral")
     if direction=="long" and funding_bias=="strong_bear":
-        # Funding >0.10%: longs extremely crowded, high chance of flush
         conviction=max(0,conviction-25)
-        brain["veto"]="funding_extreme_long_crowding" if conviction<conf_needed else ""
+        if conviction<conf_needed: brain["veto"]="funding_crowded_longs"
     elif direction=="long" and funding_bias=="lean_bear":
-        # Funding 0.05-0.10%: longs crowded, reduce conviction
         conviction=max(0,conviction-12)
     elif direction=="short" and funding_bias=="strong_bull":
         conviction=max(0,conviction-25)
-        brain["veto"]="funding_extreme_short_crowding" if conviction<conf_needed else ""
+        if conviction<conf_needed: brain["veto"]="funding_crowded_shorts"
     elif direction=="short" and funding_bias=="lean_bull":
         conviction=max(0,conviction-12)
     elif direction=="long" and funding_bias in ("lean_bull","strong_bull"):
-        # Funding negative = shorts crowded = boost long conviction
         conviction=min(100,conviction+8)
     elif direction=="short" and funding_bias in ("lean_bear","strong_bear"):
         conviction=min(100,conviction+8)
@@ -983,10 +983,9 @@ def get_market_brain(candles):
     if direction=="short" and r5>68 and macro_bias!="bear":
         brain["veto"]="rsi_trap_short"; return brain
 
-    # Threshold
-    conf_needed=C.CONF_MACRO if macro_bias!="neutral" else C.CONF_BASE
+    # Final threshold check
     if conviction<conf_needed:
-        brain["veto"]=f"low_conf_{conviction}<{conf_needed}"; return brain
+        brain["veto"]=f"entry_conv={conviction}_need={conf_needed}"; return brain
 
     # Lot scaling: 1x→2x→3x based on conviction
     if conviction>=80: scale=3
@@ -1000,7 +999,8 @@ def get_market_brain(candles):
                   "opt_type":"call" if direction=="long" else "put",
                   "opt_conviction":opt_conviction,"scale":scale,
                   "tf_bull":tf_bull_count,"tf_bear":tf_bear_count,
-                  "tf_total":len(all_trends)})
+                  "tf_total":len(all_trends),
+                  "div":div_long if direction=="long" else div_short})
     return brain
 
 # ═══ BOT ══════════════════════════════════════════════════════════
@@ -1043,16 +1043,29 @@ class Bot:
         try:
             peak={}
             if self.opts: peak={k:v for k,v in self.opts._peak.items()}
-            json.dump({"start_cap":self.start_cap,"day_start":self.day_start,
+            state={"start_cap":self.start_cap,"day_start":self.day_start,
                 "halted":self.halted,"halt_msg":self.halt_msg,
                 "total_tr":self.total_tr,"wins":self.wins,
-                "trades":self.trades[-200:],"stops":list(self._stops),
+                "trades":self.trades[-500:],"stops":list(self._stops),
                 "consec":self._consec,
                 "circuit":self._circuit.isoformat() if self._circuit else None,
                 "last_close":self._last_close.isoformat() if self._last_close else None,
                 "peak":peak,"lot_size":self.lot_size,"max_daily":self.max_daily,
-                "mode":self.mode},
-                open(self._sf,"w"))
+                "mode":self.mode}
+            json.dump(state,open(self._sf,"w"))
+            # Append closed trades to permanent tradelog
+            trade_log=self._sf.replace("bot_","tradelog_")
+            try:
+                existing=[]
+                try: existing=json.load(open(trade_log))
+                except: pass
+                existing_times={t.get("time","") for t in existing}
+                new_closed=[t for t in self.trades
+                    if t.get("exit") is not None and t.get("time","") not in existing_times]
+                if new_closed:
+                    existing.extend(new_closed)
+                    json.dump(existing[-2000:],open(trade_log,"w"))
+            except Exception as te: log.warning(f"tradelog: {te}")
         except Exception as e: log.warning(f"save: {e}")
 
     def load(self):
@@ -1242,7 +1255,7 @@ class Bot:
         self._last_was_win=won  # track for cooldown
         if won:
             self._consec=0; self.wins+=1
-            self.emit("INFO",f"✅ WIN streak broken — confidence restored")
+            self.emit("INFO",f"✅ WIN — confidence good")
         else:
             self._consec+=1
             self.emit("WARN",f"❌ Loss #{self._consec} | cooling {C.LOSS_COOLDOWN_MINS}m")
@@ -1657,8 +1670,6 @@ if C.KEY and C.SECRET:
 
 _auto_setup()
 intel.start(bots)
-_auto_setup()  # auto-create admin if needed
-
 # Auto-reconnect all users with saved keys
 def _auto_reconnect_all():
     time.sleep(5)  # wait for Flask to start
