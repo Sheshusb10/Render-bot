@@ -188,18 +188,28 @@ def get_bot(uid):
         b._sf=os.path.join(_DATA,f"bot_{uid}.json")
         bots[uid]=b
         # Auto-reconnect if saved keys exist
-        key_file=os.path.join(_DATA,f"keys_{uid}.json")
-        if os.path.exists(key_file):
-            try:
-                import base64 as b64
-                kd=json.load(open(key_file))
-                k=b64.b64decode(kd["k"]).decode()
-                s=b64.b64decode(kd["s"]).decode()
-                threading.Thread(target=lambda:b.connect(k,s),daemon=True).start()
-                log.info(f"Auto-connecting user {uid[:6]}...")
-            except Exception as e:
-                log.warning(f"Auto-connect failed: {e}")
+        _try_auto_connect(uid, b)
     return bots[uid]
+
+def _try_auto_connect(uid, b):
+    """Load saved API keys and reconnect silently."""
+    key_file=os.path.join(_DATA,f"keys_{uid}.json")
+    if not os.path.exists(key_file): return
+    try:
+        import base64 as b64
+        kd=json.load(open(key_file))
+        k=b64.b64decode(kd["k"]).decode()
+        s=b64.b64decode(kd["s"]).decode()
+        if k and s:
+            def _connect():
+                result=b.connect(k,s)
+                if result.get("success"):
+                    log.info(f"Auto-connected user {uid[:6]} balance=${result.get('balance',0):.2f}")
+                else:
+                    log.warning(f"Auto-connect failed for {uid[:6]}: {result.get('message','?')}")
+            threading.Thread(target=_connect,daemon=True).start()
+    except Exception as e:
+        log.warning(f"Auto-connect error {uid[:6]}: {e}")
 
 # ═══ SHARED INTELLIGENCE — learns from all users ══════════════════
 class Intel:
@@ -652,9 +662,10 @@ def get_market_brain(candles):
     brain["regime"]=regime
 
     hour=datetime.now(timezone.utc).hour
-    # Dead zone veto
-    if hour in C.DEAD_ZONE:
-        brain["veto"]="dead_zone"; return brain
+    # Session quality modifier (not a hard veto — just reduces conviction)
+    # Real filtering happens via entry quality (RSI, BB position)
+    session_penalty = 0
+    if hour in C.DEAD_ZONE: session_penalty = 15  # reduce conviction, don't block
 
     # ── STRADDLE DECISION ──────────────────────────────────────────
     # Straddle when: BB squeeze (coiled) + low ADX + no clear macro
@@ -732,6 +743,9 @@ def get_market_brain(candles):
             return brain
         else:
             brain["veto"]="no_clear_direction"; return brain
+
+    # Apply session penalty
+    conviction = max(0, conviction - session_penalty)
 
     brain["entry_quality"]={
         "rsi":r5,"bb_pos":round(price_bb_pos,2),
@@ -1271,7 +1285,9 @@ class Bot:
 app = Flask(__name__)
 app.secret_key = BOT_SECRET
 app.config.update(SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE="Lax",
-    PERMANENT_SESSION_LIFETIME=timedelta(days=30))
+    SESSION_COOKIE_SECURE=False,  # allow HTTP (not just HTTPS)
+    SESSION_COOKIE_NAME="alphabot_session",
+    PERMANENT_SESSION_LIFETIME=timedelta(days=90))  # 90 days = never expires practically
 CORS(app,supports_credentials=True)
 
 if C.KEY and C.SECRET:
@@ -1355,7 +1371,12 @@ def auth_setup():
 @app.route("/api/status")
 @app.route("/api/bot/status")
 @login_req
-def api_status(): return jsonify(get_bot(session["uid"]).state())
+def api_status():
+    uid=session["uid"]; b=get_bot(uid)
+    # Auto-reconnect if disconnected but keys saved
+    if not b.connected:
+        _try_auto_connect(uid, b)
+    return jsonify(b.state())
 
 @app.route("/api/connect",methods=["POST","OPTIONS"])
 @login_req
