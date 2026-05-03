@@ -59,9 +59,9 @@ class C:
     ADX_MIN      = 22
 
     # Session bias (from backtesting)
-    DEAD_ZONE   = [2,3,4,5,6]
-    PRIME_LONG  = [0,1,7,8,9,21,22,23]
-    PRIME_SHORT = [13,14,15,16]
+    DEAD_ZONE   = [20,21,22,23,0,1]  # UTC 8pm-1am = IST 1:30am-6:30am (true dead zone)
+    PRIME_LONG  = [2,3,7,8,9,10,11]  # UTC 2-5am = IST 7:30-10:30am (India morning)
+    PRIME_SHORT = [13,14,15,16]  # UTC 1-4pm = IST 6:30-9:30pm (NY open, evening India)
 
     DEPLOY_TOKEN = os.getenv("DEPLOY_TOKEN","alphabot2025deploy")
     GITHUB = "https://raw.githubusercontent.com/Sheshusb10/Render-bot/main/server.py"
