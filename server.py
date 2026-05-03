@@ -49,13 +49,25 @@ class C:
     OPT_MAX  = 0.15  # max 15% capital per option
     OPT_EXP  = 180   # exit 3h before expiry
 
-    # Account guards
+    # ── RISK MANAGEMENT RULES (from proven trading principles) ──────
+    # Rule 1: Risk 1% of capital per trade MAX
+    RISK_PER_TRADE = 0.01      # 1% per trade — non-negotiable
+    # Rule 2: Daily loss limit 3% — shut down after
+    DAILY_LOSS_LIMIT = 0.03    # 3% daily max loss
+    # Rule 3: Weekly loss limit 8% — halt trading
+    WEEKLY_LOSS_LIMIT = 0.08   # 8% weekly max loss
+    # Rule 4: After losing trade — 4 hour cooling period
+    LOSS_COOLDOWN_MINS = 60    # 60min after loss (4hrs too long for bot)
+    # Rule 5: Circuit breaker — 3 losses in a row = pause
+    CIRC_N=3; CIRC_MIN=120
+    # Rule 6: Minimum hold time
+    MIN_HOLD=15
+    # Legacy (kept for compatibility)
     HALT=0.08; PAUSE=0.03; COOL=30
-    CIRC_N=3;  CIRC_MIN=120; MIN_HOLD=15
 
     # Signal thresholds
     CONF_BASE    = 62   # default
-    CONF_MACRO   = 48   # when Daily+4H+1H all agree
+    CONF_MACRO   = 45   # when macro agrees (lowered: 48 was blocking valid signals)
     ADX_MIN      = 22
 
     # Session bias (from backtesting)
@@ -228,6 +240,114 @@ class Intel:
         try: json.dump(self.data,open(INTEL_FILE,"w"),indent=2)
         except: pass
 
+    def ask_claude(self, trades, current_params):
+        """
+        Ask Claude to analyze trade history and suggest parameter improvements.
+        Runs every 6 hours. Uses Anthropic API directly.
+        """
+        api_key = os.getenv("ANTHROPIC_API_KEY","")
+        if not api_key: return None
+        if len(trades) < 10:
+            log.info("Claude: need 10+ trades to analyze"); return None
+        try:
+            # Build trade summary
+            wins  = [t for t in trades if t.get("won")]
+            losses= [t for t in trades if t.get("won")==False]
+            wr    = len(wins)/len(trades)*100 if trades else 0
+
+            # Hour breakdown
+            hour_stats = {}
+            for t in trades:
+                try:
+                    h = datetime.fromisoformat(t["time"]).hour
+                    hour_stats.setdefault(h,{"w":0,"l":0,"pnl":0})
+                    hour_stats[h]["pnl"] += float(t.get("pnl",0) or 0)
+                    if t.get("won"): hour_stats[h]["w"]+=1
+                    else: hour_stats[h]["l"]+=1
+                except: pass
+
+            # Side breakdown
+            side_stats = {}
+            for t in trades:
+                s = t.get("side","?")
+                side_stats.setdefault(s,{"w":0,"l":0,"pnl":0})
+                side_stats[s]["pnl"] += float(t.get("pnl",0) or 0)
+                if t.get("won"): side_stats[s]["w"]+=1
+                else: side_stats[s]["l"]+=1
+
+            prompt = f"""You are analyzing a BTC options trading bot on Delta Exchange India.
+Current balance: ${current_params.get('capital',0):.2f}
+Win rate: {wr:.1f}% over {len(trades)} trades
+Wins: {len(wins)}, Losses: {len(losses)}
+
+Trade P&L by side: {side_stats}
+Trade P&L by UTC hour: {dict(sorted(hour_stats.items()))}
+
+Current parameters:
+- Confidence threshold: {current_params.get('conf_base',62)}
+- Dead zone hours UTC: {current_params.get('dead_zone',[])}
+- Prime long hours UTC: {current_params.get('prime_long',[])}
+
+Last 10 trades (most recent first):
+{chr(10).join(f"  {t.get('time','?')[:16]} {t.get('side','?')} {t.get('sym','?')} pnl=${t.get('pnl',0):+.4f} reason={t.get('reason','?')}" for t in sorted(trades,key=lambda x:x.get('time',''))[-10:][::-1])}
+
+Respond ONLY with a JSON object (no markdown, no explanation):
+{{
+  "conf_base": <integer 48-75, suggested confidence threshold>,
+  "dead_zone_utc": [<hours to avoid, list of integers 0-23>],
+  "prime_long_utc": [<best hours for calls, list of integers>],
+  "insight": "<one sentence: what pattern you see>",
+  "action": "<one sentence: what to change and why>"
+}}"""
+
+            r = requests.post("https://api.anthropic.com/v1/messages",
+                headers={"x-api-key":api_key,"anthropic-version":"2023-06-01",
+                         "content-type":"application/json"},
+                json={"model":"claude-haiku-4-5-20251001","max_tokens":300,
+                      "messages":[{"role":"user","content":prompt}]},
+                timeout=30)
+
+            if r.status_code != 200:
+                log.warning(f"Claude API: {r.status_code}"); return None
+
+            text = r.json()["content"][0]["text"].strip()
+            # Strip markdown if present
+            text = text.replace("```json","").replace("```","").strip()
+            suggestions = json.loads(text)
+
+            log.info(f"Claude insight: {suggestions.get('insight','')}")
+            log.info(f"Claude action: {suggestions.get('action','')}")
+            return suggestions
+
+        except Exception as e:
+            log.warning(f"Claude analysis error: {e}"); return None
+
+    def apply_claude_suggestions(self, suggestions):
+        """Apply Claude's suggestions to live config."""
+        if not suggestions: return
+        changed = []
+        if "conf_base" in suggestions:
+            new_conf = int(suggestions["conf_base"])
+            if 45 <= new_conf <= 78:
+                C.CONF_BASE = new_conf
+                changed.append(f"conf={new_conf}")
+        if "dead_zone_utc" in suggestions:
+            new_dz = [int(h) for h in suggestions["dead_zone_utc"] if 0<=int(h)<=23]
+            if new_dz:
+                C.DEAD_ZONE = new_dz
+                changed.append(f"dead={new_dz}")
+        if "prime_long_utc" in suggestions:
+            new_pl = [int(h) for h in suggestions["prime_long_utc"] if 0<=int(h)<=23]
+            if new_pl:
+                C.PRIME_LONG = new_pl
+                changed.append(f"prime={new_pl}")
+        if changed:
+            log.info(f"Claude applied: {', '.join(changed)}")
+        self.data["last_claude_insight"] = suggestions.get("insight","")
+        self.data["last_claude_action"]  = suggestions.get("action","")
+        self.data["last_claude_update"]  = datetime.now(timezone.utc).isoformat()
+        self._save()
+
     def update(self,all_bots):
         with self._lk:
             trades=[{**t,"uid":uid} for uid,b in all_bots.items()
@@ -296,10 +416,28 @@ class Intel:
 
     def start(self,bots_ref):
         def loop():
+            tick=0
             while True:
                 time.sleep(3600)
-                try: self.update(bots_ref)
-                except Exception as e: log.warning(f"intel: {e}")
+                tick+=1
+                try:
+                    self.update(bots_ref)
+                except Exception as e:
+                    log.warning(f"intel update: {e}")
+                # Ask Claude every 6 hours
+                if tick % 6 == 0:
+                    try:
+                        all_trades=[t for b in bots_ref.values()
+                                   for t in b.trades if t.get("won") is not None]
+                        if all_trades:
+                            params={"capital": max((b.capital for b in bots_ref.values()),default=0),
+                                    "conf_base":C.CONF_BASE,"dead_zone":C.DEAD_ZONE,
+                                    "prime_long":C.PRIME_LONG}
+                            suggestions=self.ask_claude(all_trades,params)
+                            if suggestions:
+                                self.apply_claude_suggestions(suggestions)
+                    except Exception as e:
+                        log.warning(f"Claude learning: {e}")
         threading.Thread(target=loop,daemon=True).start()
 
     def summary(self): return dict(self.data)
@@ -617,10 +755,39 @@ def get_market_brain(candles):
 
     Returns a comprehensive market view with trade recommendation.
     """
-    brain={"direction":"neutral","conviction":0,"strategy":"WAIT",
+    brain={"direction":"neutral","conviction":0,"raw_conviction":0,"strategy":"WAIT",
            "opt_type":None,"opt_conviction":"atm","macro_bias":"neutral",
            "trends":{},"adx5m":0,"bw":0,"atr_pct":0,"veto":"",
            "regime":"NEUTRAL","scale":1}
+
+    # ── MARKET CONTEXT (funding + OI) ─────────────────────────────
+    mkt=candles.get("market",{})
+    funding=float(mkt.get("funding",0) or 0)
+    oi_change=float(mkt.get("oi_change",0) or 0)
+    brain["funding"]=funding; brain["oi_change"]=oi_change
+
+    # Funding rate interpretation (from real BTC data):
+    # > +0.05%: longs very crowded → likely flush down → avoid longs
+    # > +0.10%: extreme long crowding → strong put signal
+    # < -0.02%: shorts crowded → likely short squeeze → avoid shorts
+    # < -0.05%: extreme short crowding → strong call signal
+    # -0.01% to +0.03%: neutral → no adjustment
+    if funding > 0.10:
+        brain["funding_bias"]="strong_bear"   # extreme longs = fade
+    elif funding > 0.05:
+        brain["funding_bias"]="lean_bear"     # crowded longs = caution
+    elif funding < -0.05:
+        brain["funding_bias"]="strong_bull"   # extreme shorts = squeeze
+    elif funding < -0.02:
+        brain["funding_bias"]="lean_bull"     # shorts crowded = lean long
+    else:
+        brain["funding_bias"]="neutral"
+
+    # OI interpretation:
+    # OI rising + price rising = trend confirmed
+    # OI falling + price rising = trend weakening (exit soon)
+    # OI rising + price falling = shorts piling in = bearish
+    brain["oi_trend"]="rising" if oi_change>0.1 else "falling" if oi_change<-0.1 else "flat"
 
     c5m=candles.get("5m",[]); c1m=candles.get("1m",[]); c15m=candles.get("15m",[])
     c1h=candles.get("1h",[]); c4h=candles.get("4h",[]); c1d=candles.get("1d",[])
@@ -747,10 +914,40 @@ def get_market_brain(candles):
     # Apply session penalty
     conviction = max(0, conviction - session_penalty)
 
+    # ── FUNDING RATE VETO ─────────────────────────────────────────
+    # This is the single most powerful filter from real BTC data
+    funding_bias=brain.get("funding_bias","neutral")
+    if direction=="long" and funding_bias=="strong_bear":
+        # Funding >0.10%: longs extremely crowded, high chance of flush
+        conviction=max(0,conviction-25)
+        brain["veto"]="funding_extreme_long_crowding" if conviction<conf_needed else ""
+    elif direction=="long" and funding_bias=="lean_bear":
+        # Funding 0.05-0.10%: longs crowded, reduce conviction
+        conviction=max(0,conviction-12)
+    elif direction=="short" and funding_bias=="strong_bull":
+        conviction=max(0,conviction-25)
+        brain["veto"]="funding_extreme_short_crowding" if conviction<conf_needed else ""
+    elif direction=="short" and funding_bias=="lean_bull":
+        conviction=max(0,conviction-12)
+    elif direction=="long" and funding_bias in ("lean_bull","strong_bull"):
+        # Funding negative = shorts crowded = boost long conviction
+        conviction=min(100,conviction+8)
+    elif direction=="short" and funding_bias in ("lean_bear","strong_bear"):
+        conviction=min(100,conviction+8)
+
+    # OI confirmation boost
+    oi_trend=brain.get("oi_trend","flat")
+    if direction=="long" and oi_trend=="rising": conviction=min(100,conviction+5)
+    if direction=="short" and oi_trend=="rising" and macro_bias=="bear": conviction=min(100,conviction+5)
+    if (direction=="long" and oi_trend=="falling") or        (direction=="short" and oi_trend=="falling" and macro_bias=="bull"):
+        conviction=max(0,conviction-5)  # OI falling = trend weakening
+
     brain["entry_quality"]={
         "rsi":r5,"bb_pos":round(price_bb_pos,2),
         "vs_ema21":round((price-e21_5m)/e21_5m*100,2),
-        "adx":adx_v,"hist":round(hist,4)
+        "adx":adx_v,"hist":round(hist,4),
+        "funding":funding,"oi_change":oi_change,
+        "funding_bias":funding_bias,"oi_trend":oi_trend
     }
 
     # RSI trap vetoes
@@ -783,6 +980,7 @@ class Bot:
         self.api=DeltaAPI(); self.opts=None
         self._sf=os.path.join(_DATA,"bot_default.json")
         self.running=False; self.connected=False; self.opts_mode=False
+        self._start_time=None  # track when bot started
         self.capital=0.0; self.start_cap=0.0; self.day_start=0.0
         self.halted=False; self.halt_msg=""
         self.status="Not connected"; self.logs=[]; self.trades=[]
@@ -880,6 +1078,7 @@ class Bot:
         self.emit("INFO",f"Connected ${bal:.2f} | Start ${self.start_cap:.2f}")
         self._sync_pos()
         self._reconcile()
+        self._start_time=datetime.now(timezone.utc)  # record connect time
         if not self.running: self.start()
         return {"success":True,"balance":bal}
 
@@ -1011,12 +1210,16 @@ class Bot:
 
     def _on_close(self,won,pnl,entry,exit_p,lots,reason):
         now=datetime.now(timezone.utc); self._last_close=now
-        if won: self._consec=0; self.wins+=1
+        self._last_was_win=won  # track for cooldown
+        if won:
+            self._consec=0; self.wins+=1
+            self.emit("INFO",f"✅ WIN streak broken — confidence restored")
         else:
             self._consec+=1
+            self.emit("WARN",f"❌ Loss #{self._consec} | cooling {C.LOSS_COOLDOWN_MINS}m")
             if self._consec>=C.CIRC_N:
                 self._circuit=now+timedelta(minutes=C.CIRC_MIN)
-                self.emit("WARN",f"Circuit: {C.CIRC_N} losses → {C.CIRC_MIN}min pause")
+                self.emit("WARN",f"⚠️ CIRCUIT: {C.CIRC_N} consecutive losses → {C.CIRC_MIN}min pause")
         for t in reversed(self.trades):
             if t.get("exit") is None and t.get("entry")==round(entry,1):
                 t.update({"exit":round(exit_p,1),"pnl":pnl,"won":won,"reason":reason}); break
@@ -1041,7 +1244,30 @@ class Bot:
             diff=rsi([c["c"] for c in b1m])-rsi([c["c"] for c in d1m])
             if diff>8:   bnc_lead="binance_leading_bull"
             elif diff<-8: bnc_lead="binance_leading_bear"
-        return {"5m":c5m,"1m":c1m,"15m":d15m,"1h":b1h,"4h":b4h,"1d":b1d,"binance_lead":bnc_lead}
+        # ── COINGLASS: Funding rate + OI + Liquidations ──────────────
+        market_data={"funding":0.0,"oi_change":0.0,"liq_long":0.0,"liq_short":0.0,"source":"none"}
+        try:
+            # Binance funding rate (free, no API key needed)
+            fr=requests.get("https://fapi.binance.com/fapi/v1/premiumIndex",
+                params={"symbol":"BTCUSDT"},timeout=5).json()
+            funding=float(fr.get("lastFundingRate",0) or 0)*100  # as percentage
+            market_data["funding"]=round(funding,4)
+            market_data["source"]="binance"
+
+            # Binance OI (open interest trend)
+            oi=requests.get("https://fapi.binance.com/futures/data/openInterestHist",
+                params={"symbol":"BTCUSDT","period":"5m","limit":3},timeout=5).json()
+            if isinstance(oi,list) and len(oi)>=2:
+                oi_now=float(oi[-1].get("sumOpenInterest",0))
+                oi_prev=float(oi[0].get("sumOpenInterest",1))
+                market_data["oi_change"]=round((oi_now-oi_prev)/oi_prev*100,3)
+
+            log.info(f"Market: funding={funding:+.4f}% OI_change={market_data['oi_change']:+.3f}%")
+        except Exception as e:
+            log.warning(f"Market data fetch: {e}")
+
+        return {"5m":c5m,"1m":c1m,"15m":d15m,"1h":b1h,"4h":b4h,"1d":b1d,
+                "binance_lead":bnc_lead,"market":market_data}
 
     def _pos_disp(self,positions=None):
         if positions is None: positions=self.api.btcusd_pos()
@@ -1084,33 +1310,69 @@ class Bot:
         self.brain=brain
 
         direction=brain["direction"]; strategy=brain["strategy"]
-        conviction=brain["conviction"]; veto=brain["veto"]
-        macro_bias=brain["macro_bias"]; scale=brain["scale"]
+        conviction=brain.get("raw_conviction",brain["conviction"])
+        veto=brain["veto"]; macro_bias=brain["macro_bias"]; scale=brain["scale"]
+        macro_confirms=(macro_bias=="bull" and direction=="long") or                        (macro_bias=="bear" and direction=="short")
 
+        raw_conv=brain.get("raw_conviction",conviction)
+        eq=brain.get("entry_quality",{})
         self.emit("INFO",
             f"#{self.scan_n} ${self.price:,.0f} | {brain['regime']} | "
-            f"macro={macro_bias} | conv={conviction} | {strategy} | "
+            f"macro={macro_bias} | conv={raw_conv} | {strategy} | "
             f"adx={brain['adx5m']} bw={brain['bw']} "
-            f"{'⚡DIV' if brain.get('trends',{}) else ''}"
-            f"{'✗'+veto if veto else ''}")
+            f"rsi={brain.get('rsi',0):.0f} "
+            f"fund={eq.get('funding',0):+.3f}% "
+            f"oi={eq.get('oi_change',0):+.2f}% "
+            f"{'⚡DIV ' if brain.get('div') else ''}"
+            f"{'✗'+veto if veto else '✓TRADE'}")
 
         now=datetime.now(timezone.utc)
-        # Guards
+        # ── PRE-TRADE CHECKLIST (disciplined, not emotional) ─────────
+        # Check 1: Circuit breaker (3 consecutive losses)
         if self._circuit and now<self._circuit:
-            self.status=f"Circuit: {int((self._circuit-now).seconds/60)}m"; return
+            mins=int((self._circuit-now).seconds/60)
+            self.status=f"⚠️ Circuit breaker: {mins}m remaining (3 losses)"; return
         elif self._circuit and now>=self._circuit:
-            self._circuit=None; self._consec=0; self.emit("INFO","Circuit lifted")
-        if self._last_close and (now-self._last_close).seconds<C.COOL*60:
-            self.status=f"Cooldown {C.COOL-(now-self._last_close).seconds//60}m"; return
-        if self.day_start>0 and (self.capital-self.day_start)/self.day_start<=-C.PAUSE:
-            self.status="Paused — daily limit"; return
+            self._circuit=None; self._consec=0
+            self.emit("INFO","✅ Circuit breaker lifted — resuming")
+
+        # Check 2: Loss cooldown (step away after loss)
+        if self._last_close and not getattr(self,'_last_was_win',True):
+            elapsed=(now-self._last_close).seconds//60
+            if elapsed<C.LOSS_COOLDOWN_MINS:
+                self.status=f"⏸ Post-loss cooldown: {C.LOSS_COOLDOWN_MINS-elapsed}m remaining"
+                return
+
+        # Check 3: Daily loss limit (3% = shut down for the day)
         today=now.strftime("%Y-%m-%d")
-        if self._daily_date!=today: self._daily_date=today; self._daily_n=0
+        if self._daily_date!=today:
+            self._daily_date=today; self._daily_n=0
+            self.day_start=self.capital  # reset daily start
+        daily_pnl_pct=(self.capital-self.day_start)/self.day_start*100 if self.day_start>0 else 0
+        if daily_pnl_pct<=-C.DAILY_LOSS_LIMIT*100:
+            self.status=f"🛑 Daily loss limit hit ({daily_pnl_pct:.1f}%) — shut down for today"
+            return
+
+        # Check 4: Weekly loss limit (8% = full halt)
+        if self.start_cap>0:
+            total_pnl_pct=(self.capital-self.start_cap)/self.start_cap*100
+            if total_pnl_pct<=-C.WEEKLY_LOSS_LIMIT*100:
+                self.halted=True
+                self.halt_msg=f"Down {abs(total_pnl_pct):.1f}% from start — manual review required"
+                self.emit("ERROR",f"🛑 WEEKLY HALT: {self.halt_msg}"); self.save(); return
+
         if self._daily_n>=self.max_daily:
-            self.status=f"Daily limit ({self.max_daily})"; return
+            self.status=f"Daily trade limit ({self.max_daily})"; return
 
         if veto:
             self.status=f"Waiting: {veto} | macro={macro_bias}"; return
+
+        # Startup guard: wait 60s before first trade (let data stabilize)
+        if self._start_time:
+            secs_since_start=(datetime.now(timezone.utc)-self._start_time).total_seconds()
+            if secs_since_start<60:
+                self.status=f"Startup: waiting {int(60-secs_since_start)}s for data to stabilize"
+                return
 
         # PRO mode: only trade when ALL 3 timeframes aligned
         if self.active_mode=="pro":
@@ -1123,8 +1385,36 @@ class Bot:
         # Existing positions
         if len(real)>=1:
             d=self._pos_disp(real); x=d[0] if d else {}
-            self.status=f"Holding {x.get('side','').upper()} @ ${x.get('entry',0):,.0f} UPL ${x.get('upnl',0):+.3f}"
-            return
+            upnl=x.get('upnl',0); pct=x.get('pct',0)
+            self.status=f"Holding {x.get('side','').upper()} @ ${x.get('entry',0):,.0f} | UPL ${upnl:+.3f} ({pct:+.2f}%)"
+            # Check option exits always
+            if self.opts_mode and self.opts:
+                self._check_opt_exits()
+            # HIGH CONVICTION: also open option to amplify the move
+            # conv>=80 = strong enough to run both perp + option
+            if self.opts_mode and self.opts and conviction>=80 and not veto:
+                opt_pos=self.api.opt_pos()
+                local_open=[t for t in self.trades if t.get("exit") is None
+                    and t.get("side") in ("call","put","straddle")]
+                if not opt_pos and not local_open:
+                    # Open supporting option alongside existing perp
+                    opt_type="call" if direction=="long" else "put"
+                    opt=self.opts.find(opt_type,self.price,brain.get("opt_conviction","atm"))
+                    if opt.get("found") and opt["premium_usd"]<=self.capital*C.OPT_MAX:
+                        pid=self.api.opt_pid(opt["symbol"])
+                        if pid:
+                            r=self.api.order("buy",1,pid)
+                            if r.get("success"):
+                                self.opts.open(opt["symbol"])
+                                self.emit("TRADE",
+                                    f"⚡ COMBO: {opt_type.upper()} alongside PERP "
+                                    f"{opt['symbol']} ${opt['premium_usd']:.2f} conv={conviction}")
+                                self.trades.append({"time":now.isoformat(),"side":opt_type,
+                                    "entry":round(opt["mark"],4),"exit":None,"lots":1,
+                                    "pnl":None,"pct":None,"reason":"combo_with_perp",
+                                    "won":None,"pid":str(pid),"sym":opt["symbol"]})
+                                self.save()
+            return  # still don't open new perp
 
         # ── OPTIONS MODE ───────────────────────────────────────────
         if self.opts_mode and self.opts:
@@ -1195,17 +1485,46 @@ class Bot:
             return
 
         cfg=self.mode_cfg
-        margin_per_lot=self.price*C.LOT/C.LEV
-        # Risk % from mode: safe=2%, normal=5%, pro=10%
-        risk_capital=self.capital*cfg["risk"]
-        max_risk_lots=max(1,int(risk_capital/margin_per_lot))
-        max_affordable=max(1,int(self.capital*0.20/margin_per_lot))
-        lots=min(self.lot_size*scale*cfg["lot_mult"],min(max_risk_lots,max_affordable))
-        lots=max(1,int(lots))
+        price_now=self.price if self.price>0 else 78000
+        margin_per_lot=price_now*C.LOT/C.LEV
+
+        # ── POSITION SIZING: 1% risk rule ─────────────────────────
+        # Position Size = (Risk in $ × 100) / Stop-Loss %
+        atp=brain.get("atr_pct",0.3); strategy_now=brain.get("strategy","SCALP")
+        sl_pct=(atp*1.0/100) if strategy_now=="SWING" else (atp*0.8/100)
+        sl_pct=max(sl_pct,0.005)  # min 0.5% stop
+        # 1% risk = how many lots?
+        risk_usd=self.capital*C.RISK_PER_TRADE
+        # Each lot risks: entry × LOT × sl_pct
+        risk_per_lot=price_now*C.LOT*sl_pct
+        risk_based_lots=max(1,int(risk_usd/risk_per_lot)) if risk_per_lot>0 else 1
+
+        # Scale up on high conviction (still within risk rules)
+        conviction_mult=min(scale,3)  # max 3x on high conviction
+        requested_lots=risk_based_lots*conviction_mult
+
+        # Hard cap: never more than 10% of capital as margin
+        max_margin_lots=max(1,int(self.capital*0.10/margin_per_lot))
+        lots=max(1,min(requested_lots,max_margin_lots))
+        lots=int(lots)
+
+        actual_risk_usd=round(lots*risk_per_lot,2)
+        actual_risk_pct=round(actual_risk_usd/self.capital*100,2) if self.capital>0 else 0
+        self.emit("INFO",
+            f"Sizing: 1%=${risk_usd:.2f} sl={sl_pct*100:.2f}% "
+            f"→ {lots}L | risk=${actual_risk_usd} ({actual_risk_pct}%) "
+            f"| conv_mult={conviction_mult}x | mode={self.active_mode}")
 
         r=self.api.order("buy" if direction=="long" else "sell",lots)
         if not r.get("success"):
-            self.emit("ERROR",f"Order failed: {r.get('error','?')}"); return
+            err=r.get("error",r.get("message","?"))
+            self.emit("ERROR",f"Order FAILED: {err} | lots={lots} price=${self.price:,.0f}")
+            # Log full response for debugging
+            self.emit("WARN",f"Delta response: {str(r)[:200]}")
+            return
+        # Verify order was filled
+        filled_size=float((r.get("result",{}) or {}).get("size",0) or lots)
+        self.emit("TRADE",f"Order confirmed: {filled_size}L filled")
 
         # ATR-based TP/SL, wider for SWING
         atp=brain["atr_pct"]
@@ -1260,12 +1579,17 @@ class Bot:
             "status":self.status,"price":round(self.price,1),
             "regime":b.get("regime","—"),"strategy":b.get("strategy","—"),
             "macro_bias":b.get("macro_bias","neutral"),
-            "conviction":b.get("conviction",0),"scale":b.get("scale",1),
+            "conviction":b.get("raw_conviction",b.get("conviction",0)),
+            "scale":b.get("scale",1),
             "direction":b.get("direction","neutral"),
             "trends":trends,"adx":b.get("adx5m",0),
             "bw":b.get("bw",0),"atr_pct":b.get("atr_pct",0),"rsi":b.get("rsi",50),
             "veto":b.get("veto",""),
             "entry_quality":b.get("entry_quality",{}),
+            "funding":b.get("funding",0),
+            "funding_bias":b.get("funding_bias","neutral"),
+            "oi_change":b.get("oi_change",0),
+            "oi_trend":b.get("oi_trend","flat"),
             "capital":round(self.capital,2),"start_cap":round(sc,2),
             "pnl_pct":round(pnl_pct,2),"pnl_usd":pnl_usd,"trade_pnl_usd":trade_pnl,
             "win_rate":round(wr,1),"total_trades":self.total_tr,"wins":self.wins,
@@ -1277,9 +1601,17 @@ class Bot:
                 "mode":self.mode,"active_mode":self.active_mode,
                 "mode_locked":self.mode=="pro" and self.capital<C.MODES["pro"]["min_bal"]},
             "guardrails":{"Opt TP":"+70%","Opt SL":"-15%","Floor":"64% of peak",
-                "Perp stop":f"{C.STOP*100:.1f}% ATR","Monthly halt":"-8%",
-                "Daily pause":"-3%","Cooldown":f"{C.COOL}min",
-                "Circuit":f"{C.CIRC_N} losses","Min hold":f"{C.MIN_HOLD}min"}}
+                "Risk/trade":"1% of capital","Daily limit":"-3%","Weekly halt":"-8%",
+                "Loss cooldown":f"{C.LOSS_COOLDOWN_MINS}min","Circuit":f"{C.CIRC_N} losses"},
+            "risk_stats":{
+                "daily_pnl_pct":round((self.capital-self.day_start)/self.day_start*100,2) if self.day_start>0 else 0,
+                "daily_pnl_usd":round(self.capital-self.day_start,2) if self.day_start>0 else 0,
+                "total_pnl_pct":round((self.capital-sc)/sc*100,2) if sc>0 else 0,
+                "consec_losses":self._consec,
+                "in_cooldown":bool(self._last_close and not getattr(self,'_last_was_win',True) and
+                    (datetime.now(timezone.utc)-self._last_close).seconds//60<C.LOSS_COOLDOWN_MINS),
+                "daily_loss_limit_pct":C.DAILY_LOSS_LIMIT*100,
+                "risk_per_trade_pct":C.RISK_PER_TRADE*100}}
 
 # ═══ FLASK ════════════════════════════════════════════════════════
 app = Flask(__name__)
@@ -1502,11 +1834,22 @@ def api_user_settings():
             return jsonify({"success":False,"message":"Mode must be safe/normal/pro"})
         if new_mode=="pro" and b.capital<C.MODES["pro"]["min_bal"]:
             return jsonify({"success":False,
-                "message":f"PRO mode requires ${C.MODES['pro']['min_bal']} balance. You have ${b.capital:.0f}"})
+                "message":f"PRO mode requires ${C.MODES['pro']['min_bal']}. You have ${b.capital:.0f}"})
         b.mode=new_mode
         b.emit("INFO",f"Mode changed to {new_mode.upper()}")
-    b.emit("INFO",f"Settings: lots={b.lot_size} max_daily={b.max_daily} mode={b.mode}"); b.save()
-    return jsonify({"success":True,"lot_size":b.lot_size,"max_daily":b.max_daily,"mode":b.mode})
+    # Calculate what will ACTUALLY be traded
+    price=b.price or 78000
+    margin=price*C.LOT/C.LEV
+    max_lots=max(1,int(b.capital*0.20/margin)) if b.capital>0 else 1
+    cfg=b.mode_cfg
+    actual_lots=max(1,min(int(b.lot_size*cfg["lot_mult"]),max_lots))
+    actual_risk=round(actual_lots*margin,2)
+    actual_pct=round(actual_risk/b.capital*100,1) if b.capital>0 else 0
+    b.emit("INFO",f"Settings saved: lots={b.lot_size}(actual={actual_lots}) mode={b.mode} risk=${actual_risk}({actual_pct}%)")
+    b.save()
+    return jsonify({"success":True,"lot_size":b.lot_size,"max_daily":b.max_daily,"mode":b.mode,
+        "actual_lots":actual_lots,"actual_risk_usd":actual_risk,"actual_risk_pct":actual_pct,
+        "max_affordable_lots":max_lots,"margin_per_lot":round(margin,2)})
 
 @app.route("/api/ip")
 def api_ip():
@@ -1570,6 +1913,22 @@ def admin_invite():
 def admin_intel():
     intel.update(bots)
     return jsonify(intel.summary())
+
+@app.route("/api/admin/claude_learn",methods=["POST"])
+@admin_req
+def admin_claude_learn():
+    """Manually trigger Claude to analyze trades and update parameters."""
+    all_trades=[t for b in bots.values() for t in b.trades if t.get("won") is not None]
+    if len(all_trades)<5:
+        return jsonify({"success":False,"message":f"Need 5+ closed trades, have {len(all_trades)}"})
+    params={"capital":max((b.capital for b in bots.values()),default=0),
+            "conf_base":C.CONF_BASE,"dead_zone":C.DEAD_ZONE,"prime_long":C.PRIME_LONG}
+    suggestions=intel.ask_claude(all_trades,params)
+    if suggestions:
+        intel.apply_claude_suggestions(suggestions)
+        return jsonify({"success":True,"suggestions":suggestions,
+            "applied":{"conf_base":C.CONF_BASE,"dead_zone":C.DEAD_ZONE}})
+    return jsonify({"success":False,"message":"Claude analysis failed — check ANTHROPIC_API_KEY"})
 
 @app.route("/api/admin/logs")
 @admin_req
