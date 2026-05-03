@@ -59,8 +59,8 @@ class C:
     ADX_MIN      = 22
 
     # Session bias (from backtesting)
-    DEAD_ZONE   = [20,21,22,23,0,1]  # UTC 8pm-1am = IST 1:30am-6:30am (true dead zone)
-    PRIME_LONG  = [2,3,7,8,9,10,11]  # UTC 2-5am = IST 7:30-10:30am (India morning)
+    DEAD_ZONE   = [11,12,13,14,15]  # UTC 11am-3pm = IST 4:30pm-8:30pm (worst by data: IST 17-20)
+    PRIME_LONG  = [19,20,21,22,23,0,8,9]  # IST 1am,4am,1pm best by data
     PRIME_SHORT = [13,14,15,16]  # UTC 1-4pm = IST 6:30-9:30pm (NY open, evening India)
 
     DEPLOY_TOKEN = os.getenv("DEPLOY_TOKEN","alphabot2025deploy")
@@ -222,29 +222,66 @@ class Intel:
         with self._lk:
             trades=[{**t,"uid":uid} for uid,b in all_bots.items()
                     for t in b.trades if t.get("won") is not None]
-            if len(trades)<5: return
+            if len(trades)<3: return
             wins=[t for t in trades if t["won"]]
             wr=len(wins)/len(trades)*100
+
+            # Learn from hours
             by_hour={}
             for t in trades:
                 try:
                     h=str(datetime.fromisoformat(t["time"]).hour)
-                    by_hour.setdefault(h,{"wins":0,"total":0})
+                    by_hour.setdefault(h,{"wins":0,"total":0,"pnl":0})
                     by_hour[h]["total"]+=1
+                    by_hour[h]["pnl"]+=float(t.get("pnl",0) or 0)
                     if t["won"]: by_hour[h]["wins"]+=1
                 except: pass
             for h in by_hour:
                 v=by_hour[h]
                 v["wr"]=round(v["wins"]/v["total"]*100,1) if v["total"]>0 else 0
-            good=[int(h) for h,v in by_hour.items() if v["wr"]>=62 and v["total"]>=3]
-            bad =[int(h) for h,v in by_hour.items() if v["wr"]<=38 and v["total"]>=3]
+
+            # Learn from regime conditions
+            by_regime={}
+            for t in trades:
+                regime=t.get("reason","unknown")
+                by_regime.setdefault(regime,{"wins":0,"total":0,"pnl":0})
+                by_regime[regime]["total"]+=1
+                by_regime[regime]["pnl"]+=float(t.get("pnl",0) or 0)
+                if t.get("won"): by_regime[regime]["wins"]+=1
+
+            # Learn: which option types performed best
+            by_side={}
+            for t in trades:
+                side=t.get("side","unknown")
+                by_side.setdefault(side,{"wins":0,"total":0,"pnl":0})
+                by_side[side]["total"]+=1
+                by_side[side]["pnl"]+=float(t.get("pnl",0) or 0)
+                if t.get("won"): by_side[side]["wins"]+=1
+
+            # Adjust thresholds dynamically based on performance
+            # If win rate < 40% → raise confidence threshold
+            # If win rate > 60% → we can be slightly more aggressive
+            adj_conf = C.CONF_BASE
+            if len(trades)>=10:
+                if wr < 40: adj_conf = min(C.CONF_BASE+8, 75)  # be more selective
+                elif wr > 60: adj_conf = max(C.CONF_BASE-3, 55)  # slightly more active
+                if adj_conf != C.CONF_BASE:
+                    C.CONF_BASE = adj_conf
+                    log.info(f"Intel: WR={wr:.1f}% → confidence threshold adjusted to {adj_conf}")
+
+            # Update dead/prime hours from real data
+            good=[int(h) for h,v in by_hour.items() if v["wr"]>=60 and v["total"]>=3 and v["pnl"]>0]
+            bad =[int(h) for h,v in by_hour.items() if v["wr"]<=35 and v["total"]>=3 and v["pnl"]<0]
+
             self.data.update({"win_rate":round(wr,1),"total":len(trades),
-                "by_hour":by_hour,"good_hours":good,"bad_hours":bad,
+                "by_hour":by_hour,"by_regime":by_regime,"by_side":by_side,
+                "good_hours":good,"bad_hours":bad,
+                "conf_threshold":C.CONF_BASE,
                 "updated":datetime.now(timezone.utc).isoformat()})
-            if len(trades)>=20:
+            if len(trades)>=10:
                 if good: C.PRIME_LONG=list(set(C.PRIME_LONG+good))[:12]
                 if bad:  C.DEAD_ZONE=list(set(C.DEAD_ZONE+bad))[:10]
-                log.info(f"Intel: WR={wr:.1f}% good={good} bad={bad}")
+                log.info(f"Intel: WR={wr:.1f}% good_hrs={good} bad_hrs={bad} trades={len(trades)}")
             self._save()
 
     def start(self,bots_ref):
@@ -627,45 +664,80 @@ def get_market_brain(candles):
         brain["opt_type"]="straddle"; brain["opt_conviction"]="atm"
         return brain
 
-    # ── DIRECTIONAL DECISION ───────────────────────────────────────
-    # Direction hierarchy: macro > 5m regime > divergence
+    # ── ENTRY QUALITY CHECK (from real trade data) ─────────────────
+    # Real data shows: buying calls at RSI>65 = consistent losses
+    # Buying calls at RSI<45 (dip in bull trend) = consistent wins
+    # Same for puts: buy puts at RSI>55 (spike in bear) not RSI<35
+    e21_5m = ema(cl,21)[-1]; e55_5m = ema(cl,55)[-1] if len(cl)>=55 else cl[0]
+    upper_bb,mid_bb,lower_bb,_ = bollinger(cl)
+    price_bb_pos = (price - lower_bb)/(upper_bb - lower_bb) if upper_bb>lower_bb else 0.5
+
+    # ── DIRECTIONAL DECISION with entry quality ────────────────────
     if macro_bias=="bull":
         direction="long"
-        # ITM when conviction is high (strong macro + 5m confirms)
-        if bull_votes==3 and regime in ("BULL","STRONG_BULL"):
-            conviction=85; opt_conviction="itm"  # deep ITM for max leverage
+        # Entry quality: only buy calls when price is NOT at top
+        # Ideal: RSI<55 (pullback) AND price near/below EMA21
+        at_good_entry = r5 < 58 and price <= e21_5m * 1.005  # within 0.5% of EMA21
+        at_dip        = r5 < 50 and price_bb_pos < 0.4       # real dip, near lower band
+        at_breakout   = r5 > 55 and price > e21_5m and hist > 0 and adx_v > 20  # real breakout
+
+        if bull_votes==3 and at_dip:
+            conviction=88; opt_conviction="itm"   # best entry: macro+dip = max size
+        elif bull_votes==3 and at_breakout:
+            conviction=82; opt_conviction="itm"   # strong breakout with all macro
         elif bull_votes>=2 and div_long:
-            conviction=80; opt_conviction="itm"  # divergence + macro = ITM
+            conviction=80; opt_conviction="itm"   # divergence = reversal signal
+        elif bull_votes>=2 and at_dip:
+            conviction=72; opt_conviction="atm"   # good entry on macro dip
+        elif bull_votes>=2 and at_good_entry:
+            conviction=65; opt_conviction="atm"   # macro ok, entry decent
         elif bull_votes>=2:
-            conviction=65; opt_conviction="atm"  # macro only = ATM
+            conviction=45; opt_conviction="atm"   # macro but bad entry timing
         else:
-            conviction=50; opt_conviction="atm"
+            conviction=38; opt_conviction="atm"   # weak — likely veto
     elif macro_bias=="bear":
         direction="short"
-        if bear_votes==3 and regime in ("BEAR","STRONG_BEAR"):
-            conviction=85; opt_conviction="itm"
+        # For puts: buy when price is at top of range (RSI>55)
+        at_good_entry = r5 > 42 and price >= e21_5m * 0.995
+        at_spike      = r5 > 55 and price_bb_pos > 0.6
+        at_breakdown  = r5 < 45 and price < e21_5m and hist < 0 and adx_v > 20
+
+        if bear_votes==3 and at_spike:
+            conviction=88; opt_conviction="itm"
+        elif bear_votes==3 and at_breakdown:
+            conviction=82; opt_conviction="itm"
         elif bear_votes>=2 and div_short:
             conviction=80; opt_conviction="itm"
-        elif bear_votes>=2:
+        elif bear_votes>=2 and at_spike:
+            conviction=72; opt_conviction="atm"
+        elif bear_votes>=2 and at_good_entry:
             conviction=65; opt_conviction="atm"
+        elif bear_votes>=2:
+            conviction=45; opt_conviction="atm"
         else:
-            conviction=50; opt_conviction="atm"
+            conviction=38; opt_conviction="atm"
     else:
-        # No macro bias — use 5m only if strong
-        if regime in ("STRONG_BULL","BULL") and adx_v>25:
+        # No macro bias — only trade very clear 5m signals
+        if regime in ("STRONG_BULL","BULL") and adx_v>25 and r5<52:
+            direction="long"; conviction=62; opt_conviction="atm"
+        elif regime in ("STRONG_BEAR","BEAR") and adx_v>25 and r5>48:
+            direction="short"; conviction=62; opt_conviction="atm"
+        elif div_long and adx_v>18:
             direction="long"; conviction=60; opt_conviction="atm"
-        elif regime in ("STRONG_BEAR","BEAR") and adx_v>25:
+        elif div_short and adx_v>18:
             direction="short"; conviction=60; opt_conviction="atm"
-        elif div_long:
-            direction="long"; conviction=58; opt_conviction="atm"
-        elif div_short:
-            direction="short"; conviction=58; opt_conviction="atm"
         elif squeeze:
-            brain["strategy"]="STRADDLE"; brain["conviction"]=52
+            brain["strategy"]="STRADDLE"; brain["conviction"]=55
             brain["opt_type"]="straddle"; brain["opt_conviction"]="atm"
             return brain
         else:
             brain["veto"]="no_clear_direction"; return brain
+
+    brain["entry_quality"]={
+        "rsi":r5,"bb_pos":round(price_bb_pos,2),
+        "vs_ema21":round((price-e21_5m)/e21_5m*100,2),
+        "adx":adx_v,"hist":round(hist,4)
+    }
 
     # RSI trap vetoes
     if direction=="long" and r5<32 and macro_bias!="bull":
@@ -1179,6 +1251,7 @@ class Bot:
             "trends":trends,"adx":b.get("adx5m",0),
             "bw":b.get("bw",0),"atr_pct":b.get("atr_pct",0),"rsi":b.get("rsi",50),
             "veto":b.get("veto",""),
+            "entry_quality":b.get("entry_quality",{}),
             "capital":round(self.capital,2),"start_cap":round(sc,2),
             "pnl_pct":round(pnl_pct,2),"pnl_usd":pnl_usd,"trade_pnl_usd":trade_pnl,
             "win_rate":round(wr,1),"total_trades":self.total_tr,"wins":self.wins,
