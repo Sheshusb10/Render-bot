@@ -187,6 +187,18 @@ def get_bot(uid):
         b=Bot()
         b._sf=os.path.join(_DATA,f"bot_{uid}.json")
         bots[uid]=b
+        # Auto-reconnect if saved keys exist
+        key_file=os.path.join(_DATA,f"keys_{uid}.json")
+        if os.path.exists(key_file):
+            try:
+                import base64 as b64
+                kd=json.load(open(key_file))
+                k=b64.b64decode(kd["k"]).decode()
+                s=b64.b64decode(kd["s"]).decode()
+                threading.Thread(target=lambda:b.connect(k,s),daemon=True).start()
+                log.info(f"Auto-connecting user {uid[:6]}...")
+            except Exception as e:
+                log.warning(f"Auto-connect failed: {e}")
     return bots[uid]
 
 # ═══ SHARED INTELLIGENCE — learns from all users ══════════════════
@@ -741,6 +753,15 @@ class Bot:
             self.total_tr=int(s.get("total_tr",0))
             self.wins=int(s.get("wins",0))
             self.trades=s.get("trades",[])
+            # Restore full trade history from tradelog
+            trade_log=self._sf.replace("bot_","tradelog_")
+            try:
+                all_trades=json.load(open(trade_log))
+                # Merge: keep open trades from state, add closed from log
+                open_trades=[t for t in self.trades if t.get("exit") is None]
+                closed_log=[t for t in all_trades if t.get("exit") is not None]
+                self.trades=closed_log[-200:]+open_trades
+            except: pass
             self._stops=set(s.get("stops",[]))
             self._consec=int(s.get("consec",0))
             self.lot_size=int(s.get("lot_size",10))
@@ -1187,6 +1208,13 @@ _auto_setup()
 intel.start(bots)
 _auto_setup()  # auto-create admin if needed
 
+# Auto-reconnect all users with saved keys
+def _auto_reconnect_all():
+    time.sleep(5)  # wait for Flask to start
+    for uid in um.db.get("users",{}).keys():
+        get_bot(uid)  # triggers auto-connect if keys saved
+threading.Thread(target=_auto_reconnect_all,daemon=True).start()
+
 @app.after_request
 def _h(r):
     r.headers.update({"Access-Control-Allow-Origin":request.headers.get("Origin","*"),
@@ -1262,7 +1290,18 @@ def api_connect():
     if request.method=="OPTIONS": return jsonify({})
     d=request.json or {}; k=d.get("api_key",""); s=d.get("api_secret","")
     if not k or not s: return jsonify({"success":False,"message":"Key and secret required"})
-    return jsonify(get_bot(session["uid"]).connect(k.strip(),s.strip()))
+    uid=session["uid"]; b=get_bot(uid)
+    result=b.connect(k.strip(),s.strip())
+    if result.get("success"):
+        # Save API keys to user state — auto-reconnect on restart
+        key_file=os.path.join(_DATA,f"keys_{uid}.json")
+        try:
+            import base64 as b64
+            json.dump({"k":b64.b64encode(k.encode()).decode(),
+                       "s":b64.b64encode(s.encode()).decode()},
+                      open(key_file,"w"))
+        except: pass
+    return jsonify(result)
 
 @app.route("/api/bot/start",methods=["POST"])
 @login_req
@@ -1283,21 +1322,26 @@ def api_run():
 def api_clear_stale():
     """Remove reconciled/ghost trades from history."""
     b=get_bot(session["uid"])
-    before=len(b.trades)
-    # Keep only: open trades with real positions OR closed trades with actual P&L
+    # Get real open positions from Delta
     real_syms=set()
     for p in b.api.btcusd_pos(): real_syms.add(str(p.get("product_id","")))
     for p in b.api.opt_pos(): real_syms.add(p.get("product_symbol",""))
-    cleaned=[]
-    removed=0
+
+    cleaned=[]; removed=0
     for t in b.trades:
-        is_ghost=(t.get("reason") in ("reconciled","manual_close") and t.get("pnl",0)==0 and t.get("exit") is not None)
-        if is_ghost:
+        is_open = t.get("exit") is None
+        sym=str(t.get("sym","")); pid=str(t.get("pid",""))
+        # Remove if: open trade not on Delta, OR zero-PnL ghost
+        is_ghost_open = is_open and sym not in real_syms and pid not in real_syms
+        is_zero_ghost = (t.get("reason") in ("reconciled","manual_close")
+                        and t.get("pnl",0)==0 and not is_open)
+        if is_ghost_open or is_zero_ghost:
             removed+=1
+            if b.opts: b.opts.close(sym)
         else:
             cleaned.append(t)
     b.trades=cleaned; b.save()
-    b.emit("INFO",f"Cleared {removed} stale trades")
+    b.emit("INFO",f"Cleared {removed} stale trades | {len(cleaned)} remain")
     return jsonify({"success":True,"removed":removed,"remaining":len(cleaned)})
 
 @app.route("/api/close_all",methods=["POST"])
