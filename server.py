@@ -856,6 +856,11 @@ def get_market_brain(candles):
     session_penalty = 0
     if hour in C.DEAD_ZONE: session_penalty = 15  # reduce conviction, don't block
 
+    # ── TIMEFRAME ALIGNMENT COUNT ─────────────────────────────────
+    all_trends=[trends.get(t,"neutral") for t in ["1m","5m","15m","1h","4h","1d"]]
+    tf_bull_count=all_trends.count("bull")
+    tf_bear_count=all_trends.count("bear")
+
     # ── STRADDLE DECISION ──────────────────────────────────────────
     # Only straddle when macro is NEUTRAL (no clear direction)
     # If macro is clear → go directional even in squeeze
