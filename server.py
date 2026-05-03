@@ -857,12 +857,17 @@ def get_market_brain(candles):
     if hour in C.DEAD_ZONE: session_penalty = 15  # reduce conviction, don't block
 
     # ── STRADDLE DECISION ──────────────────────────────────────────
-    # Straddle when: BB squeeze (coiled) + low ADX + no clear macro
+    # Only straddle when macro is NEUTRAL (no clear direction)
+    # If macro is clear → go directional even in squeeze
     squeeze=bw<1.2 and adx_v<20
-    if squeeze and macro_bias=="neutral":
+    tf_aligned=max(tf_bull_count,tf_bear_count)>=4  # 4+ TFs agree
+    if squeeze and macro_bias=="neutral" and not tf_aligned:
         brain["strategy"]="STRADDLE"; brain["conviction"]=55
         brain["opt_type"]="straddle"; brain["opt_conviction"]="atm"
         return brain
+    elif squeeze and macro_bias!="neutral":
+        # Squeeze + clear direction = explosive directional move
+        brain["squeeze_breakout"]=True  # boost conviction later
 
     # ── ENTRY QUALITY CHECK (from real trade data) ─────────────────
     # Real data shows: buying calls at RSI>65 = consistent losses
@@ -993,7 +998,9 @@ def get_market_brain(candles):
 
     brain.update({"direction":direction,"conviction":conviction,"strategy":strategy,
                   "opt_type":"call" if direction=="long" else "put",
-                  "opt_conviction":opt_conviction,"scale":scale})
+                  "opt_conviction":opt_conviction,"scale":scale,
+                  "tf_bull":tf_bull_count,"tf_bear":tf_bear_count,
+                  "tf_total":len(all_trends)})
     return brain
 
 # ═══ BOT ══════════════════════════════════════════════════════════
@@ -1338,13 +1345,14 @@ class Bot:
 
         raw_conv=brain.get("raw_conviction",conviction)
         eq=brain.get("entry_quality",{})
+        tf_b=brain.get("tf_bull",0); tf_br=brain.get("tf_bear",0)
         self.emit("INFO",
             f"#{self.scan_n} ${self.price:,.0f} | {brain['regime']} | "
             f"macro={macro_bias} | conv={raw_conv} | {strategy} | "
             f"adx={brain['adx5m']} bw={brain['bw']} "
             f"rsi={brain.get('rsi',0):.0f} "
+            f"TF={tf_b}B/{tf_br}S "
             f"fund={eq.get('funding',0):+.3f}% "
-            f"oi={eq.get('oi_change',0):+.2f}% "
             f"{'⚡DIV ' if brain.get('div') else ''}"
             f"{'✗'+veto if veto else '✓TRADE'}")
 
