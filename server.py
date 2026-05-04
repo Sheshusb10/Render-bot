@@ -628,7 +628,7 @@ def divergence(cl,hi,lo,direction,lb=10):
     return cl[-1]>max(cl[-lb:-1]) and h_now<h_prev
 
 def trend_from_candles(candles_list):
-    """Returns bull/bear/neutral for a given candle list."""
+    """Returns bull/bear/neutral. No ADX requirement — price position decides."""
     if len(candles_list)<21: return "neutral"
     cl=[c["c"] for c in candles_list]
     hi=[c["h"] for c in candles_list]
@@ -636,8 +636,12 @@ def trend_from_candles(candles_list):
     e8=ema(cl,8)[-1]; e21=ema(cl,21)[-1]
     adx_v,pdi,ndi=adx_calc(hi,lo,cl)
     p=cl[-1]
+    # Primary: EMA stack + directional index
     if p>e8>e21 and pdi>ndi: return "bull"
     if p<e8<e21 and ndi>pdi: return "bear"
+    # Secondary: just EMA stack (ADX doesn't matter for direction)
+    if p>e8 and e8>e21: return "bull"
+    if p<e8 and e8<e21: return "bear"
     return "neutral"
 
 # ═══ EXPERT OPTIONS ENGINE ════════════════════════════════════════
@@ -868,6 +872,7 @@ def get_market_brain(candles):
     tf_aligned=max(tf_bull_count,tf_bear_count)>=4  # 4+ TFs agree
     if squeeze and macro_bias=="neutral" and not tf_aligned:
         brain["strategy"]="STRADDLE"; brain["conviction"]=55
+        brain["raw_conviction"]=55
         brain["opt_type"]="straddle"; brain["opt_conviction"]="atm"
         return brain
     elif squeeze and macro_bias!="neutral":
@@ -1482,7 +1487,7 @@ class Bot:
 
             if strategy=="STRADDLE":
                 st=self.opts.straddle(self.price)
-                if st.get("found") and st["total"]<=self.capital*C.OPT_MAX*2:
+                if st.get("found") and st["total"]<=self.capital*0.30:  # 30% total for straddle
                     cp=self.api.opt_pid(st["call"]["symbol"])
                     pp=self.api.opt_pid(st["put"]["symbol"])
                     if cp: self.api.order("buy",1,cp)
@@ -1500,7 +1505,11 @@ class Bot:
                                 "won":None,"pid":str(pid),"sym":opt["symbol"]})
                         self.save()
                 else:
-                    self.status=f"Straddle: no liquid options found"
+                    st_debug=f"Straddle: call={'found' if st.get('call',{}).get('found') else 'NOT found'} put={'found' if st.get('put',{}).get('found') else 'NOT found'}"
+                    if st.get("found") and st["total"]>self.capital*C.OPT_MAX*2:
+                        st_debug=f"Straddle found but premium ${st['total']:.2f} > limit ${self.capital*C.OPT_MAX*2:.2f}"
+                    self.status=st_debug
+                    self.emit("WARN",st_debug)
                 return
 
             # Directional option
