@@ -2108,36 +2108,6 @@ def api_opts_chain():
     chain.sort(key=lambda x:x["strike"])
     return jsonify({"chain":chain,"price":round(price,1),"atm":atm,"expiry":expiry})
 
-@app.route("/api/opts/expiries",methods=["GET"])
-@login_req
-def api_opts_expiries():
-    """Get available expiries for BTC options."""
-    b=get_bot(session["uid"])
-    if not b.opts: return jsonify({"error":"Not connected"})
-    result=b.api.get("/v2/products",{"contract_type":"call_options","state":"live"})
-    if not result or not result.get("success"):
-        return jsonify({"expiries":[]})
-    seen=set(); expiries=[]
-    for p in result.get("result",[]):
-        sym=p.get("symbol","")
-        if not sym.startswith("C-BTC-"): continue
-        parts=sym.split("-")
-        if len(parts)<4: continue
-        exp=parts[3]
-        if exp not in seen:
-            seen.add(exp)
-            # Format: DDMMYY → readable
-            try:
-                from datetime import datetime as dt2
-                d=dt2.strptime(exp,"%d%m%y")
-                label=d.strftime("%d %b")
-                days=(d-dt2.now()).days
-                expiries.append({"code":exp,"label":label,"days":days})
-            except:
-                expiries.append({"code":exp,"label":exp,"days":0})
-    expiries.sort(key=lambda x:x["days"])
-    return jsonify({"expiries":expiries[:6]})  # next 6 expiries
-
 
 @app.route("/api/opts/find",methods=["POST"])
 @login_req
